@@ -50,7 +50,7 @@ class MonoDataset(data.Dataset):
         self.width = width
         self.num_scales = num_scales
 
-        self.interp = Image.ANTIALIAS
+        self.interp = Image.LANCZOS
 
         self.frame_idxs = frame_idxs
 
@@ -58,7 +58,7 @@ class MonoDataset(data.Dataset):
         self.img_ext = img_ext
 
         self.loader = pil_loader
-        self.to_tensor = transforms.ToTensor()
+        self.to_tensor = transforms.Compose([transforms.ToTensor(), transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
 
         # We need to specify augmentations differently in newer versions of torchvision.
         # We first try the newer tuple version; if this fails we fall back to scalars
@@ -140,7 +140,6 @@ class MonoDataset(data.Dataset):
         do_flip = self.is_train and random.random() > 0.5
 
         folder, frame_index, side = self.index_to_folder_and_frame_idx(index)
-
         poses = {}
         if type(self).__name__ in ["CityscapesPreprocessedDataset", "CityscapesEvalDataset"]:
             inputs.update(self.get_colors(folder, frame_index, side, do_flip))
@@ -178,8 +177,7 @@ class MonoDataset(data.Dataset):
             inputs[("inv_K", scale)] = torch.from_numpy(inv_K)
 
         if do_color_aug:
-            color_aug = transforms.ColorJitter.get_params(
-                self.brightness, self.contrast, self.saturation, self.hue)
+            color_aug = transforms.ColorJitter( self.brightness, self.contrast, self.saturation, self.hue)
         else:
             color_aug = (lambda x: x)
 

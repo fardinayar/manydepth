@@ -62,20 +62,20 @@ class MonodepthOptions:
         self.parser.add_argument("--height",
                                  type=int,
                                  help="input image height",
-                                 default=192)
+                                 default=518)
         self.parser.add_argument("--width",
                                  type=int,
                                  help="input image width",
-                                 default=640)
+                                 default=518)
         self.parser.add_argument("--disparity_smoothness",
                                  type=float,
                                  help="disparity smoothness weight",
-                                 default=1e-3)
+                                 default=0.0)
         self.parser.add_argument("--scales",
                                  nargs="+",
                                  type=int,
                                  help="scales used in the loss",
-                                 default=[0, 1, 2, 3])
+                                 default=[0])
         self.parser.add_argument("--min_depth",
                                  type=float,
                                  help="minimum depth",
@@ -98,7 +98,7 @@ class MonodepthOptions:
         self.parser.add_argument("--learning_rate",
                                  type=float,
                                  help="learning rate",
-                                 default=1e-4)
+                                 default=1e-5)
         self.parser.add_argument("--num_epochs",
                                  type=int,
                                  help="number of epochs",
@@ -246,7 +246,21 @@ class MonodepthOptions:
         self.parser.add_argument('--eval_teacher',
                                  action='store_true',
                                  help='If set, the teacher network will be evaluated')
-
+        
+        # DEPTH_ANYTHING options
+        self.parser.add_argument('--depth_anything_encoder',
+                                 type=str,
+                                 choices=["vits", "vitb", "vitl", "vitg"],
+                                 default="vits")
+        
+        self.parser.add_argument('--depth_anything_checkpoint',
+                                 type=str,
+                                 default='checkpoints')
+        
+        self.parser.add_argument('--encoder_lr_coef',
+                                 type=float,
+                                 default=1/100)
+        
     def parse(self):
         self.options = self.parser.parse_args()
         return self.options
