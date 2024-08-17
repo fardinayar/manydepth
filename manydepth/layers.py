@@ -216,6 +216,26 @@ def get_smooth_loss(disp, img):
 
     return grad_disp_x.mean() + grad_disp_y.mean()
 
+def get_smooth_disparity_loss(disp1, disp2):
+    """Computes the smoothness loss for a disparity image
+    The color image is used for edge-aware smoothness
+    """
+    mean_disp1 = disp1.mean(2, True).mean(3, True)
+    disp1 = disp1 / (mean_disp1 + 1e-7)
+    
+    mean_disp2 = disp2.mean(2, True).mean(3, True)
+    disp2 = disp2 / (mean_disp2 + 1e-7)
+    
+    grad_disp1_x = torch.abs(disp1[:, :, :, :-1] - disp1[:, :, :, 1:])
+    grad_disp1_y = torch.abs(disp1[:, :, :-1, :] - disp1[:, :, 1:, :])
+
+    grad_disp2_x = torch.abs(disp2[:, :, :, :-1] - disp2[:, :, :, 1:])
+    grad_disp2_y = torch.abs(disp2[:, :, :-1, :] - disp2[:, :, 1:, :])
+
+    grad_disp1_x *= torch.exp(-grad_disp2_x)
+    grad_disp1_y *= torch.exp(-grad_disp2_y)
+
+    return grad_disp1_x.mean() + grad_disp1_y.mean()
 
 class SSIM(nn.Module):
     """Layer to compute the SSIM loss between a pair of images
