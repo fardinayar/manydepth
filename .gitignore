@@ -1,4 +1,5 @@
 *.pyc
 *.png
-outs
+*outs2
+*outs
 checkpoints
