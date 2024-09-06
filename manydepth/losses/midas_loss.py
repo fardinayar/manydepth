@@ -3,7 +3,7 @@ import torch.nn as nn
 
 
 
-def affine_invariant_loss(predictions, ground_truths, mask):
+def affine_invariant_loss(predictions, ground_truths, mask, return_intermediate=False):
     """
     Computes the affine-invariant loss for batched input.
     
@@ -33,5 +33,6 @@ def affine_invariant_loss(predictions, ground_truths, mask):
     
     # Compute the affine-invariant mean absolute error
     loss = torch.mean(torch.abs(d_hat_pred - d_hat_gt)*mask)
-    
+    if return_intermediate:
+        return loss, d_hat_pred.view(B, _, H, W), d_hat_gt.view(B, _, H, W)
     return loss

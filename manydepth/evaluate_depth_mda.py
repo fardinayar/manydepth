@@ -151,7 +151,8 @@ def evaluate(opt):
         encoder = networks.ManyDepthAnythingEncoder(encoder_name=opt.depth_anything_encoder)
         depth_decoder = networks.ManyDepthAnythingDecoder(
             adaptive_bins=True, min_depth_bin=0.1, max_depth_bin=20.0,
-            depth_binning=opt.depth_binning, num_depth_bins=opt.num_depth_bins)
+            depth_binning=opt.depth_binning, num_depth_bins=opt.num_depth_bins,
+            matching_height=opt.height // 14, matching_width=opt.width //14)
 
         #model_dict = encoder.state_dict()
         encoder.load_state_dict(encoder_dict, strict=False)

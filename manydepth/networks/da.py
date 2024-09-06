@@ -100,7 +100,8 @@ class ManyDepthAnythingDecoder(ResnetEncoderMatching):
         num_depth_bins=96,
         adaptive_bins=False,
         depth_binning='linear',
-        matching_height=518//14 
+        matching_height=518//14,
+        matching_width=518//14
     ):
         super(ResnetEncoderMatching, self).__init__()
         
@@ -114,7 +115,7 @@ class ManyDepthAnythingDecoder(ResnetEncoderMatching):
         self.depth_bins = None
         self.num_ch_enc = in_channels
         self.matching_height = matching_height
-        self.matching_width = matching_height
+        self.matching_width = matching_width
         self.out_channels = out_channels
         self._init_feature_matching_moudules(min_depth_bin, max_depth_bin)
 
