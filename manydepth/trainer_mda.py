@@ -86,7 +86,8 @@ class Trainer:
 
         self.models["depth"] = networks.ManyDepthAnythingDecoder(
             adaptive_bins=True, min_depth_bin=0.001, max_depth_bin=20,
-            depth_binning=self.opt.depth_binning, num_depth_bins=self.opt.num_depth_bins)
+            depth_binning=self.opt.depth_binning, num_depth_bins=self.opt.num_depth_bins,
+            matching_height=self.opt.height // 14, matching_width=self.opt.width //14)
 
         depthanything_weights = torch.load(f'checkpoints/depth_anything_v2_{self.opt.depth_anything_encoder}.pth', map_location='cpu')
         depthanything_weights_decoder = {}
@@ -110,14 +111,15 @@ class Trainer:
         self.models["mono_depth"] = decoder
         self.models["mono_depth"].to(self.device)
 
-        if self.train_teacher_and_pose:
+        #if self.train_teacher_and_pose:
         #    self.parameters_to_train.append({'params': self.models["mono_encoder"].parameters(), 'lr': self.opt.learning_rate/50})
-            self.parameters_to_train.append({'params': self.models["mono_depth"].parameters(), 'lr': self.opt.learning_rate/10})
+            #self.parameters_to_train.append({'params': self.models["mono_depth"].parameters(), 'lr': self.opt.learning_rate})
             
             
-        #self.models["mono_scaler"] = networks.DepthScaler()
-        #self.models["mono_scaler"].to(self.device)
-        #self.parameters_to_train.append({'params': self.models["mono_scaler"].parameters(), 'lr': self.opt.learning_rate*10})
+        self.models["mono_scaler"] = networks.ResnetEncoder(18, self.opt.weights_init == "pretrained",
+                                   num_input_images=1)
+        self.models["mono_scaler"].to(self.device)
+        self.parameters_to_train.append({'params': self.models["mono_scaler"].parameters(), 'lr': self.opt.learning_rate})
 
         self.models["pose_encoder"] = \
             networks.ResnetEncoder(18, self.opt.weights_init == "pretrained",
@@ -134,7 +136,7 @@ class Trainer:
             self.parameters_to_train.append({'params': self.models["pose_encoder"].parameters()})
             self.parameters_to_train.append({'params': self.models["pose"].parameters()})
 
-        self.model_optimizer = optim.Adam(self.parameters_to_train, self.opt.learning_rate)
+        self.model_optimizer = optim.AdamW(self.parameters_to_train, self.opt.learning_rate)
         self.model_lr_scheduler = optim.lr_scheduler.StepLR(
             self.model_optimizer, self.opt.scheduler_step_size, 0.1)
 
@@ -357,7 +359,13 @@ class Trainer:
             with torch.no_grad():
                 feats = self.models["mono_encoder"].get_intermediate_layers(input_image, [2, 5, 8, 11], return_class_token=True)
             monodepth = self.models['mono_depth'](feats, patch_h, patch_w)
-            monodepth = {("disp", 0): monodepth}
+            feat_scale = self.models['mono_scaler'](input_image)[-1].mean(-1).mean(-1)
+            feat_scale = torch.chunk(feat_scale, 2, dim=-1)
+            shift, scale = feat_scale[0].mean(-1).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1), feat_scale[1].mean(-1).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+            monodepth = (monodepth*F.relu(scale)+shift)
+            # Normalize depth along the batch dimension
+            normalized_depth = (monodepth - torch.amin(monodepth, dim=(1, 2, 3), keepdim=True)) / (torch.amax(monodepth, dim=(1, 2, 3), keepdim=True) - torch.amin(monodepth, dim=(1, 2, 3), keepdim=True))
+            monodepth = {("disp", 0): normalized_depth}
             mono_outputs.update(monodepth)
         else:
             with torch.no_grad():
@@ -365,7 +373,11 @@ class Trainer:
                 patch_h, patch_w = input_image.shape[-2] // 14, input_image.shape[-1] // 14
                 #
                 feats = self.models["mono_encoder"].get_intermediate_layers(input_image, [2, 5, 8, 11], return_class_token=True)
-                monodepth = {("disp", 0): (self.models['mono_depth'](feats, patch_h, patch_w))}
+                monodepth = self.models['mono_depth'](feats, patch_h, patch_w)
+                feat_scale = self.models['mono_scaler'](input_image)[-1].mean(-1).mean(-1)
+                feat_scale = torch.chunk(feat_scale, 2, dim=-1)
+                shift, scale = feat_scale[0].mean(-1).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1), feat_scale[1].mean(-1).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+                monodepth = {("disp", 0): F.sigmoid(monodepth*F.tanh(scale)+shift)}
                 mono_outputs.update(monodepth)
 
         self.generate_images_pred(inputs, mono_outputs)
@@ -436,8 +448,8 @@ class Trainer:
         min_depth = max(self.opt.min_depth, min_depth * 0.9)
         max_depth = max_depth * 1.1
 
-        self.max_depth_tracker = self.max_depth_tracker * 0.99 + max_depth * 0.01
-        self.min_depth_tracker = self.min_depth_tracker * 0.99 + min_depth * 0.01
+        self.max_depth_tracker = self.max_depth_tracker * 0.9 + max_depth * 0.1
+        self.min_depth_tracker = self.min_depth_tracker * 0.9 + min_depth * 0.1
 
     def predict_poses(self, inputs, features=None):
         """Predict poses between input frames for monocular sequences.
@@ -605,6 +617,8 @@ class Trainer:
         mono_output = outputs[('mono_depth', 0, 0)]
         matching_depth = 1 / outputs['lowest_cost'].unsqueeze(1).to(self.device)
 
+        _, matching_depth, _ = affine_invariant_loss(matching_depth, mono_output, torch.ones_like(mono_output), return_intermediate=True)
+        
         # mask where they differ by a large amount
         mask = ((matching_depth - mono_output) / mono_output) < 1.0
         mask *= ((mono_output - matching_depth) / matching_depth) < 1.0
@@ -692,10 +706,8 @@ class Trainer:
                 #consistency_loss = torch.abs(multi_depth - mono_depth) * consistency_mask
                 
                 consistency_loss = torch.abs(multi_depth - mono_depth) * consistency_mask
-                + 0.01 * get_smooth_disparity_loss(multi_depth, mono_depth)  #torch.abs(multi_depth - mono_depth) * consistency_mask +\
-                
-                consistency_loss +=  0.1 * affine_invariant_loss(multi_depth, mono_depth, torch.ones_like(mono_depth))
-                    
+                + 0.1 * get_smooth_disparity_loss(multi_depth, mono_depth)  #torch.abs(multi_depth - mono_depth) * consistency_mask +\
+                                    
                 consistency_loss = consistency_loss.mean()
 
                 # save for logging to tensorboard

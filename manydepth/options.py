@@ -62,11 +62,11 @@ class MonodepthOptions:
         self.parser.add_argument("--height",
                                  type=int,
                                  help="input image height",
-                                 default=518)
+                                 default=308)
         self.parser.add_argument("--width",
                                  type=int,
                                  help="input image width",
-                                 default=518)
+                                 default=1022)
         self.parser.add_argument("--disparity_smoothness",
                                  type=float,
                                  help="disparity smoothness weight",
@@ -113,7 +113,7 @@ class MonodepthOptions:
                                       " network and pose network.")
         self.parser.add_argument("--freeze_teacher_epoch",
                                  type=int,
-                                 default=15,
+                                 default=20,
                                  help="Sets the epoch number at which to freeze the teacher"
                                       "network and the pose network.")
         self.parser.add_argument("--freeze_teacher_step",
@@ -259,7 +259,7 @@ class MonodepthOptions:
         
         self.parser.add_argument('--encoder_lr_coef',
                                  type=float,
-                                 default=1/100)
+                                 default=1)
         
     def parse(self):
         self.options = self.parser.parse_args()
