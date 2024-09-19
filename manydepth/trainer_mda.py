@@ -96,7 +96,7 @@ class Trainer:
                 depthanything_weights_decoder.update({
                     key.replace('depth_head.', ''): value
                 })
-                
+        # TODO  
         self.models["depth"].load_state_dict(depthanything_weights_decoder, strict=False)
         self.models["depth"].to(self.device)
 
@@ -111,14 +111,22 @@ class Trainer:
         self.models["mono_depth"] = decoder
         self.models["mono_depth"].to(self.device)
 
-        #if self.train_teacher_and_pose:
-        #    self.parameters_to_train.append({'params': self.models["mono_encoder"].parameters(), 'lr': self.opt.learning_rate/50})
-            #self.parameters_to_train.append({'params': self.models["mono_depth"].parameters(), 'lr': self.opt.learning_rate})
+        if self.train_teacher_and_pose:
+            for param in self.models["mono_encoder"].parameters():
+                param.requires_grad = False
+            self.models["mono_encoder"].cls_token.requires_grad = True
+            self.parameters_to_train.append({'params': self.models["mono_encoder"].cls_token, 'lr': self.opt.learning_rate})
+            #self.parameters_to_train.append({'params': self.models["mono_depth"].parameters(), 'lr': self.opt.learning_rate/50})
             
             
         self.models["mono_scaler"] = networks.DepthScaler()
         self.models["mono_scaler"].to(self.device)
-        self.parameters_to_train.append({'params': self.models["mono_scaler"].parameters(), 'lr': self.opt.learning_rate*10})
+        self.parameters_to_train.append({'params': self.models["mono_scaler"].parameters(), 'lr': self.opt.learning_rate})
+        
+        
+        self.models["multi_scaler"] = networks.DepthScaler()
+        self.models["multi_scaler"].to(self.device)
+        self.parameters_to_train.append({'params': self.models["multi_scaler"].parameters(), 'lr': self.opt.learning_rate})
 
         self.models["pose_encoder"] = \
             networks.ResnetEncoder(18, self.opt.weights_init == "pretrained",
@@ -273,7 +281,7 @@ class Trainer:
 
             before_op_time = time.time()
 
-            outputs, losses = self.process_batch(inputs, is_train=True)
+            outputs, losses, mono_losses = self.process_batch(inputs, is_train=True)
             self.model_optimizer.zero_grad()
             losses["loss"].backward()
             self.model_optimizer.step()
@@ -285,12 +293,12 @@ class Trainer:
             late_phase = self.step % 10000 == 0
 
             if early_phase or late_phase:
-                self.log_time(batch_idx, duration, losses["loss"].cpu().data)
+                self.log_time(batch_idx, duration, losses["loss"].cpu().data, mono_losses["loss"].cpu())
 
                 if "depth_gt" in inputs:
                     self.compute_depth_losses(inputs, outputs, losses)
 
-                self.log("train", inputs, outputs, losses)
+                self.log("train", inputs, outputs, losses, mono_losses)
                 self.val()
 
             if self.opt.save_intermediate_models and late_phase:
@@ -355,25 +363,22 @@ class Trainer:
             input_image = inputs["color_aug", 0, 0]
             patch_h, patch_w = input_image.shape[-2] // 14, input_image.shape[-1] // 14
             # TODO
-            with torch.no_grad():
-                feats = self.models["mono_encoder"].get_intermediate_layers(input_image, [2, 5, 8, 11], return_class_token=True)
-            scale, shift = self.models["mono_scaler"](feats)
-            monodepth = self.models['mono_depth'](feats, patch_h, patch_w)
-            monodepth =  monodepth * scale + shift + 0.001
-            monodepth = (monodepth - torch.amin(monodepth, dim=(1, 2), keepdim=True)) / (torch.amax(monodepth, dim=(1, 2), keepdim=True) - torch.amin(monodepth, dim=(1, 2), keepdim=True))
+            feats = self.models["mono_encoder"].get_intermediate_layers(input_image, [2, 5, 8, 11], return_class_token=True)
+            monodepth, depth_feats = self.models['mono_depth'](feats, patch_h, patch_w)
+            scale, shift = self.models["mono_scaler"](feats, depth_feats)
+            monodepth =  (monodepth * scale  + shift).sigmoid()
             monodepth = {("disp", 0): monodepth}
             mono_outputs.update(monodepth)
         else:
             with torch.no_grad():
                 input_image = inputs["color_aug", 0, 0]
                 patch_h, patch_w = input_image.shape[-2] // 14, input_image.shape[-1] // 14
-                #
+                # TODO
                 feats = self.models["mono_encoder"].get_intermediate_layers(input_image, [2, 5, 8, 11], return_class_token=True)
-                monodepth = self.models['mono_depth'](feats, patch_h, patch_w)
-                feat_scale = self.models['mono_scaler'](input_image)[-1].mean(-1).mean(-1)
-                feat_scale = torch.chunk(feat_scale, 2, dim=-1)
-                shift, scale = feat_scale[0].mean(-1).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1), feat_scale[1].mean(-1).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
-                monodepth = {("disp", 0): F.sigmoid(monodepth*F.tanh(scale)+shift)}
+                monodepth, depth_feats = self.models['mono_depth'](feats, patch_h, patch_w)
+                scale, shift = self.models["mono_scaler"](feats, depth_feats)
+                monodepth =  (monodepth * scale  + shift).sigmoid()
+                monodepth = {("disp", 0): monodepth}
                 mono_outputs.update(monodepth)
 
         self.generate_images_pred(inputs, mono_outputs)
@@ -394,7 +399,7 @@ class Trainer:
         else:
             features, lookup_features = self.models["encoder"](inputs["color_aug", 0, 0], lookup_frames)
         
-        depth, lowest_cost, confidence_mask = self.models["depth"](features,
+        depth, lowest_cost, confidence_mask, depth_feats = self.models["depth"](features,
                                                                       lookup_features,
                                                                       patch_h,
                                                                       patch_w,
@@ -403,6 +408,8 @@ class Trainer:
                                                                     inputs[('inv_K', 2)],
                                                                     min_depth_bin=min_depth_bin,
                                                                     max_depth_bin=max_depth_bin)
+        scale, shift = self.models["multi_scaler"](features, depth_feats)
+        depth =  (depth * scale + shift).sigmoid()
         
         outputs.update({("disp", 0): depth})
 
@@ -423,13 +430,13 @@ class Trainer:
         # update losses with single frame losses
         if self.train_teacher_and_pose:
             for key, val in mono_losses.items():
-                losses[key] += val
+                losses[key] += val*1
 
         # update adaptive depth bins
         if self.train_teacher_and_pose:
             self.update_adaptive_depth_bins(outputs)
 
-        return outputs, losses
+        return outputs, losses, mono_losses
 
     def update_adaptive_depth_bins(self, outputs):
         """Update the current estimates of min/max depth using exponental weighted average"""
@@ -444,8 +451,8 @@ class Trainer:
         min_depth = max(self.opt.min_depth, min_depth * 0.9)
         max_depth = max_depth * 1.1
 
-        self.max_depth_tracker = self.max_depth_tracker * 0.9 + max_depth * 0.1
-        self.min_depth_tracker = self.min_depth_tracker * 0.9 + min_depth * 0.1
+        self.max_depth_tracker = self.max_depth_tracker * 0.09 + max_depth * 0.01
+        self.min_depth_tracker = self.min_depth_tracker * 0.09 + min_depth * 0.01
 
     def predict_poses(self, inputs, features=None):
         """Predict poses between input frames for monocular sequences.
@@ -525,12 +532,12 @@ class Trainer:
             inputs = next(self.val_iter)
 
         with torch.no_grad():
-            outputs, losses = self.process_batch(inputs)
+            outputs, losses, mono_losses = self.process_batch(inputs)
 
             if "depth_gt" in inputs:
                 self.compute_depth_losses(inputs, outputs, losses)
 
-            self.log("val", inputs, outputs, losses)
+            self.log("val", inputs, outputs, losses, mono_losses)
             del inputs, outputs, losses
 
         self.set_train()
@@ -547,8 +554,10 @@ class Trainer:
                 disp = F.interpolate(
                     disp, [self.opt.height, self.opt.width], mode="bilinear", align_corners=False)
                 source_scale = 0
-            #depth = disp
+            #depth = 1/(disp+0.001)
+            #depth[depth>self.opt.max_depth] = self.opt.max_depth
             _, depth = disp_to_depth(disp, self.opt.min_depth, self.opt.max_depth)
+
             # TODO
             outputs[("depth", 0, scale)] = depth
 
@@ -612,8 +621,6 @@ class Trainer:
 
         mono_output = outputs[('mono_depth', 0, 0)]
         matching_depth = 1 / outputs['lowest_cost'].unsqueeze(1).to(self.device)
-
-        _, matching_depth, _ = affine_invariant_loss(matching_depth, mono_output, torch.ones_like(mono_output), return_intermediate=True)
         
         # mask where they differ by a large amount
         mask = ((matching_depth - mono_output) / mono_output) < 1.0
@@ -701,8 +708,7 @@ class Trainer:
                 mono_depth = outputs[("mono_depth", 0, scale)].detach()
                 #consistency_loss = torch.abs(multi_depth - mono_depth) * consistency_mask
                 
-                consistency_loss = torch.abs(multi_depth - mono_depth) * consistency_mask
-                + 0.1 * get_smooth_disparity_loss(multi_depth, mono_depth)  #torch.abs(multi_depth - mono_depth) * consistency_mask +\
+                consistency_loss =  0.001 * get_smooth_disparity_loss(multi_depth, mono_depth)  + torch.abs(multi_depth - mono_depth) * consistency_mask
                                     
                 consistency_loss = consistency_loss.mean()
 
@@ -765,7 +771,7 @@ class Trainer:
         for i, metric in enumerate(self.depth_metric_names):
             losses[metric] = np.array(depth_errors[i].cpu())
 
-    def log_time(self, batch_idx, duration, loss):
+    def log_time(self, batch_idx, duration, loss, mono_loss):
         """Print a logging statement to the terminal
         """
         samples_per_sec = self.opt.batch_size / duration
@@ -773,16 +779,18 @@ class Trainer:
         training_time_left = (
             self.num_total_steps / self.step - 1.0) * time_sofar if self.step > 0 else 0
         print_string = "epoch {:>3} | batch {:>6} | examples/s: {:5.1f}" + \
-            " | loss: {:.5f} | time elapsed: {} | time left: {}"
-        print(print_string.format(self.epoch, batch_idx, samples_per_sec, loss,
+            " | loss: {:.5f} | mono_loss: {:.5f} | time elapsed: {} | time left: {}"
+        print(print_string.format(self.epoch, batch_idx, samples_per_sec, loss, mono_loss,
                                   sec_to_hm_str(time_sofar), sec_to_hm_str(training_time_left)))
 
-    def log(self, mode, inputs, outputs, losses):
+    def log(self, mode, inputs, outputs, losses, mono_losses):
         """Write an event to the tensorboard events file
         """
         writer = self.writers[mode]
         for l, v in losses.items():
             writer.add_scalar("{}".format(l), v, self.step)
+        for l, v in mono_losses.items():
+            writer.add_scalar("mono_{}".format(l), v, self.step)
 
         for j in range(min(4, self.opt.batch_size)):  # write a maxmimum of four images
             s = 0  # log only max scale
