@@ -17,26 +17,35 @@ MODEL_CONFIGS = {
 class DepthScaler(nn.Module):
     def __init__(self, in_channels=384):
         super().__init__()
-        self.intermediate_layers = nn.Sequential(nn.Linear(in_channels, in_channels),
+        self.intermediate_layers1 = nn.Sequential(nn.Linear(in_channels, in_channels),
+                                                 nn.ReLU(),
+                                                 nn.Linear(in_channels, in_channels),
+                                                 nn.ReLU(),)
+        self.intermediate_layers2 = nn.Sequential(nn.Linear(in_channels, in_channels),
+                                                 nn.ReLU(),
+                                                 nn.Linear(in_channels, in_channels),
+                                                 nn.ReLU(),)
+        self.intermediate_layers3 = nn.Sequential(nn.Linear(in_channels, in_channels),
                                                  nn.ReLU(),
                                                  nn.Linear(in_channels, in_channels),
                                                  nn.ReLU(),)
         self.scale = nn.Sequential(nn.Linear(in_channels, in_channels),
                                                  nn.ReLU(),
                                                  nn.Linear(in_channels, 1),
-                                                 nn.Sigmoid())
+                                                 nn.ReLU())
         self.shift = nn.Sequential(nn.Linear(in_channels, in_channels),
                                                  nn.ReLU(),
-                                                 nn.Linear(in_channels, 1),
-                                                 nn.Sigmoid())
+                                                 nn.Linear(in_channels, 1))
         self.in_channels = in_channels
     
     def forward(self, features):
-        scale_features = self.intermediate_layers(torch.mean(features[-1][0], dim=1))
+        scale_features = self.intermediate_layers1(torch.mean(features[-1][0], dim=1)) +\
+                            self.intermediate_layers2(torch.mean(features[-2][0], dim=1)) +\
+                            self.intermediate_layers3(torch.mean(features[-3][0], dim=1))
         scale = self.scale(scale_features)
         shift = self.shift(scale_features)
         
-        return scale, shift * 2
+        return scale.unsqueeze(-1).unsqueeze(-1), shift.unsqueeze(-1).unsqueeze(-1)
 
 def get_da_encoder_decoder(encoder_name='vits', checkpoint=True):
     da_model = DepthAnythingV2(**MODEL_CONFIGS[encoder_name])
