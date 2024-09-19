@@ -116,10 +116,9 @@ class Trainer:
             #self.parameters_to_train.append({'params': self.models["mono_depth"].parameters(), 'lr': self.opt.learning_rate})
             
             
-        self.models["mono_scaler"] = networks.ResnetEncoder(18, self.opt.weights_init == "pretrained",
-                                   num_input_images=1)
+        self.models["mono_scaler"] = networks.DepthScaler()
         self.models["mono_scaler"].to(self.device)
-        self.parameters_to_train.append({'params': self.models["mono_scaler"].parameters(), 'lr': self.opt.learning_rate})
+        self.parameters_to_train.append({'params': self.models["mono_scaler"].parameters(), 'lr': self.opt.learning_rate*10})
 
         self.models["pose_encoder"] = \
             networks.ResnetEncoder(18, self.opt.weights_init == "pretrained",
@@ -358,14 +357,11 @@ class Trainer:
             # TODO
             with torch.no_grad():
                 feats = self.models["mono_encoder"].get_intermediate_layers(input_image, [2, 5, 8, 11], return_class_token=True)
+            scale, shift = self.models["mono_scaler"](feats)
             monodepth = self.models['mono_depth'](feats, patch_h, patch_w)
-            feat_scale = self.models['mono_scaler'](input_image)[-1].mean(-1).mean(-1)
-            feat_scale = torch.chunk(feat_scale, 2, dim=-1)
-            shift, scale = feat_scale[0].mean(-1).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1), feat_scale[1].mean(-1).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
-            monodepth = (monodepth*F.relu(scale)+shift)
-            # Normalize depth along the batch dimension
-            normalized_depth = (monodepth - torch.amin(monodepth, dim=(1, 2, 3), keepdim=True)) / (torch.amax(monodepth, dim=(1, 2, 3), keepdim=True) - torch.amin(monodepth, dim=(1, 2, 3), keepdim=True))
-            monodepth = {("disp", 0): normalized_depth}
+            monodepth =  monodepth * scale + shift + 0.001
+            monodepth = (monodepth - torch.amin(monodepth, dim=(1, 2), keepdim=True)) / (torch.amax(monodepth, dim=(1, 2), keepdim=True) - torch.amin(monodepth, dim=(1, 2), keepdim=True))
+            monodepth = {("disp", 0): monodepth}
             mono_outputs.update(monodepth)
         else:
             with torch.no_grad():
