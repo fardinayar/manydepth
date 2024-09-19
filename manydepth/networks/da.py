@@ -14,38 +14,77 @@ MODEL_CONFIGS = {
 }
 
 
+import torch.nn as nn
+import torch
+
 class DepthScaler(nn.Module):
-    def __init__(self, in_channels=384):
+    def __init__(self, in_channels=384, hidden_dim=256):
         super().__init__()
-        self.intermediate_layers1 = nn.Sequential(nn.Linear(in_channels, in_channels),
-                                                 nn.ReLU(),
-                                                 nn.Linear(in_channels, in_channels),
-                                                 nn.ReLU(),)
-        self.intermediate_layers2 = nn.Sequential(nn.Linear(in_channels, in_channels),
-                                                 nn.ReLU(),
-                                                 nn.Linear(in_channels, in_channels),
-                                                 nn.ReLU(),)
-        self.intermediate_layers3 = nn.Sequential(nn.Linear(in_channels, in_channels),
-                                                 nn.ReLU(),
-                                                 nn.Linear(in_channels, in_channels),
-                                                 nn.ReLU(),)
-        self.scale = nn.Sequential(nn.Linear(in_channels, in_channels),
-                                                 nn.ReLU(),
-                                                 nn.Linear(in_channels, 1),
-                                                 nn.ReLU())
-        self.shift = nn.Sequential(nn.Linear(in_channels, in_channels),
-                                                 nn.ReLU(),
-                                                 nn.Linear(in_channels, 1))
-        self.in_channels = in_channels
-    
-    def forward(self, features):
-        scale_features = self.intermediate_layers1(torch.mean(features[-1][0], dim=1)) +\
-                            self.intermediate_layers2(torch.mean(features[-2][0], dim=1)) +\
-                            self.intermediate_layers3(torch.mean(features[-3][0], dim=1))
-        scale = self.scale(scale_features)
-        shift = self.shift(scale_features)
         
-        return scale.unsqueeze(-1).unsqueeze(-1), shift.unsqueeze(-1).unsqueeze(-1)
+        self.mlp1 = nn.Sequential(
+            nn.Linear(in_channels, hidden_dim),
+            nn.ReLU(),
+            nn.GroupNorm(16, hidden_dim),
+            nn.Linear(hidden_dim, in_channels),
+            nn.ReLU(),
+            nn.GroupNorm(16, in_channels),
+        )
+        
+        self.mlp2 = nn.Sequential(
+            nn.Linear(in_channels * 2, hidden_dim),
+            nn.ReLU(),
+            nn.GroupNorm(16, hidden_dim),
+            nn.Linear(hidden_dim, in_channels),
+            nn.ReLU(),
+            nn.GroupNorm(16, in_channels),
+        )
+        
+        self.mlp3 = nn.Sequential(
+            nn.Linear(in_channels * 2, hidden_dim),
+            nn.ReLU(),
+            nn.GroupNorm(16, hidden_dim),
+            nn.Linear(hidden_dim, in_channels),
+            nn.ReLU(),
+            nn.GroupNorm(16, in_channels),
+        )
+        
+        self.mlp4 = nn.Sequential(
+            nn.Linear(in_channels * 2, hidden_dim),
+            nn.ReLU(),
+            nn.GroupNorm(16, hidden_dim),
+            nn.Linear(hidden_dim, in_channels * 2),
+            nn.ReLU(),# Output for scale and shift
+            nn.GroupNorm(16, in_channels * 2),
+        )
+        
+        self.scale = nn.Linear(in_channels, 1)
+        self.shift = nn.Linear(in_channels, 1)
+        self.depth_feat_adaptor = nn.Sequential(
+            nn.Linear(32, hidden_dim),
+            nn.ReLU(),
+            nn.GroupNorm(2, hidden_dim),
+            nn.Linear(hidden_dim, in_channels),
+        )
+    
+    def forward(self, features, depth_pred_feats):
+        # Adapt depth_pred_feats
+        #depth_feat = self.depth_feat_adaptor(depth_pred_feats.mean(-1).mean(-1).squeeze(-1).squeeze(-1))
+        #depth_feat = torch.relu(depth_feat)
+        # Combine features step by step
+        x = self.mlp1(features[-4][1])
+        x = self.mlp2(torch.cat([x, features[-3][1]], dim=-1))
+        x = self.mlp3(torch.cat([x, features[-2][1]], dim=-1))
+        x = self.mlp4(torch.cat([x, features[-1][1]], dim=-1))
+        
+        # Split the output into scale and shift
+        scale_shift = x.view(x.size(0), -1, 2)
+        scale = scale_shift[:, :, 0]
+        shift = scale_shift[:, :, 1]
+        
+        scale = self.scale(scale)
+        shift = self.shift(shift)
+        
+        return torch.abs(scale).unsqueeze(-1).unsqueeze(-1), shift.unsqueeze(-1).unsqueeze(-1)
 
 def get_da_encoder_decoder(encoder_name='vits', checkpoint=True):
     da_model = DepthAnythingV2(**MODEL_CONFIGS[encoder_name])
@@ -192,7 +231,7 @@ class ManyDepthAnythingDecoder(ResnetEncoderMatching):
             nn.Conv2d(head_features_1 // 2, head_features_2, kernel_size=3, stride=1, padding=1),
             nn.ReLU(True),
             nn.Conv2d(head_features_2, 1, kernel_size=1, stride=1, padding=0),
-            nn.Sigmoid()
+            # TODO SIGMOID
         )
         
     def _init_feature_matching_moudules(self, min_depth_bin, max_depth_bin):
@@ -283,7 +322,7 @@ class ManyDepthAnythingDecoder(ResnetEncoderMatching):
         path_1 = self.scratch.refinenet1(path_2, layer_1_rn)
         
         out = self.scratch.output_conv1(path_1)
-        out = nn.functional.interpolate(out, (int(patch_h * 14), int(patch_w * 14)), mode="bilinear", align_corners=True)
-        depth = self.scratch.output_conv2(out)
-        return depth, lowest_cost, confidence_mask
+        out_ = nn.functional.interpolate(out, (int(patch_h * 14), int(patch_w * 14)), mode="bilinear", align_corners=True)
+        depth = self.scratch.output_conv2(out_)
+        return depth, lowest_cost, confidence_mask, out_
 

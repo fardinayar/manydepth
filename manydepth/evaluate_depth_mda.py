@@ -99,6 +99,7 @@ def evaluate(opt):
         else:
             encoder_path = os.path.join(opt.load_weights_folder, "encoder.pth")
             decoder_path = os.path.join(opt.load_weights_folder, "depth.pth")
+            scaler_path = os.path.join(opt.load_weights_folder, "multi_scaler.pth")
             encoder_class = networks.ResnetEncoderMatching
 
         encoder_dict = torch.load(encoder_path)
@@ -153,17 +154,20 @@ def evaluate(opt):
             adaptive_bins=True, min_depth_bin=0.1, max_depth_bin=20.0,
             depth_binning=opt.depth_binning, num_depth_bins=opt.num_depth_bins,
             matching_height=opt.height // 14, matching_width=opt.width //14)
+        
+        multi_scaler = networks.DepthScaler()
 
         #model_dict = encoder.state_dict()
         encoder.load_state_dict(encoder_dict, strict=False)
         depth_decoder.load_state_dict(torch.load(decoder_path))
-
+        multi_scaler.load_state_dict(torch.load(scaler_path))
         encoder.eval()
         depth_decoder.eval()
-
+        multi_scaler.eval()
         if torch.cuda.is_available():
             encoder.cuda()
             depth_decoder.cuda()
+            multi_scaler.cuda()
 
         pred_disps = []
 
@@ -238,7 +242,7 @@ def evaluate(opt):
 
                     features, lookup_features = encoder(input_color, lookup_frames)
                     patch_h, patch_w = input_color.shape[-2] // 14, input_color.shape[-1] // 14
-                    output, lowest_cost, confidence_mask = depth_decoder(features,
+                    output, lowest_cost, confidence_mask, depth_feats = depth_decoder(features,
                                                                                 lookup_features,
                                                                                 patch_h,
                                                                                 patch_w,
@@ -246,6 +250,8 @@ def evaluate(opt):
                                                                                 K,
                                                                                 invK,
                                                                                 min_depth_bin, max_depth_bin)
+                    scale, shift = multi_scaler(features, depth_feats)
+                    output =  (output * (scale) + shift).sigmoid()
                 pred_disp, _ = disp_to_depth(output, opt.min_depth, opt.max_depth)
                 
                 pred_disp = pred_disp.cpu()[:, 0].numpy()

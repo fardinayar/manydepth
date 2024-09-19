@@ -62,11 +62,11 @@ class MonodepthOptions:
         self.parser.add_argument("--height",
                                  type=int,
                                  help="input image height",
-                                 default=308)
+                                 default=518)
         self.parser.add_argument("--width",
                                  type=int,
                                  help="input image width",
-                                 default=1022)
+                                 default=518)
         self.parser.add_argument("--disparity_smoothness",
                                  type=float,
                                  help="disparity smoothness weight",
@@ -186,7 +186,7 @@ class MonodepthOptions:
         self.parser.add_argument("--log_frequency",
                                  type=int,
                                  help="number of batches between each tensorboard log",
-                                 default=250)
+                                 default=50)
         self.parser.add_argument("--save_frequency",
                                  type=int,
                                  help="number of epochs between each save",
@@ -259,7 +259,7 @@ class MonodepthOptions:
         
         self.parser.add_argument('--encoder_lr_coef',
                                  type=float,
-                                 default=1)
+                                 default=0.1)
         
     def parse(self):
         self.options = self.parser.parse_args()

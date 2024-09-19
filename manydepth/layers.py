@@ -220,11 +220,6 @@ def get_smooth_disparity_loss(disp1, disp2):
     """Computes the smoothness loss for a disparity image
     The color image is used for edge-aware smoothness
     """
-    mean_disp1 = disp1.mean(2, True).mean(3, True)
-    disp1 = disp1 / (mean_disp1 + 1e-7)
-    
-    mean_disp2 = disp2.mean(2, True).mean(3, True)
-    disp2 = disp2 / (mean_disp2 + 1e-7)
     
     grad_disp1_x = torch.abs(disp1[:, :, :, :-1] - disp1[:, :, :, 1:])
     grad_disp1_y = torch.abs(disp1[:, :, :-1, :] - disp1[:, :, 1:, :])
