@@ -17,61 +17,51 @@ MODEL_CONFIGS = {
 import torch.nn as nn
 import torch
 
-class DepthScaler(nn.Module):
-    def __init__(self, in_channels=384, hidden_dim=256):
+class DepthScaler(nn.Module):    
+    def __init__(self, in_channels=384, hidden_dim=256, dropout_rate=0.4):
         super().__init__()
         
         self.mlp1 = nn.Sequential(
             nn.Linear(in_channels, hidden_dim),
-            nn.ReLU(),
-            nn.GroupNorm(16, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout_rate),
             nn.Linear(hidden_dim, in_channels),
-            nn.ReLU(),
-            nn.GroupNorm(16, in_channels),
+            nn.GELU(),
         )
         
         self.mlp2 = nn.Sequential(
             nn.Linear(in_channels * 2, hidden_dim),
-            nn.ReLU(),
-            nn.GroupNorm(16, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout_rate),
             nn.Linear(hidden_dim, in_channels),
-            nn.ReLU(),
-            nn.GroupNorm(16, in_channels),
+            nn.GELU(),
         )
         
         self.mlp3 = nn.Sequential(
             nn.Linear(in_channels * 2, hidden_dim),
-            nn.ReLU(),
-            nn.GroupNorm(16, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout_rate),
             nn.Linear(hidden_dim, in_channels),
-            nn.ReLU(),
-            nn.GroupNorm(16, in_channels),
+            nn.GELU(),
         )
         
         self.mlp4 = nn.Sequential(
             nn.Linear(in_channels * 2, hidden_dim),
-            nn.ReLU(),
-            nn.GroupNorm(16, hidden_dim),
-            nn.Linear(hidden_dim, in_channels * 2),
-            nn.ReLU(),# Output for scale and shift
-            nn.GroupNorm(16, in_channels * 2),
+            nn.GELU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(hidden_dim, in_channels),
+            nn.GELU(),# Output for scale and shift
         )
         
-        self.scale = nn.Linear(in_channels, 1)
-        self.shift = nn.Linear(in_channels, 1)
-        self.depth_feat_adaptor = nn.Sequential(
-            nn.Linear(32, hidden_dim),
-            nn.ReLU(),
-            nn.GroupNorm(2, hidden_dim),
-            nn.Linear(hidden_dim, in_channels),
-        )
+        self.scale = nn.Linear(in_channels//2, 1)
+        self.shift = nn.Linear(in_channels//2, 1) 
     
-    def forward(self, features, depth_pred_feats):
+    def forward(self, features, depth_pred_feats=None):
         # Adapt depth_pred_feats
         #depth_feat = self.depth_feat_adaptor(depth_pred_feats.mean(-1).mean(-1).squeeze(-1).squeeze(-1))
         #depth_feat = torch.relu(depth_feat)
         # Combine features step by step
-        x = self.mlp1(features[-4][1])
+        x = self.mlp1(features[-1][1])
         x = self.mlp2(torch.cat([x, features[-3][1]], dim=-1))
         x = self.mlp3(torch.cat([x, features[-2][1]], dim=-1))
         x = self.mlp4(torch.cat([x, features[-1][1]], dim=-1))
@@ -248,11 +238,11 @@ class ManyDepthAnythingDecoder(ResnetEncoderMatching):
             reduce_conv = nn.Sequential(nn.Conv2d(self.num_ch_enc + self.num_depth_bins,
                                                     out_channels=self.num_ch_enc,
                                                     kernel_size=3, stride=1, padding=1, bias=False),
-                                            nn.ReLU(inplace=True)
+                                            nn.GELU()
                                             )
-            '''for m in reduce_conv.modules():
+            for m in reduce_conv.modules():
                 if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d, nn.BatchNorm2d)):
-                    nn.init.normal_(m.weight.data, 0.0, 0.002)'''
+                    nn.init.normal_(m.weight.data, 0.0, 0.002)
             self.reduce_convs.append(reduce_conv)
 
     
@@ -278,7 +268,7 @@ class ManyDepthAnythingDecoder(ResnetEncoderMatching):
         
         # mask the cost volume based on the confidence
         cost_volume *= confidence_mask.unsqueeze(1)
-        post_matching_feats = self.reduce_convs[i](torch.cat([current_feats, cost_volume], 1))
+        post_matching_feats = self.reduce_convs[i](torch.cat([current_feats, cost_volume], 1)) + current_feats
 
         return post_matching_feats, lowest_cost, confidence_mask
 
