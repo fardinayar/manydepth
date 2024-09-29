@@ -94,13 +94,12 @@ def evaluate(opt):
         if opt.eval_teacher:
             encoder_path = os.path.join(opt.load_weights_folder, "mono_encoder.pth")
             decoder_path = os.path.join(opt.load_weights_folder, "mono_depth.pth")
-            encoder_class = networks.ResnetEncoder
+            scaler_path = os.path.join(opt.load_weights_folder, "mono_scaler.pth")
 
         else:
             encoder_path = os.path.join(opt.load_weights_folder, "encoder.pth")
             decoder_path = os.path.join(opt.load_weights_folder, "depth.pth")
             scaler_path = os.path.join(opt.load_weights_folder, "multi_scaler.pth")
-            encoder_class = networks.ResnetEncoderMatching
 
         encoder_dict = torch.load(encoder_path)
         try:
@@ -118,7 +117,7 @@ def evaluate(opt):
 
         else:
             dataset = datasets.KITTIRAWDataset(opt.data_path, filenames,
-                                               encoder_dict['height'], encoder_dict['width'],
+                                               HEIGHT, WIDTH,
                                                frames_to_load, 4,
                                                is_train=False)
         dataloader = DataLoader(dataset, opt.batch_size, shuffle=False, num_workers=opt.num_workers,
@@ -126,8 +125,7 @@ def evaluate(opt):
 
         # setup models
         if opt.eval_teacher:
-            encoder_opts = dict(num_layers=opt.num_layers,
-                                pretrained=False)
+            encoder, depth_decoder = networks.get_da_encoder_decoder(encoder_name=opt.depth_anything_encoder)
         else:
             pose_enc_dict = torch.load(os.path.join(opt.load_weights_folder, "pose_encoder.pth"))
             pose_dec_dict = torch.load(os.path.join(opt.load_weights_folder, "pose.pth"))
@@ -149,25 +147,25 @@ def evaluate(opt):
                 pose_enc.cuda()
                 pose_dec.cuda()
 
-        encoder = networks.ManyDepthAnythingEncoder(encoder_name=opt.depth_anything_encoder)
-        depth_decoder = networks.ManyDepthAnythingDecoder(
-            adaptive_bins=True, min_depth_bin=0.1, max_depth_bin=20.0,
-            depth_binning=opt.depth_binning, num_depth_bins=opt.num_depth_bins,
-            matching_height=opt.height // 14, matching_width=opt.width //14)
+            encoder = networks.ManyDepthAnythingEncoder(encoder_name=opt.depth_anything_encoder)
+            depth_decoder = networks.ManyDepthAnythingDecoder(
+                adaptive_bins=True, min_depth_bin=0.1, max_depth_bin=20.0,
+                depth_binning=opt.depth_binning, num_depth_bins=opt.num_depth_bins,
+                matching_height=opt.height // 14, matching_width=opt.width //14)
         
-        multi_scaler = networks.DepthScaler()
+        scaler = networks.DepthScaler()
 
         #model_dict = encoder.state_dict()
         encoder.load_state_dict(encoder_dict, strict=False)
         depth_decoder.load_state_dict(torch.load(decoder_path))
-        multi_scaler.load_state_dict(torch.load(scaler_path))
+        scaler.load_state_dict(torch.load(scaler_path))
         encoder.eval()
         depth_decoder.eval()
-        multi_scaler.eval()
+        scaler.eval()
         if torch.cuda.is_available():
             encoder.cuda()
             depth_decoder.cuda()
-            multi_scaler.cuda()
+            scaler.cuda()
 
         pred_disps = []
 
@@ -181,8 +179,9 @@ def evaluate(opt):
                     input_color = input_color.cuda()
 
                 if opt.eval_teacher:
-                    output = encoder(input_color)
-                    output = depth_decoder(output)
+                    features = encoder.get_intermediate_layers(input_color, [2, 5, 8, 11], return_class_token=True)
+                    patch_h, patch_w = input_color.shape[-2] // 14, input_color.shape[-1] // 14
+                    output, depth_feats = depth_decoder(features, patch_h, patch_w)
                 else:
 
                     if opt.static_camera:
@@ -250,7 +249,10 @@ def evaluate(opt):
                                                                                 K,
                                                                                 invK,
                                                                                 min_depth_bin, max_depth_bin)
-                    scale, shift = multi_scaler(features, depth_feats)
+                scale, shift = scaler(features)
+                if not opt.eval_teacher:
+                    output =  (output * (scale) + shift ).sigmoid()
+                else:
                     output =  (output * (scale) + shift).sigmoid()
                 pred_disp, _ = disp_to_depth(output, opt.min_depth, opt.max_depth)
                 

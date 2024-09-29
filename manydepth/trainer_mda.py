@@ -113,13 +113,13 @@ class Trainer:
 
         if self.train_teacher_and_pose:
             for param in self.models["mono_encoder"].parameters():
-                param.requires_grad = False
-            self.models["mono_encoder"].cls_token.requires_grad = True
-            self.parameters_to_train.append({'params': self.models["mono_encoder"].cls_token, 'lr': self.opt.learning_rate})
-            #self.parameters_to_train.append({'params': self.models["mono_depth"].parameters(), 'lr': self.opt.learning_rate/50})
+                param.requires_grad = True
+            #self.models["mono_encoder"].cls_token.requires_grad = True
+            #self.parameters_to_train.append({'params': self.models["mono_encoder"], 'lr': self.opt.learning_rate})
+            self.parameters_to_train.append({'params': self.models["mono_depth"].parameters(), 'lr': self.opt.learning_rate/100})
             
             
-        self.models["mono_scaler"] = networks.DepthScaler()
+        self.models["mono_scaler"] = networks.DepthScaler(dropout_rate=0.0)
         self.models["mono_scaler"].to(self.device)
         self.parameters_to_train.append({'params': self.models["mono_scaler"].parameters(), 'lr': self.opt.learning_rate})
         
@@ -363,7 +363,8 @@ class Trainer:
             input_image = inputs["color_aug", 0, 0]
             patch_h, patch_w = input_image.shape[-2] // 14, input_image.shape[-1] // 14
             # TODO
-            feats = self.models["mono_encoder"].get_intermediate_layers(input_image, [2, 5, 8, 11], return_class_token=True)
+            with torch.no_grad():
+                feats = self.models["mono_encoder"].get_intermediate_layers(input_image, [2, 5, 8, 11], return_class_token=True)
             monodepth, depth_feats = self.models['mono_depth'](feats, patch_h, patch_w)
             scale, shift = self.models["mono_scaler"](feats, depth_feats)
             monodepth =  (monodepth * scale  + shift).sigmoid()
@@ -409,8 +410,8 @@ class Trainer:
                                                                     min_depth_bin=min_depth_bin,
                                                                     max_depth_bin=max_depth_bin)
         scale, shift = self.models["multi_scaler"](features, depth_feats)
+        #depth =  (depth ).sigmoid()
         depth =  (depth * scale + shift).sigmoid()
-        
         outputs.update({("disp", 0): depth})
 
         outputs["lowest_cost"] = F.interpolate(lowest_cost.unsqueeze(1),
@@ -451,8 +452,8 @@ class Trainer:
         min_depth = max(self.opt.min_depth, min_depth * 0.9)
         max_depth = max_depth * 1.1
 
-        self.max_depth_tracker = self.max_depth_tracker * 0.09 + max_depth * 0.01
-        self.min_depth_tracker = self.min_depth_tracker * 0.09 + min_depth * 0.01
+        self.max_depth_tracker = self.max_depth_tracker * 0.9 + max_depth * 0.1
+        self.min_depth_tracker = self.min_depth_tracker * 0.9 + min_depth * 0.1
 
     def predict_poses(self, inputs, features=None):
         """Predict poses between input frames for monocular sequences.
