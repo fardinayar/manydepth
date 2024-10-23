@@ -110,7 +110,7 @@ class DPTHead(nn.Module):
             nn.Conv2d(head_features_1 // 2, head_features_2, kernel_size=3, stride=1, padding=1),
             nn.ReLU(True),
             nn.Conv2d(head_features_2, 1, kernel_size=1, stride=1, padding=0),
-            # TODO SIGMOID
+            
         )
     
     def forward(self, out_features, patch_h, patch_w):

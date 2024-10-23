@@ -98,11 +98,13 @@ class Trainer:
                 })
         # TODO  
         self.models["depth"].load_state_dict(depthanything_weights_decoder, strict=False)
+        
+        
         self.models["depth"].to(self.device)
 
         if self.opt.encoder_lr_coef != 0.0:
             self.parameters_to_train.append({'params': self.models["encoder"].parameters(), 'lr': self.opt.encoder_lr_coef * self.opt.learning_rate})
-        self.parameters_to_train.append({'params': self.models["depth"].parameters()})
+        self.parameters_to_train.append({'params': self.models["depth"].parameters(), 'lr': self.opt.learning_rate})
 
         encoder, decoder = networks.get_da_encoder_decoder(encoder_name=self.opt.depth_anything_encoder)
         self.models["mono_encoder"] = encoder
@@ -113,13 +115,13 @@ class Trainer:
 
         if self.train_teacher_and_pose:
             for param in self.models["mono_encoder"].parameters():
-                param.requires_grad = True
-            #self.models["mono_encoder"].cls_token.requires_grad = True
-            #self.parameters_to_train.append({'params': self.models["mono_encoder"], 'lr': self.opt.learning_rate})
-            self.parameters_to_train.append({'params': self.models["mono_depth"].parameters(), 'lr': self.opt.learning_rate/100})
+                param.requires_grad = False
+            self.models["mono_encoder"].cls_token.requires_grad = True
+            #self.parameters_to_train.append({'params': self.models["mono_encoder"].cls_token, 'lr': self.opt.learning_rate})
+            #self.parameters_to_train.append({'params': self.models["mono_depth"].parameters(), 'lr': self.opt.learning_rate/100})
             
             
-        self.models["mono_scaler"] = networks.DepthScaler(dropout_rate=0.0)
+        self.models["mono_scaler"] = networks.DepthScaler()
         self.models["mono_scaler"].to(self.device)
         self.parameters_to_train.append({'params': self.models["mono_scaler"].parameters(), 'lr': self.opt.learning_rate})
         
@@ -409,8 +411,9 @@ class Trainer:
                                                                     inputs[('inv_K', 2)],
                                                                     min_depth_bin=min_depth_bin,
                                                                     max_depth_bin=max_depth_bin)
+        
         scale, shift = self.models["multi_scaler"](features, depth_feats)
-        #depth =  (depth ).sigmoid()
+        #depth =  (depth )
         depth =  (depth * scale + shift).sigmoid()
         outputs.update({("disp", 0): depth})
 
@@ -442,8 +445,8 @@ class Trainer:
     def update_adaptive_depth_bins(self, outputs):
         """Update the current estimates of min/max depth using exponental weighted average"""
 
-        min_depth = outputs[('mono_depth', 0, 0)].detach().min(-1)[0].min(-1)[0]
-        max_depth = outputs[('mono_depth', 0, 0)].detach().max(-1)[0].max(-1)[0]
+        min_depth = outputs[('depth', 0, 0)].detach().min(-1)[0].min(-1)[0]
+        max_depth = outputs[('depth', 0, 0)].detach().max(-1)[0].max(-1)[0]
 
         min_depth = min_depth.mean().cpu().item()
         max_depth = max_depth.mean().cpu().item()
@@ -709,7 +712,7 @@ class Trainer:
                 mono_depth = outputs[("mono_depth", 0, scale)].detach()
                 #consistency_loss = torch.abs(multi_depth - mono_depth) * consistency_mask
                 
-                consistency_loss =  0.001 * get_smooth_disparity_loss(multi_depth, mono_depth)  + torch.abs(multi_depth - mono_depth) * consistency_mask
+                consistency_loss =  0.01 * get_smooth_disparity_loss(multi_depth, mono_depth) #+ torch.abs(multi_depth - mono_depth) * consistency_mask
                                     
                 consistency_loss = consistency_loss.mean()
 
