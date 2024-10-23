@@ -259,7 +259,7 @@ class MonodepthOptions:
         
         self.parser.add_argument('--encoder_lr_coef',
                                  type=float,
-                                 default=0.1)
+                                 default=0.0)
         
     def parse(self):
         self.options = self.parser.parse_args()

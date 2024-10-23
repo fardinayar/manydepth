@@ -6,75 +6,83 @@ from .resnet_encoder import ResnetEncoderMatching
 from layers import BackprojectDepth, Project3D
 from .depth_anything_v2.util.blocks import FeatureFusionBlock, _make_scratch
 import copy
+import loralib as lora
+
 MODEL_CONFIGS = {
     'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
     'vitb': {'encoder': 'vitb', 'features': 128, 'out_channels': [96, 192, 384, 768]},
     'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
     'vitg': {'encoder': 'vitg', 'features': 384, 'out_channels': [1536, 1536, 1536, 1536]}
 }
-
-
-import torch.nn as nn
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class TransformerDecoderLayer(nn.Module):
+    def __init__(self, d_model, nhead, dim_feedforward=384*2, dropout=0.4):
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+        self.multihead_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.norm3 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.dropout3 = nn.Dropout(dropout)
+
+        self.activation = F.relu
+
+    def forward(self, tgt, memory):
+        tgt2 = self.norm1(tgt)
+        tgt2 = self.self_attn(tgt2, tgt2, tgt2)[0]
+        tgt = tgt + self.dropout1(tgt2)
+        tgt2 = self.norm2(tgt)
+        tgt2 = self.multihead_attn(tgt2, memory, memory)[0]
+        tgt = tgt + self.dropout2(tgt2)
+        tgt2 = self.norm3(tgt)
+        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt2))))
+        tgt = tgt + self.dropout3(tgt2)
+        return tgt
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 class DepthScaler(nn.Module):    
-    def __init__(self, in_channels=384, hidden_dim=256, dropout_rate=0.4):
+    def __init__(self, in_channels=384, num_heads=8, dropout_rate=0.9):
         super().__init__()
         
-        self.mlp1 = nn.Sequential(
-            nn.Linear(in_channels, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout_rate),
-            nn.Linear(hidden_dim, in_channels),
-            nn.GELU(),
-        )
+        self.query_scale = nn.Parameter(torch.randn(1, 1, in_channels))
+        self.query_shift = nn.Parameter(torch.randn(1, 1, in_channels))
         
-        self.mlp2 = nn.Sequential(
-            nn.Linear(in_channels * 2, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout_rate),
-            nn.Linear(hidden_dim, in_channels),
-            nn.GELU(),
-        )
+        self.attn_scale = nn.MultiheadAttention(in_channels, num_heads=num_heads, dropout=dropout_rate, batch_first=True)
+        self.attn_shift = nn.MultiheadAttention(in_channels, num_heads=num_heads, dropout=dropout_rate, batch_first=True)
         
-        self.mlp3 = nn.Sequential(
-            nn.Linear(in_channels * 2, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout_rate),
-            nn.Linear(hidden_dim, in_channels),
-            nn.GELU(),
-        )
-        
-        self.mlp4 = nn.Sequential(
-            nn.Linear(in_channels * 2, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout_rate),
-            nn.Linear(hidden_dim, in_channels),
-            nn.GELU(),# Output for scale and shift
-        )
-        
-        self.scale = nn.Linear(in_channels//2, 1)
-        self.shift = nn.Linear(in_channels//2, 1) 
+        self.scale_proj = nn.Linear(in_channels, 1)
+        self.shift_proj = nn.Linear(in_channels, 1)
     
-    def forward(self, features, depth_pred_feats=None):
-        # Adapt depth_pred_feats
-        #depth_feat = self.depth_feat_adaptor(depth_pred_feats.mean(-1).mean(-1).squeeze(-1).squeeze(-1))
-        #depth_feat = torch.relu(depth_feat)
-        # Combine features step by step
-        x = self.mlp1(features[-1][1])
-        x = self.mlp2(torch.cat([x, features[-3][1]], dim=-1))
-        x = self.mlp3(torch.cat([x, features[-2][1]], dim=-1))
-        x = self.mlp4(torch.cat([x, features[-1][1]], dim=-1))
+    def forward(self, features, depth=None):
+        # Combine features
+        x = features[-1][0]  # Assuming this is [B, N, C]
         
-        # Split the output into scale and shift
-        scale_shift = x.view(x.size(0), -1, 2)
-        scale = scale_shift[:, :, 0]
-        shift = scale_shift[:, :, 1]
+        # Attention pooling for scale
+        query_scale = self.query_scale.expand(x.size(0), -1, -1)  # [1, B, in_channels]
         
-        scale = self.scale(scale)
-        shift = self.shift(shift)
+        attn_output_scale, _ = self.attn_scale(query_scale, x, x)
         
-        return torch.abs(scale).unsqueeze(-1).unsqueeze(-1), shift.unsqueeze(-1).unsqueeze(-1)
+        # Attention pooling for shift
+        query_shift = self.query_shift.expand(x.size(0), -1, -1)  # [1, B, in_channels]
+        attn_output_shift, _ = self.attn_shift(query_shift, x, x)
+        
+        # Project to get final scale and shift
+        scale = self.scale_proj(attn_output_scale + query_scale).unsqueeze(-1)
+        shift = self.shift_proj(attn_output_shift + query_shift).unsqueeze(-1)
+        
+        return torch.abs(scale), shift
 
 def get_da_encoder_decoder(encoder_name='vits', checkpoint=True):
     da_model = DepthAnythingV2(**MODEL_CONFIGS[encoder_name])
@@ -142,7 +150,6 @@ class ManyDepthAnythingDecoder(ResnetEncoderMatching):
         matching_width=518//14
     ):
         super(ResnetEncoderMatching, self).__init__()
-        
         ### Add mathing to DPT
         self.adaptive_bins = adaptive_bins
         self.depth_binning = depth_binning
@@ -205,7 +212,10 @@ class ManyDepthAnythingDecoder(ResnetEncoderMatching):
             groups=1,
             expand=False,
         )
-        
+        self.transformer_layers = nn.ModuleList([
+            TransformerDecoderLayer(d_model=in_channels, nhead=8)
+            for _ in range(3)  # You can adjust the number of layers
+        ])
         self.scratch.stem_transpose = None
         
         self.scratch.refinenet1 = _make_fusion_block(features, use_bn)
@@ -221,7 +231,7 @@ class ManyDepthAnythingDecoder(ResnetEncoderMatching):
             nn.Conv2d(head_features_1 // 2, head_features_2, kernel_size=3, stride=1, padding=1),
             nn.ReLU(True),
             nn.Conv2d(head_features_2, 1, kernel_size=1, stride=1, padding=0),
-            # TODO SIGMOID
+            #nn.Sigmoid()
         )
         
     def _init_feature_matching_moudules(self, min_depth_bin, max_depth_bin):
@@ -237,12 +247,12 @@ class ManyDepthAnythingDecoder(ResnetEncoderMatching):
         for i in range(len(self.out_channels)):
             reduce_conv = nn.Sequential(nn.Conv2d(self.num_ch_enc + self.num_depth_bins,
                                                     out_channels=self.num_ch_enc,
-                                                    kernel_size=3, stride=1, padding=1, bias=False),
-                                            nn.GELU()
-                                            )
-            for m in reduce_conv.modules():
-                if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d, nn.BatchNorm2d)):
-                    nn.init.normal_(m.weight.data, 0.0, 0.002)
+                                                    kernel_size=3, stride=1, padding=1),
+                                            nn.GELU(),
+                                        nn.Conv2d(self.num_ch_enc,
+                                                    out_channels=self.num_ch_enc,
+                                                    kernel_size=3, stride=1, padding=1),
+                                        )
             self.reduce_convs.append(reduce_conv)
 
     
@@ -268,11 +278,29 @@ class ManyDepthAnythingDecoder(ResnetEncoderMatching):
         
         # mask the cost volume based on the confidence
         cost_volume *= confidence_mask.unsqueeze(1)
-        post_matching_feats = self.reduce_convs[i](torch.cat([current_feats, cost_volume], 1)) + current_feats
+        post_matching_feats = self.reduce_convs[i](torch.cat([current_feats, cost_volume], 1)) 
 
         return post_matching_feats, lowest_cost, confidence_mask
-
     
+    def _fuse_matching_cross_attention(self, current_feats, lookup_feats):
+        batch_size, channels, height, width = current_feats.shape
+        
+        # Reshape current_feats
+        current_feats_flat = current_feats.view(batch_size, channels, -1).permute(2, 0, 1)
+        
+        # Reshape lookup_feats
+        lookup_feats_flat = lookup_feats.view(batch_size, -1, height * width).permute(2, 0, 1)
+        
+        # Pass through transformer decoder layers
+        output = current_feats_flat
+        for layer in self.transformer_layers:
+            output = layer(output, lookup_feats_flat)
+
+        # Reshape output back to original dimensions
+        fused_features = output.permute(1, 2, 0).view(batch_size, channels, height, width)
+
+        return fused_features
+
     def forward(self, out_features, lookup_features, patch_h, patch_w,  poses, K, invK,
                 min_depth_bin=None, max_depth_bin=None):
         out = []
@@ -291,9 +319,10 @@ class ManyDepthAnythingDecoder(ResnetEncoderMatching):
                 
             x = x.permute(0, 2, 1).reshape((x.shape[0], x.shape[-1], patch_h, patch_w))
             lookup_feature = lookup_feature.permute(0, 2, 1).reshape((lookup_feature.shape[0], lookup_feature.shape[-1], patch_h, patch_w))
-            if i < 3:
-                x, lowest_cost, confidence_mask = self._fuse_matching_features(i, x, lookup_feature, poses, K, invK, min_depth_bin, max_depth_bin)
+            if i < 1:
+                _, lowest_cost, confidence_mask = self._fuse_matching_features(i, x, lookup_feature, poses, K, invK, min_depth_bin, max_depth_bin)
             
+                x = self._fuse_matching_cross_attention(x, lookup_feature)
             x = self.projects[i](x)
             x = self.resize_layers[i](x)
             
