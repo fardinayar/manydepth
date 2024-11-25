@@ -70,7 +70,7 @@ class MonodepthOptions:
         self.parser.add_argument("--disparity_smoothness",
                                  type=float,
                                  help="disparity smoothness weight",
-                                 default=0.0)
+                                 default=0.1)
         self.parser.add_argument("--scales",
                                  nargs="+",
                                  type=int,
@@ -259,7 +259,7 @@ class MonodepthOptions:
         
         self.parser.add_argument('--encoder_lr_coef',
                                  type=float,
-                                 default=0.0)
+                                 default=1)
         
     def parse(self):
         self.options = self.parser.parse_args()
