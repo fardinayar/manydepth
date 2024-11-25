@@ -232,6 +232,26 @@ def get_smooth_disparity_loss(disp1, disp2):
 
     return grad_disp1_x.mean() + grad_disp1_y.mean()
 
+
+def get_smooth_disparity_loss2(multi_depth, mono_depth):
+    # Normalize depths per sample in the batch
+    batch_size = multi_depth.shape[0]
+    multi_depth_norm = (multi_depth - multi_depth.view(batch_size, -1).mean(dim=1).view(batch_size, 1, 1, 1)) / (multi_depth.view(batch_size, -1).std(dim=1).view(batch_size, 1, 1, 1) + 1e-6)
+    mono_depth_norm = (mono_depth - mono_depth.view(batch_size, -1).mean(dim=1).view(batch_size, 1, 1, 1)) / (mono_depth.view(batch_size, -1).std(dim=1).view(batch_size, 1, 1, 1) + 1e-6)
+
+    # Compute gradients
+    grad_multi_x = multi_depth_norm[:, :, :, 1:] - multi_depth_norm[:, :, :, :-1]
+    grad_multi_y = multi_depth_norm[:, :, 1:, :] - multi_depth_norm[:, :, :-1, :]
+    grad_mono_x = mono_depth_norm[:, :, :, 1:] - mono_depth_norm[:, :, :, :-1]
+    grad_mono_y = mono_depth_norm[:, :, 1:, :] - mono_depth_norm[:, :, :-1, :]
+
+    # Compute loss
+    loss_x = torch.abs(grad_multi_x - grad_mono_x)
+    loss_y = torch.abs(grad_multi_y - grad_mono_y)
+
+    # Average over batch and spatial dimensions
+    return loss_x.mean() + loss_y.mean()
+
 class SSIM(nn.Module):
     """Layer to compute the SSIM loss between a pair of images
     """

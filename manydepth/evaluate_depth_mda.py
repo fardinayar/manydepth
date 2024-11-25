@@ -5,12 +5,14 @@
 # available in the LICENSE file.
 
 import os
+
+from networks.replace_with_lora import replace_qkv_with_mergedlinear
 os.environ["MKL_NUM_THREADS"] = "1"  # noqa F402
 os.environ["NUMEXPR_NUM_THREADS"] = "1"  # noqa F402
 os.environ["OMP_NUM_THREADS"] = "1"  # noqa F402
 import cv2
 import numpy as np
-
+from copy import deepcopy
 import torch
 from torch.utils.data import DataLoader
 
@@ -154,6 +156,7 @@ def evaluate(opt):
                 matching_height=opt.height // 14, matching_width=opt.width //14)
         
         scaler = networks.DepthScaler()
+        encoder = replace_qkv_with_mergedlinear(encoder)
 
         #model_dict = encoder.state_dict()
         encoder.load_state_dict(encoder_dict, strict=False)
@@ -249,7 +252,7 @@ def evaluate(opt):
                                                                                 K,
                                                                                 invK,
                                                                                 min_depth_bin, max_depth_bin)
-                scale, shift = scaler(features)
+                scale, shift = scaler(features, depth_feats)
                 if not opt.eval_teacher:
                     output =  (output * (scale) + shift ).sigmoid()
                 else:
@@ -325,6 +328,7 @@ def evaluate(opt):
         print("   Mono evaluation - using median scaling")
 
     errors = []
+    errors_metric = []
     ratios = []
     for i in tqdm.tqdm(range(pred_disps.shape[0])):
 
@@ -366,6 +370,8 @@ def evaluate(opt):
 
         pred_depth = pred_depth[mask]
         gt_depth = gt_depth[mask]
+        
+        pred_depth_metric = deepcopy(pred_depth)
 
         pred_depth *= opt.pred_depth_scale_factor
         if not opt.disable_median_scaling:
@@ -377,7 +383,8 @@ def evaluate(opt):
         pred_depth[pred_depth > MAX_DEPTH] = MAX_DEPTH
 
         errors.append(compute_errors(gt_depth, pred_depth))
-
+        errors_metric.append(compute_errors(gt_depth, pred_depth_metric))
+        
     if opt.save_pred_disps:
         print("saving errors")
         if opt.zero_cost_volume:
@@ -391,13 +398,17 @@ def evaluate(opt):
     if not opt.disable_median_scaling:
         ratios = np.array(ratios)
         med = np.median(ratios)
-        print(" Scaling ratios | med: {:0.3f} | std: {:0.3f}".format(med, np.std(ratios / med)))
+        print(" Scaling ratios | med: {:0.3f} | std: {:0.3f}".format(med, np.std(ratios)))
 
     mean_errors = np.array(errors).mean(0)
+    mean_errors_metric = np.array(errors_metric).mean(0)
 
-    print("\n  " + ("{:>8} | " * 7).format("abs_rel",
-                                           "sq_rel", "rmse", "rmse_log", "a1", "a2", "a3"))
+    print(".....SCALED WITH GROUND TRUTH......")
+    print("\n  " + ("{:>8} | " * 7).format("abs_rel", "sq_rel", "rmse", "rmse_log", "a1", "a2", "a3"))
     print(("&{: 8.3f}  " * 7).format(*mean_errors.tolist()) + "\\\\")
+    print("\n\n.....UNSCALED......")
+    print("\n  " + ("{:>8} | " * 7).format("abs_rel", "sq_rel", "rmse", "rmse_log", "a1", "a2", "a3"))
+    print(("&{: 8.3f}  " * 7).format(*mean_errors_metric.tolist()) + "\\\\")
     print("\n-> Done!")
 
 
