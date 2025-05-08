@@ -62,7 +62,7 @@ class MonodepthOptions:
         self.parser.add_argument("--height",
                                  type=int,
                                  help="input image height",
-                                 default=518)
+                                 default=182)
         self.parser.add_argument("--width",
                                  type=int,
                                  help="input image width",
@@ -70,7 +70,7 @@ class MonodepthOptions:
         self.parser.add_argument("--disparity_smoothness",
                                  type=float,
                                  help="disparity smoothness weight",
-                                 default=0.1)
+                                 default=0.0)
         self.parser.add_argument("--scales",
                                  nargs="+",
                                  type=int,
@@ -260,6 +260,10 @@ class MonodepthOptions:
         self.parser.add_argument('--encoder_lr_coef',
                                  type=float,
                                  default=1)
+        
+        self.parser.add_argument("--g2s",
+                         help="use g2s loss",
+                         action="store_true")
         
     def parse(self):
         self.options = self.parser.parse_args()

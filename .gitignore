@@ -3,3 +3,5 @@
 outs
 checkpoints
 outs2
+kitti_data/
+*.pth

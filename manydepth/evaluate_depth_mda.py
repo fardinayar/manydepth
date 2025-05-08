@@ -6,7 +6,7 @@
 
 import os
 
-from networks.replace_with_lora import replace_qkv_with_mergedlinear
+from networks.replace_with_lora import replace_qkv_with_mergedlinear, replace_conv_with_loraconv
 os.environ["MKL_NUM_THREADS"] = "1"  # noqa F402
 os.environ["NUMEXPR_NUM_THREADS"] = "1"  # noqa F402
 os.environ["OMP_NUM_THREADS"] = "1"  # noqa F402
@@ -157,6 +157,7 @@ def evaluate(opt):
         
         scaler = networks.DepthScaler()
         encoder = replace_qkv_with_mergedlinear(encoder)
+        depth_decoder = replace_conv_with_loraconv(depth_decoder)
 
         #model_dict = encoder.state_dict()
         encoder.load_state_dict(encoder_dict, strict=False)
@@ -252,7 +253,7 @@ def evaluate(opt):
                                                                                 K,
                                                                                 invK,
                                                                                 min_depth_bin, max_depth_bin)
-                scale, shift = scaler(features, depth_feats)
+                scale, shift = scaler(features)
                 if not opt.eval_teacher:
                     output =  (output * (scale) + shift ).sigmoid()
                 else:

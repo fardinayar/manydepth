@@ -52,65 +52,76 @@ class TransformerDecoderLayer(nn.Module):
         tgt2 = self.norm3(tgt)
         tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt2))))
         tgt = tgt + self.dropout3(tgt2)
-        return tgt*F.sigmoid(self.lam) + input_tgt*(1 - F.sigmoid(self.lam))
+        return tgt
 
 class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_len=1369):
+    def __init__(self, d_model, dropout=0.1, max_len=5000):
         super().__init__()
-        
+        self.dropout = nn.Dropout(p=dropout)
         pe = torch.zeros(max_len, d_model)
         position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
         div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
-        
-        pe = pe.unsqueeze(0).transpose(0, 1)
+        pe = pe.unsqueeze(0)  # shape: (1, max_len, d_model)
         self.register_buffer('pe', pe)
-
+        
     def forward(self, x):
-        return x + self.pe[:x.size(0), :]
-    
-class DepthScaler(nn.Module):    
-    def __init__(self, in_channels=384, num_heads=8, dropout_rate=0.4, layern=True):
+        # x: (batch_size, seq_len, d_model)
+        x = x + self.pe[:, :x.size(1), :]
+        return self.dropout(x)
+
+class DepthScaler(nn.Module):
+    def __init__(self, in_channels=384, hidden_dim=128, num_heads=8, dropout_rate=0.4, num_decoder_layers=3):
         super().__init__()
+        # Downproject features to a compact representation
+        self.down_proj = nn.Linear(in_channels, hidden_dim)
+        self.pos_encoder = PositionalEncoding(hidden_dim, dropout_rate)
         
-        self.query_scale_shift = nn.Parameter(torch.randn(1, 1, in_channels))
-        self.attn_shift = nn.ModuleList(
-            [nn.MultiheadAttention(in_channels, num_heads=num_heads, dropout=dropout_rate, batch_first=True) for _ in range(3)]
-        )
-        self.lin_shift = nn.ModuleList(
-            [nn.Linear(in_channels, in_channels) for _ in range(3)]
-        )
+        # Define the Transformer decoder using standard decoder layers
+        decoder_layer = nn.TransformerDecoderLayer(d_model=hidden_dim,
+                                                   nhead=num_heads,
+                                                   dropout=dropout_rate,
+                                                   batch_first=True)
+        self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_decoder_layers)
         
-        self.layern = nn.ModuleList(
-            [nn.Identity(in_channels) for _ in range(3)]   
-        )
-        self.layern_shift = nn.LayerNorm(in_channels)
-        self.layern_scale = nn.LayerNorm(in_channels)
-
-        self.scale_proj = nn.Linear(in_channels, 1)
-        self.shift_proj = nn.Linear(in_channels, 1)
+        # Two learnable queries: one for scale and one for shift.
+        # These act as the target tokens for the transformer decoder.
+        self.queries = nn.Parameter(torch.randn(2, hidden_dim))
+        self.layer_norm = nn.LayerNorm(hidden_dim)
         
-        self.pos_encoder = PositionalEncoding(in_channels)
-
-    
-    def forward(self, features, depth=None):
-        # Combine features
-        attn_output = self.query_scale_shift.expand(features[0][0].size(0), -1, -1)  # [1, B, in_channels]
-
-
-        for i in range(3):
-            x = features[i-3][0]
-            x = self.pos_encoder(x)
-
-            attn_output, _ = self.attn_shift[0](attn_output, x, x) 
-            attn_output = self.lin_shift[0](attn_output+ attn_output) + attn_output
-            # Project to get final scale and shift
-        scale = self.scale_proj(self.layern_scale(attn_output)).unsqueeze(-1)
-        shift = self.shift_proj(self.layern_shift(attn_output)).unsqueeze(-1)
+        # Final projection layers for scale and shift outputs.
+        self.scale_proj = nn.Linear(hidden_dim, 1)
+        self.shift_proj = nn.Linear(hidden_dim, 1)
         
-        return torch.abs(scale), shift
+    def forward(self, features):
+        """
+        Args:
+            features: Tensor of shape (batch_size, seq_len, in_channels)
+                      representing the source features.
+        Returns:
+            scale: Tensor of shape (batch_size, 1, 1)
+            shift: Tensor of shape (batch_size, 1, 1)
+        """
+        # Downproject the features to hidden_dim
+        x = self.down_proj(features[-1][0])  # shape: (B, seq_len, hidden_dim)
+        x = self.pos_encoder(x)
+        
+        batch_size = x.size(0)
+        # Expand the two queries across the batch dimension.
+        # The queries tensor becomes shape: (batch_size, 2, hidden_dim)
+        queries = self.queries.unsqueeze(0).expand(batch_size, -1, -1)
+        
+        # Use the transformer decoder: the target is the queries and the memory is x.
+        out = self.transformer_decoder(tgt=queries, memory=x)  # shape: (B, 2, hidden_dim)
+        out = self.layer_norm(out)
+        
+        # The first token corresponds to scale and the second to shift.
+        scale = torch.abs(self.scale_proj(out[:, 0, :]))  # shape: (B, 1)
+        shift = self.shift_proj(out[:, 1, :])               # shape: (B, 1)
+        
+        # Optionally unsqueeze to add an extra dimension (if needed downstream)
+        return scale.unsqueeze(-1).unsqueeze(-1), shift.unsqueeze(-1).unsqueeze(-1)
 
 def get_da_encoder_decoder(encoder_name='vits', checkpoint=True):
     da_model = DepthAnythingV2(**MODEL_CONFIGS[encoder_name])
@@ -240,14 +251,24 @@ class ManyDepthAnythingDecoder(ResnetEncoderMatching):
             groups=1,
             expand=False,
         )
-        '''self.transformer_layers = nn.ModuleList([
-            TransformerDecoderLayer(d_model=in_channels, nhead=8)
-            for _ in range(1)  # You can adjust the number of layers
-        ])'''
+        self.transformer_layers = nn.ModuleList([
+            nn.ModuleList([
+                TransformerDecoderLayer(d_model=in_channels, nhead=8)
+                for _ in range(2)  # You can adjust the number of layers
+            ])
+        for _ in range(4)])
         
 
         
-        self.preciver = PreceiverIO(in_channels*2, in_channels/4, in_channels, 96, self.matching_height*self.matching_width, 4, 4, 96*2)
+        self.preciver = PreceiverIO(in_channels, in_channels//8, in_channels, self.matching_height*self.matching_width//4, self.matching_height*self.matching_width, 4, in_channels*2)
+        '''pp=0
+        for p in list(self.preciver.parameters()):
+            nnn=1
+            for s in list(p.size()):
+                nnn = nnn*s
+            pp += nnn
+        print(pp)
+        exit(1)'''
         self.scratch.stem_transpose = None
         
         self.scratch.refinenet1 = _make_fusion_block(features, use_bn)
@@ -313,7 +334,7 @@ class ManyDepthAnythingDecoder(ResnetEncoderMatching):
 
         return post_matching_feats, lowest_cost, confidence_mask
     
-    def _fuse_matching_cross_attention(self, current_feats, lookup_feats):
+    def _fuse_matching_cross_attention(self, current_feats, lookup_feats, i):
         batch_size, channels, height, width = current_feats.shape
         
         # Reshape current_feats
@@ -324,13 +345,13 @@ class ManyDepthAnythingDecoder(ResnetEncoderMatching):
         
         # Pass through transformer decoder layers
         output = current_feats_flat
-        for layer in self.transformer_layers:
+        for layer in self.transformer_layers[i]:
             output = layer(output, lookup_feats_flat)
 
         # Reshape output back to original dimensions
         fused_features = output.permute(1, 2, 0).view(batch_size, channels, height, width)
 
-        return fused_features
+        return fused_features + current_feats
     
     def _fuse_features_preciver(self, current_feats, lookup_feats):
         batch_size, channels, height, width = current_feats.shape
@@ -366,7 +387,7 @@ class ManyDepthAnythingDecoder(ResnetEncoderMatching):
                 
             x = x.permute(0, 2, 1).reshape((x.shape[0], x.shape[-1], patch_h, patch_w))
             lookup_feature = lookup_feature.permute(0, 2, 1).reshape((lookup_feature.shape[0], lookup_feature.shape[-1], patch_h, patch_w))
-            if i < 3:
+            if i > 2:
                 _, lowest_cost, confidence_mask = self._fuse_matching_features(i, x, lookup_feature, poses, K, invK, min_depth_bin, max_depth_bin)
             
                 x = self._fuse_features_preciver(x, lookup_feature)

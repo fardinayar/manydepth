@@ -21,6 +21,27 @@ from torchvision import transforms
 cv2.setNumThreads(0)
 
 
+def txt_reader_eigen(path, frame_index):
+    with open(path, 'r') as f:
+        poses = f.readlines()
+        translations = []
+        for pose in poses[frame_index - 1: frame_index + 2]:
+            pose = pose.rstrip()
+            translation = [
+                float(pose.split(" ")[3]),
+                float(pose.split(" ")[7]),
+                float(pose.split(" ")[11])
+            ]
+            translations.append(translation)
+        return translations
+
+
+def norm(t1, t2):
+    diff = 0
+    for c1, c2 in zip(t1, t2):
+        diff += (c1 - c2) ** 2
+    return diff ** 0.5
+
 def pil_loader(path):
     # open path as file to avoid ResourceWarning
     # (https://github.com/python-pillow/Pillow/issues/835)
@@ -40,8 +61,9 @@ class MonoDataset(data.Dataset):
                  frame_idxs,
                  num_scales,
                  is_train=False,
-                 img_ext='.jpg',
-                 ):
+                img_ext='.png',
+                load_gps=False
+                ):
         super(MonoDataset, self).__init__()
 
         self.data_path = data_path
@@ -82,6 +104,7 @@ class MonoDataset(data.Dataset):
                                                interpolation=self.interp)
 
         self.load_depth = self.check_depth()
+        self.load_gps = load_gps
 
     def preprocess(self, inputs, color_aug):
         """Resize colour images to the required scales and augment if required
@@ -106,6 +129,7 @@ class MonoDataset(data.Dataset):
                     inputs[(n + "_aug", im, i)] = inputs[(n, im, i)]
                 else:
                     inputs[(n + "_aug", im, i)] = self.to_tensor(color_aug(f))
+
 
     def __len__(self):
         return len(self.filenames)
@@ -164,6 +188,13 @@ class MonoDataset(data.Dataset):
                                                     f'--data_path is set correctly, or try adding'
                                                     f' the --png flag. {e}')
 
+
+        if self.load_gps:
+            gps_path = os.path.join(self.data_path, folder, folder.split("/")[-1] + ".txt")
+            translations = txt_reader_eigen(gps_path, frame_index)
+            inputs["gps12"] = norm(translations[1], translations[0])
+            inputs["gps23"] = norm(translations[1], translations[2])
+            
         # adjusting intrinsics to match each scale in the pyramid
         for scale in range(self.num_scales):
             K = self.load_intrinsics(folder, frame_index)

@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import loralib as lora
 
-def replace_qkv_with_mergedlinear(model, r=1, lora_alpha=32, lora_dropout=0.1):
+def replace_qkv_with_mergedlinear(model, r=16, lora_alpha=16, lora_dropout=0.0):
     """
     Recursively replace all qkv linear layers in the model with MergedLinear from loralib.
     
@@ -47,4 +47,51 @@ def replace_qkv_with_mergedlinear(model, r=1, lora_alpha=32, lora_dropout=0.1):
             # Recursively apply to child modules
             replace_qkv_with_mergedlinear(module, r, lora_alpha, lora_dropout)
     
+    return model
+
+
+
+def replace_conv_with_loraconv(model, r=64, lora_alpha=1, lora_dropout=0.0):
+    """
+    Recursively replace all convolutional layers in the model with LoRA-enhanced convolutional layers.
+    
+    Args:
+    - model: The PyTorch model to modify.
+    - r: LoRA rank.
+    - lora_alpha: LoRA alpha parameter.
+    - lora_dropout: Dropout probability for LoRA layers.
+    
+    Returns:
+    - The modified model.
+    """
+    for name, module in model.named_children():
+        if isinstance(module, nn.Conv2d):
+            # Create a new LoRA Conv2d layer
+            new_layer = lora.Conv2d(
+                in_channels=module.in_channels,
+                out_channels=module.out_channels,
+                kernel_size=module.kernel_size[0],
+                stride=module.stride,
+                padding=module.padding,
+                dilation=module.dilation,
+                groups=module.groups,
+                bias=module.bias is not None,
+                r=r,
+                lora_alpha=lora_alpha,
+                lora_dropout=lora_dropout
+            )
+
+            # Copy the weights and bias from the original layer
+            with torch.no_grad():
+                new_layer.weight.copy_(module.weight)
+                if module.bias is not None:
+                    new_layer.bias.copy_(module.bias)
+
+            # Replace the old layer with the new one
+            setattr(model, name, new_layer)
+            print(f"Replaced Conv2d layer: {name}")
+        else:
+            # Recursively apply to child modules
+            replace_conv_with_loraconv(module, r, lora_alpha, lora_dropout)
+
     return model
