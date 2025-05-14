@@ -89,7 +89,6 @@ class Trainer:
         self.models['encoder'] = replace_qkv_with_mergedlinear(self.models["encoder"])
         lora.mark_only_lora_as_trainable(self.models['encoder'])
         self.models["encoder"].to(self.device)
-        self.models["encoder"].encoder.pos_embed.require_grad = True
         self.models["encoder"].encoder.cls_token.require_grad = True
 
         self.models["depth"] = networks.ManyDepthAnythingDecoder(
@@ -105,11 +104,11 @@ class Trainer:
                     key.replace('depth_head.', ''): value
                 })
         # TODO  
-        #self.models["depth"].load_state_dict(depthanything_weights_decoder, strict=False)
-        #self.models['depth'] = replace_conv_with_loraconv(self.models["depth"])
-        #lora.mark_only_lora_as_trainable(self.models['depth'])
+        self.models["depth"].load_state_dict(depthanything_weights_decoder, strict=False)
+        self.models['depth'] = replace_conv_with_loraconv(self.models["depth"])
+        lora.mark_only_lora_as_trainable(self.models['depth'])
         for name, p in self.models['depth'].named_parameters():
-            if 'preciver' in name:
+            if 'transformer_layers' in name:
                 p.requires_grad = True
         
         self.models["depth"].to(self.device)
@@ -120,18 +119,15 @@ class Trainer:
 
         encoder, decoder = networks.get_da_encoder_decoder(encoder_name=self.opt.depth_anything_encoder)
         self.models["mono_encoder"] = encoder
-        self.models['mono_encoder'] = replace_qkv_with_mergedlinear(self.models["mono_encoder"])
-        lora.mark_only_lora_as_trainable(self.models['mono_encoder'])
         self.models["mono_encoder"].to(self.device)
 
         self.models["mono_depth"] = decoder
         self.models["mono_depth"].to(self.device)
         
         
-        if self.train_teacher_and_pose:
-            pass
-            #self.parameters_to_train.append({'params': self.models["mono_encoder"].parameters(), 'lr': self.opt.learning_rate})
-            #self.parameters_to_train.append({'params': self.models["mono_depth"].parameters(), 'lr': self.opt.learning_rate})
+        #if self.train_teacher_and_pose:
+        #    self.parameters_to_train.append({'params': self.models["mono_encoder"].parameters(), 'lr': self.opt.learning_rate})
+        #    self.parameters_to_train.append({'params': self.models["mono_depth"].parameters(), 'lr': self.opt.learning_rate})
             
         
         
@@ -150,11 +146,15 @@ class Trainer:
                                  num_frames_to_predict_for=2)
         self.models["pose"].to(self.device)
         
+        
+        pose_encoder_weights = torch.load(f'pose_encoder.pth', map_location='cpu')
+        pose_weights = torch.load(f'pose.pth', map_location='cpu')
+    
         pose_encoder_weights = torch.load(f'pose_encoder.pth', map_location='cpu')
         pose_weights = torch.load(f'pose.pth', map_location='cpu')
         
-        self.models["pose_encoder"].load_state_dict(pose_encoder_weights, strict=True)
-        self.models["pose"].load_state_dict(pose_weights, strict=True)
+        '''self.models["pose_encoder"].load_state_dict(pose_encoder_weights, strict=True)
+        self.models["pose"].load_state_dict(pose_weights, strict=True)'''
 
         if self.train_teacher_and_pose:
             self.parameters_to_train.append({'params': self.models["pose_encoder"].parameters(), 'lr': self.opt.learning_rate})
@@ -162,7 +162,7 @@ class Trainer:
 
         self.model_optimizer = optim.AdamW(self.parameters_to_train, self.opt.learning_rate)
         self.model_lr_scheduler = optim.lr_scheduler.StepLR(
-            self.model_optimizer, self.opt.scheduler_step_size, 0.1)
+            self.model_optimizer, self.opt.scheduler_step_size//3, 0.1)
 
         if self.opt.load_weights_folder is not None:
             self.load_model()
@@ -239,7 +239,7 @@ class Trainer:
         self.save_opts()
 
     def g2s_weight(self):
-        return 1
+            return math.exp(self.epoch - self.opt.num_epochs+1)
 
     def set_train(self):
         """Convert all models to training mode
@@ -273,6 +273,8 @@ class Trainer:
             self.run_epoch()
             if (self.epoch + 1) % self.opt.save_frequency == 0:
                 self.save_model()
+            
+            
 
     def freeze_teacher(self):
         if self.train_teacher_and_pose:
@@ -334,11 +336,13 @@ class Trainer:
                 self.freeze_teacher()
 
             self.step += 1
+
         self.model_lr_scheduler.step()
 
     def process_batch(self, inputs, is_train=False):
         """Pass a minibatch through the network and generate images and losses
         """
+
         for key, ipt in inputs.items():
             inputs[key] = ipt.to(self.device)
 
@@ -392,8 +396,8 @@ class Trainer:
                 # TODO
                 feats = self.models["mono_encoder"].get_intermediate_layers(input_image, [2, 5, 8, 11], return_class_token=True)
                 monodepth, depth_feats = self.models['mono_depth'](feats, patch_h, patch_w)
-                monodepth = {("disp", 0): monodepth.sigmoid()}
-                mono_outputs.update(monodepth)
+            monodepth = {("disp", 0): monodepth.sigmoid()}
+            mono_outputs.update(monodepth)
         else:
             with torch.no_grad():
                 input_image = inputs["color_aug", 0, 0]
@@ -721,6 +725,7 @@ class Trainer:
             # find minimum losses from [reprojection, identity]
             reprojection_loss_mask = self.compute_loss_masks(reprojection_loss,
                                                              identity_reprojection_loss)
+            
             # standard reprojection loss
             reprojection_loss = reprojection_loss * reprojection_loss_mask
             reprojection_loss = reprojection_loss.sum() / (reprojection_loss_mask.sum() + 1e-7)
@@ -739,7 +744,7 @@ class Trainer:
                 # Patch-based implementation without using log
 
                 # Define patch size
-                patch_size = 128  # Can be adjusted based on input size
+                patch_size = 32  # Can be adjusted based on input size
 
                 # Unfold into patches
                 b, c, h, w = multi_depth.shape
@@ -759,20 +764,19 @@ class Trainer:
                 var_mono = ((patches_mono - mean_mono)**2).mean(dim=1, keepdim=True)
 
                 # Normalize patches using alpha (scale) and beta (shift)
-                alpha_multi = torch.sqrt(var_multi + 1e-7).detach()
+                alpha_multi = torch.sqrt(var_multi + 1e-7)
                 alpha_mono = torch.sqrt(var_mono + 1e-7)
 
-                beta_multi = mean_multi.detach()
+                beta_multi = mean_multi
                 beta_mono = mean_mono
 
                 patches_multi_norm = (patches_multi - beta_multi) / alpha_multi
                 patches_mono_norm = (patches_mono - beta_mono) / alpha_mono
 
                 # Calculate patch-wise loss
+                # Add quantile mask
                 patch_ssi_loss = torch.abs(patches_multi_norm - patches_mono_norm).mean(dim=1)
-
                 ssi_loss = patch_ssi_loss.mean()
-
                 # Simplify gradient computation to avoid fold operation issues
                 # Reshape patches for direct gradient computation within patches
                 patch_h = patch_w = patch_size
@@ -792,14 +796,16 @@ class Trainer:
                 p_mono_grad_y = torch.abs(patches_mono_norm_reshaped[:, :, :, :-1, :] - 
                                         patches_mono_norm_reshaped[:, :, :, 1:, :])
 
-                # Calculate gradient matching loss within patches
-                p_grad_match_x = torch.abs(p_multi_grad_x - p_mono_grad_x).mean()
-                p_grad_match_y = torch.abs(p_multi_grad_y - p_mono_grad_y).mean()
-                grad_match_loss = p_grad_match_x + p_grad_match_y
+                # Calculate gradient matching loss within patches and pad to same size
+                p_grad_match_x = torch.abs(p_multi_grad_x - p_mono_grad_x)
+                p_grad_match_y = torch.abs(p_multi_grad_y - p_mono_grad_y)
+
+
+                grad_match_loss = p_grad_match_x.mean() + p_grad_match_y.mean()
 
                 # Combine losses
                 ssi_weight = 0.01
-                grad_weight = 1
+                grad_weight = 0.0
 
                 consistency_loss = (ssi_weight * ssi_loss + 
                                     grad_weight * grad_match_loss)

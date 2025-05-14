@@ -56,18 +56,12 @@ class PreceiverIO(nn.Module):
 
         # 3. Aggregate features from x2 based on the computed cost volume
         # For each token in x1, we obtain a weighted sum of features from x2.
-        aggregated_features = torch.matmul(cost_volume, x2_proj)  # shape: (B, N, latent_dim)
-        
-        # Project aggregated features to output dimension before decoding.
-        memory = self.output_proj(aggregated_features)  # shape: (B, N, output_dim)
-
-        # Repeat output queries for each batch.
-        output_queries = self.output_queries.repeat(b, 1, 1)  # shape: (B, num_output_queries, output_dim)
+        aggregated_features = torch.matmul(cost_volume, x2) + x1 # shape: (B, N, latent_dim)
 
         # 5. Refine output queries using transformer decoder, where the memory is the aggregated feature context.
-        out = self.decoder_layer(x1, memory)  # shape: (B, num_output_queries, output_dim)
+        out = self.decoder_layer(x1, aggregated_features)  # shape: (B, num_output_queries, output_dim)
 
-        out = self.cost_fusion(torch.cat([out, cost_summary], -1)) + x1
+        out = self.cost_fusion(torch.cat([out, cost_summary], -1))
         # Optionally add a residual connection with a slice of one of the inputs if applicable:
         # For instance, if output_dim <= input_dim, you might do:
         
