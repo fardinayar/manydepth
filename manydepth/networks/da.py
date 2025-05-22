@@ -20,7 +20,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class TransformerDecoderLayer(nn.Module):
-    def __init__(self, d_model, nhead, dim_feedforward=384*2, dropout=0.3):
+    def __init__(self, d_model, nhead, dim_feedforward=384*2, dropout=0.0):
         super().__init__()
         self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
         self.multihead_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
@@ -37,7 +37,6 @@ class TransformerDecoderLayer(nn.Module):
         self.dropout3 = nn.Dropout(dropout)
 
         self.activation = F.relu
-        self.lam = nn.Parameter(torch.zeros(1, 1, d_model)).cuda() - 9
 
     def forward(self, input_tgt, memory):
         tgt = input_tgt
@@ -51,7 +50,7 @@ class TransformerDecoderLayer(nn.Module):
         tgt2 = self.norm3(tgt)
         tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt2))))
         tgt = tgt + self.dropout3(tgt2)
-        return tgt ##+ self.lam.sigmoid() * input_tgt
+        return tgt 
 
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, dropout=0.1, max_len=5000):

@@ -90,6 +90,7 @@ class Trainer:
         lora.mark_only_lora_as_trainable(self.models['encoder'])
         self.models["encoder"].to(self.device)
         self.models["encoder"].encoder.cls_token.require_grad = True
+        self.models["encoder"].encoder.pos_embed.require_grad = True
 
         self.models["depth"] = networks.ManyDepthAnythingDecoder(
             adaptive_bins=True, min_depth_bin=0.001, max_depth_bin=100,
@@ -162,7 +163,7 @@ class Trainer:
 
         self.model_optimizer = optim.AdamW(self.parameters_to_train, self.opt.learning_rate)
         self.model_lr_scheduler = optim.lr_scheduler.StepLR(
-            self.model_optimizer, self.opt.scheduler_step_size//3, 0.1)
+            self.model_optimizer, 5, 0.1)
 
         if self.opt.load_weights_folder is not None:
             self.load_model()
@@ -239,7 +240,10 @@ class Trainer:
         self.save_opts()
 
     def g2s_weight(self):
-            return math.exp(self.epoch - self.opt.num_epochs+1)
+            return math.exp(0.01*(self.step - 1*2000)) if self.step <= 1*2000 else 1
+    
+    def consistency_weight(self):
+        return math.exp(0.01*(self.step - 1*10000)) if self.step <= 1*10000 else 1
 
     def set_train(self):
         """Convert all models to training mode
@@ -426,7 +430,8 @@ class Trainer:
         else:
             features, lookup_features = self.models["encoder"](inputs["color_aug", 0, 0], lookup_frames)
         
-        depth, lowest_cost, confidence_mask, depth_feats = self.models["depth"](features,
+
+        depth, lowest_cost, confidence_mask, _ = self.models["depth"](features,
                                                                       lookup_features,
                                                                       patch_h,
                                                                       patch_w,
@@ -726,8 +731,7 @@ class Trainer:
             reprojection_loss_mask = self.compute_loss_masks(reprojection_loss,
                                                              identity_reprojection_loss)
             
-            # standard reprojection loss
-            reprojection_loss = reprojection_loss * reprojection_loss_mask
+            reprojection_loss = reprojection_loss * reprojection_loss_mask 
             reprojection_loss = reprojection_loss.sum() / (reprojection_loss_mask.sum() + 1e-7)
 
 
@@ -744,7 +748,7 @@ class Trainer:
                 # Patch-based implementation without using log
 
                 # Define patch size
-                patch_size = 32  # Can be adjusted based on input size
+                patch_size = 64  # Can be adjusted based on input size
 
                 # Unfold into patches
                 b, c, h, w = multi_depth.shape
@@ -776,6 +780,9 @@ class Trainer:
                 # Calculate patch-wise loss
                 # Add quantile mask
                 patch_ssi_loss = torch.abs(patches_multi_norm - patches_mono_norm).mean(dim=1)
+                quantile_threshold = torch.quantile(patch_ssi_loss, 0.85, dim=1, keepdim=True)
+                quantile_mask = (patch_ssi_loss <= quantile_threshold).float()
+                patch_ssi_loss = patch_ssi_loss * quantile_mask
                 ssi_loss = patch_ssi_loss.mean()
                 # Simplify gradient computation to avoid fold operation issues
                 # Reshape patches for direct gradient computation within patches
@@ -804,7 +811,7 @@ class Trainer:
                 grad_match_loss = p_grad_match_x.mean() + p_grad_match_y.mean()
 
                 # Combine losses
-                ssi_weight = 0.01
+                ssi_weight = 0.1
                 grad_weight = 0.0
 
                 consistency_loss = (ssi_weight * ssi_loss + 
