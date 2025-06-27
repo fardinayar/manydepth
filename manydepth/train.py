@@ -9,6 +9,7 @@ import numpy as np
 from trainer_mda import Trainer
 from options import MonodepthOptions
 
+
 def seed_all(seed):
     if not seed:
         seed = 1

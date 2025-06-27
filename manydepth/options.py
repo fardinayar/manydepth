@@ -144,9 +144,6 @@ class MonodepthOptions:
                                  help="pretrained or scratch",
                                  default="pretrained",
                                  choices=["pretrained", "scratch"])
-        self.parser.add_argument('--use_future_frame',
-                                 action='store_true',
-                                 help='If set, will also use a future frame in time for matching.')
         self.parser.add_argument('--num_matching_frames',
                                  help='Sets how many previous frames to load to build the cost'
                                       'volume',

@@ -253,11 +253,11 @@ def evaluate(opt):
                                                                                 K,
                                                                                 invK,
                                                                                 min_depth_bin, max_depth_bin)
-                scale, shift = scaler(features)
+                #scale, shift = scaler(features)
                 if not opt.eval_teacher:
-                    output =  (output * (scale) + shift ).sigmoid()
+                    output =  (output).sigmoid()
                 else:
-                    output =  (output * (scale) + shift).sigmoid()
+                    output =  (output).sigmoid()
                 pred_disp, _ = disp_to_depth(output, opt.min_depth, opt.max_depth)
                 
                 pred_disp = pred_disp.cpu()[:, 0].numpy()

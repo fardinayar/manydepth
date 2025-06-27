@@ -18,7 +18,7 @@ def disp_to_depth(disp, min_depth, max_depth):
     """
     min_disp = 1 / max_depth
     max_disp = 1 / min_depth #TODO
-    scaled_disp = min_disp + disp
+    scaled_disp = disp + min_disp
     depth = 1 / scaled_disp
     return scaled_disp, depth
 
