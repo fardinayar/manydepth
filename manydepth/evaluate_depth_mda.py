@@ -72,8 +72,6 @@ def evaluate(opt):
     MAX_DEPTH = 80
 
     frames_to_load = [0]
-    if opt.use_future_frame:
-        frames_to_load.append(1)
     for idx in range(-1, -1 - opt.num_matching_frames, -1):
         if idx not in frames_to_load:
             frames_to_load.append(idx)
@@ -151,25 +149,19 @@ def evaluate(opt):
 
             encoder = networks.ManyDepthAnythingEncoder(encoder_name=opt.depth_anything_encoder)
             depth_decoder = networks.ManyDepthAnythingDecoder(
-                adaptive_bins=True, min_depth_bin=0.1, max_depth_bin=20.0,
-                depth_binning=opt.depth_binning, num_depth_bins=opt.num_depth_bins,
                 matching_height=opt.height // 14, matching_width=opt.width //14)
         
-        scaler = networks.DepthScaler()
         encoder = replace_qkv_with_mergedlinear(encoder)
         depth_decoder = replace_conv_with_loraconv(depth_decoder)
 
         #model_dict = encoder.state_dict()
         encoder.load_state_dict(encoder_dict, strict=False)
         depth_decoder.load_state_dict(torch.load(decoder_path))
-        scaler.load_state_dict(torch.load(scaler_path))
         encoder.eval()
         depth_decoder.eval()
-        scaler.eval()
         if torch.cuda.is_available():
             encoder.cuda()
             depth_decoder.cuda()
-            scaler.cuda()
 
         pred_disps = []
 
@@ -245,7 +237,7 @@ def evaluate(opt):
 
                     features, lookup_features = encoder(input_color, lookup_frames)
                     patch_h, patch_w = input_color.shape[-2] // 14, input_color.shape[-1] // 14
-                    output, lowest_cost, confidence_mask, depth_feats = depth_decoder(features,
+                    output, depth_feats = depth_decoder(features,
                                                                                 lookup_features,
                                                                                 patch_h,
                                                                                 patch_w,

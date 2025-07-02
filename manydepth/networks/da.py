@@ -2,11 +2,9 @@ import math
 from .depth_anything_v2.dpt import DepthAnythingV2
 import torch.nn as nn
 import torch
-from .resnet_encoder import ResnetEncoderMatching
-from layers import BackprojectDepth, Project3D
 from .depth_anything_v2.util.blocks import FeatureFusionBlock, _make_scratch
 import copy
-from .preciver import PreceiverIO
+from .feature_fusion import MultiFrameFeatureFusion
 
 MODEL_CONFIGS = {
     'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
@@ -132,8 +130,8 @@ class ManyDepthAnythingDecoder(nn.Module):
         
 
         
-        self.precivers = nn.ModuleList([
-            PreceiverIO(in_channels, in_channels//8, in_channels, self.matching_height*self.matching_width, self.matching_height*self.matching_width, 4, in_channels*2)
+        self.multi_frame_feature_fusion = nn.ModuleList([
+            MultiFrameFeatureFusion(in_channels, in_channels//8, in_channels, self.matching_height, self.matching_width)
             for _ in range(4)
         ])
         
@@ -155,7 +153,7 @@ class ManyDepthAnythingDecoder(nn.Module):
         )
         
     
-    def _fuse_features_preciver(self, current_feats, lookup_feats, i):
+    def _fuse_features_multi_frame(self, current_feats, lookup_feats, i):
         batch_size, channels, height, width = current_feats.shape
         
         # Reshape current_feats
@@ -166,7 +164,7 @@ class ManyDepthAnythingDecoder(nn.Module):
         
         #concatenate features along channel dim
         fused_features = torch.cat((current_feats_flat, lookup_feats_flat), 1).permute(0,2,1)
-        output = self.precivers[i](fused_features).permute(0,2,1)
+        output = self.multi_frame_feature_fusion[i](fused_features).permute(0,2,1)
         output = output.view(batch_size, channels, height, width)
 
         return output
@@ -190,7 +188,7 @@ class ManyDepthAnythingDecoder(nn.Module):
             x = x.permute(0, 2, 1).reshape((x.shape[0], x.shape[-1], patch_h, patch_w))
             lookup_feature = lookup_feature.permute(0, 2, 1).reshape((lookup_feature.shape[0], lookup_feature.shape[-1], patch_h, patch_w))
             if i > -1:
-                x = self._fuse_features_preciver(x, lookup_feature, i)
+                x = self._fuse_features_multi_frame(x, lookup_feature, i)
             x = self.projects[i](x)
             x = self.resize_layers[i](x)
             

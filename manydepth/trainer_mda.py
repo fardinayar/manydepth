@@ -23,12 +23,11 @@ import json
 
 from utils import readlines, sec_to_hm_str
 from layers import SSIM, BackprojectDepth, Project3D, transformation_from_parameters, \
-    disp_to_depth, get_smooth_loss, compute_depth_errors, get_smooth_disparity_loss, get_smooth_disparity_loss2
+    disp_to_depth, get_smooth_loss, compute_depth_errors
 import loralib as lora
 
 import datasets, networks
 import matplotlib.pyplot as plt
-from losses.midas_loss import affine_invariant_loss
 from networks.replace_with_lora import replace_qkv_with_mergedlinear, replace_conv_with_loraconv
 _DEPTH_COLORMAP = plt.get_cmap('plasma', 256)  # for plotting
 
@@ -96,7 +95,7 @@ class Trainer:
         self.models['depth'] = replace_conv_with_loraconv(self.models["depth"])
         lora.mark_only_lora_as_trainable(self.models['depth'])
         for name, p in self.models['depth'].named_parameters():
-            if 'preciver' in name:
+            if 'multi_frame_feature_fusion' in name:
                 p.requires_grad = True
         
         self.models["depth"].to(self.device)
@@ -217,8 +216,6 @@ class Trainer:
     def g2s_weight(self):
             return math.exp(0.01*(self.step - 1*2000)) if self.step <= 1*2000 else 1
     
-    def consistency_weight(self):
-        return math.exp(0.01*(self.step - 1*10000)) if self.step <= 1*10000 else 1
 
     def set_train(self):
         """Convert all models to training mode
@@ -249,26 +246,6 @@ class Trainer:
                 self.save_model()
             
             
-
-    def freeze_teacher(self):
-        if self.train_teacher_and_pose:
-            self.train_teacher_and_pose = False
-            print('freezing teacher and pose networks!')
-
-            # here we reinitialise our optimizer to ensure there are no updates to the
-            # teacher and pose networks
-            self.parameters_to_train = []
-            self.parameters_to_train += list(self.models["encoder"].parameters())
-            self.parameters_to_train += list(self.models["depth"].parameters())
-            self.model_optimizer = optim.Adam(self.parameters_to_train, self.opt.learning_rate)
-            self.model_lr_scheduler = optim.lr_scheduler.StepLR(
-                self.model_optimizer, self.opt.scheduler_step_size, 0.1)
-
-            # set eval so that teacher + pose batch norm is running average
-            self.set_eval()
-            # set train so that multi batch norm is in train mode
-            self.set_train()
-
     def run_epoch(self):
         """Run a single epoch of training and validation
         """
@@ -323,7 +300,7 @@ class Trainer:
         mono_outputs = {}
         outputs = {}
 
-        pose_pred = self.predict_poses(inputs, None)
+        pose_pred = self.predict_poses(inputs)
 
         outputs.update(pose_pred)
         mono_outputs.update(pose_pred)
@@ -399,7 +376,7 @@ class Trainer:
 
         return outputs, losses, mono_losses
 
-    def predict_poses(self, inputs, features=None):
+    def predict_poses(self, inputs):
         """Predict poses between input frames for monocular sequences.
         """
         outputs = {}
@@ -417,21 +394,8 @@ class Trainer:
                         pose_inputs = [pose_feats[f_i], pose_feats[0]]
                     else:
                         pose_inputs = [pose_feats[0], pose_feats[f_i]]
-                        
-                        
-                    mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(pose_inputs[0].device)
-                    std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(pose_inputs[0].device)
-
-                    unnormalized_pose_inputs = []
-                    for input_tensor in pose_inputs:
-                        unnormalized_input = input_tensor * std + mean
-                        unnormalized_pose_inputs.append(unnormalized_input)
-
-                    pose_inputs = unnormalized_pose_inputs
 
                     pose_inputs = [self.models["pose_encoder"](torch.cat(pose_inputs, 1))]
-                    # unnormalize pose inputs that are already normalized with imagenet mean and std
-
                     
                     axisangle, translation = self.models["pose"](pose_inputs)
                     outputs[("axisangle", 0, f_i)] = axisangle
@@ -696,44 +660,11 @@ class Trainer:
                 quantile_mask = (patch_ssi_loss <= quantile_threshold).float()
                 patch_ssi_loss = patch_ssi_loss * quantile_mask
                 ssi_loss = patch_ssi_loss.mean()
-                # Simplify gradient computation to avoid fold operation issues
-                # Reshape patches for direct gradient computation within patches
-                patch_h = patch_w = patch_size
-
-                # Reshape patches to compute gradients directly on patches
-                patches_multi_norm_reshaped = patches_multi_norm.reshape(b, n_patches, c, patch_h, patch_w)
-                patches_mono_norm_reshaped = patches_mono_norm.reshape(b, n_patches, c, patch_h, patch_w)
-
-                # Compute gradients within each patch
-                p_multi_grad_x = torch.abs(patches_multi_norm_reshaped[:, :, :, :, :-1] - 
-                                            patches_multi_norm_reshaped[:, :, :, :, 1:])
-                p_multi_grad_y = torch.abs(patches_multi_norm_reshaped[:, :, :, :-1, :] - 
-                                            patches_multi_norm_reshaped[:, :, :, 1:, :])
-
-                p_mono_grad_x = torch.abs(patches_mono_norm_reshaped[:, :, :, :, :-1] - 
-                                        patches_mono_norm_reshaped[:, :, :, :, 1:])
-                p_mono_grad_y = torch.abs(patches_mono_norm_reshaped[:, :, :, :-1, :] - 
-                                        patches_mono_norm_reshaped[:, :, :, 1:, :])
-
-                # Calculate gradient matching loss within patches and pad to same size
-                p_grad_match_x = torch.abs(p_multi_grad_x - p_mono_grad_x)
-                p_grad_match_y = torch.abs(p_multi_grad_y - p_mono_grad_y)
-
-
-                grad_match_loss = p_grad_match_x.mean() + p_grad_match_y.mean()
-
                 # Combine losses
                 ssi_weight = 0.1
-                grad_weight = 0.0
 
-                consistency_loss = (ssi_weight * ssi_loss + 
-                                    grad_weight * grad_match_loss)
+                consistency_loss = (ssi_weight * ssi_loss)
                 
-                # save for logging to tensorboard
-                consistency_target = (mono_depth.detach() +
-                                      multi_depth.detach() )
-                consistency_target = 1 / consistency_target
-                outputs["consistency_target/{}".format(scale)] = consistency_target
                 losses['consistency_loss/{}'.format(scale)] = consistency_loss
             else:
                 consistency_loss = 0
@@ -858,31 +789,7 @@ class Trainer:
                 "disp_mono/{}".format(j),
                 disp, self.step)
 
-            if outputs.get("lowest_cost") is not None:
-                lowest_cost = outputs["lowest_cost"][j]
-
-                consistency_mask = \
-                    outputs['consistency_mask'][j].cpu().detach().unsqueeze(0).numpy()
-
-                min_val = np.percentile(lowest_cost.numpy(), 10)
-                max_val = np.percentile(lowest_cost.numpy(), 90)
-                lowest_cost = torch.clamp(lowest_cost, min_val, max_val)
-                lowest_cost = colormap(lowest_cost)
-
-                writer.add_image(
-                    "lowest_cost/{}".format(j),
-                    lowest_cost, self.step)
-                writer.add_image(
-                    "lowest_cost_masked/{}".format(j),
-                    lowest_cost * consistency_mask, self.step)
-                writer.add_image(
-                    "consistency_mask/{}".format(j),
-                    consistency_mask, self.step)
-
-                consistency_target = colormap(outputs["consistency_target/0"][j])
-                writer.add_image(
-                    "consistency_target/{}".format(j),
-                    consistency_target, self.step, dataformats='NCHW')
+        
 
     def save_opts(self):
         """Save options to disk so we know what we ran this experiment with
