@@ -12,9 +12,7 @@ class MultiFrameFeatureFusion(nn.Module):
         self.matching_width = matching_width
 
         # Shared input projection for both inputs
-        self.input_proj = nn.Sequential(nn.Linear(input_dim, latent_dim),
-                                        nn.ReLU(),
-                                        nn.Linear(latent_dim, latent_dim))
+        self.input_proj = nn.Sequential(nn.Linear(input_dim, latent_dim))
 
         # Project latents to output dimension
         self.output_proj = nn.Sequential(nn.Linear(output_dim*2, output_dim),
@@ -28,11 +26,7 @@ class MultiFrameFeatureFusion(nn.Module):
         
         # Flow embedding for 2D flow vectors (dx, dy)
         # We'll use a 2D embedding that can handle flow vectors
-        self.flow_embedding = nn.Sequential(nn.Linear(2, output_dim),
-                                            nn.TransformerEncoder(
-                                                nn.TransformerEncoderLayer(output_dim, 8, output_dim*2, batch_first=True),
-                                                num_layers=2
-                                            ))
+        self.flow_embedding = nn.Linear(2, output_dim)  # Embed 2D flow vectors (dx, dy)
         
         self.layer_norm_1 = nn.LayerNorm(output_dim)
         self.layer_norm_2 = nn.LayerNorm(output_dim)

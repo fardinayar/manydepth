@@ -5,3 +5,4 @@ checkpoints
 outs2
 kitti_data/
 *.pth
+our_data/

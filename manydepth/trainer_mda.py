@@ -77,8 +77,6 @@ class Trainer:
         lora.mark_only_lora_as_trainable(self.models['encoder'])
         
         self.models["encoder"].to(self.device)
-        self.models["encoder"].encoder.cls_token.require_grad = True
-        self.models["encoder"].encoder.pos_embed.require_grad = True
 
         self.models["depth"] = networks.ManyDepthAnythingDecoder(
             matching_height=self.opt.height // 14, matching_width=self.opt.width //14)
@@ -90,7 +88,7 @@ class Trainer:
                 depthanything_weights_decoder.update({
                     key.replace('depth_head.', ''): value
                 })
-        # TODO  
+
         self.models["depth"].load_state_dict(depthanything_weights_decoder, strict=False)
         self.models['depth'] = replace_conv_with_loraconv(self.models["depth"])
         lora.mark_only_lora_as_trainable(self.models['depth'])
@@ -122,15 +120,6 @@ class Trainer:
                                  num_frames_to_predict_for=2)
         self.models["pose"].to(self.device)
         
-        
-        # pose_encoder_weights = torch.load(f'pose_encoder.pth', map_location='cpu')
-        # pose_weights = torch.load(f'pose.pth', map_location='cpu')
-    
-        # pose_encoder_weights = torch.load(f'pose_encoder.pth', map_location='cpu')
-        # pose_weights = torch.load(f'pose.pth', map_location='cpu')
-        
-        '''self.models["pose_encoder"].load_state_dict(pose_encoder_weights, strict=True)
-        self.models["pose"].load_state_dict(pose_weights, strict=True)'''
 
         self.parameters_to_train.append({'params': self.models["pose_encoder"].parameters(), 'lr': self.opt.learning_rate})
         self.parameters_to_train.append({'params': self.models["pose"].parameters(), 'lr': self.opt.learning_rate})
@@ -238,9 +227,6 @@ class Trainer:
         self.step = 0
         self.start_time = time.time()
         for self.epoch in range(self.opt.num_epochs):
-            if self.epoch == self.opt.freeze_teacher_epoch:
-                self.freeze_teacher()
-
             self.run_epoch()
             if (self.epoch + 1) % self.opt.save_frequency == 0:
                 self.save_model()
@@ -283,8 +269,6 @@ class Trainer:
             if self.opt.save_intermediate_models and late_phase:
                 self.save_model(save_step=True)
 
-            if self.step == self.opt.freeze_teacher_step:
-                self.freeze_teacher()
 
             self.step += 1
 
