@@ -203,7 +203,8 @@ class Trainer:
         self.save_opts()
 
     def g2s_weight(self):
-            return math.exp(0.01*(self.step - 1*2000)) if self.step <= 1*2000 else 1
+            return math.exp(0.01*(self.step - 1*2000)) * 1 if self.step <= 1*2000 else 1
+        
     
 
     def set_train(self):
@@ -347,10 +348,7 @@ class Trainer:
         depth, _ = self.models["depth"](features,
                                             lookup_features,
                                             patch_h,
-                                            patch_w,
-                                        relative_poses,
-                                        inputs[('K', 2)],
-                                        inputs[('inv_K', 2)])
+                                            patch_w)
         
         depth =  (depth ).sigmoid()
         outputs.update({("disp", 0): depth})
@@ -522,18 +520,6 @@ class Trainer:
 
         return reprojection_loss_mask
 
-    def compute_matching_mask(self, outputs):
-        """Generate a mask of where we cannot trust the cost volume, based on the difference
-        between the cost volume and the teacher, monocular network"""
-
-        mono_output = outputs[('mono_depth', 0, 0)]
-        matching_depth = 1 / outputs['lowest_cost'].unsqueeze(1).to(self.device)
-        
-        # mask where they differ by a large amount
-        mask = ((matching_depth - mono_output) / mono_output) < 1.0
-        mask *= ((mono_output - matching_depth) / matching_depth) < 1.0
-        return mask[:, 0]
-
     def compute_losses(self, inputs, outputs, is_multi=False):
         """Compute the reprojection, smoothness and proxy supervised losses for a minibatch
         """
@@ -590,6 +576,10 @@ class Trainer:
             # find minimum losses from [reprojection, identity]
             reprojection_loss_mask = self.compute_loss_masks(reprojection_loss,
                                                              identity_reprojection_loss)
+            # Quantile mask
+            quantile_threshold = torch.quantile(reprojection_loss, 0.85, dim=1, keepdim=True)
+            quantile_mask = (reprojection_loss <= quantile_threshold).float()
+            reprojection_loss_mask = reprojection_loss_mask * quantile_mask
             
             reprojection_loss = reprojection_loss * reprojection_loss_mask 
             reprojection_loss = reprojection_loss.sum() / (reprojection_loss_mask.sum() + 1e-7)
@@ -645,7 +635,13 @@ class Trainer:
                 patch_ssi_loss = patch_ssi_loss * quantile_mask
                 ssi_loss = patch_ssi_loss.mean()
                 # Combine losses
-                ssi_weight = 0.1
+                ssi_weight = 0.05
+                
+                # SSI quantile mask
+                quantile_threshold = torch.quantile(patch_ssi_loss, 0.85, dim=1, keepdim=True)
+                quantile_mask = (patch_ssi_loss <= quantile_threshold).float()
+                patch_ssi_loss = patch_ssi_loss * quantile_mask
+                ssi_loss = patch_ssi_loss.mean()
 
                 consistency_loss = (ssi_weight * ssi_loss)
                 
@@ -838,18 +834,6 @@ class Trainer:
             path = os.path.join(self.opt.load_weights_folder, "{}.pth".format(n))
             model_dict = self.models[n].state_dict()
             pretrained_dict = torch.load(path)
-
-            if n == 'encoder':
-                min_depth_bin = pretrained_dict.get('min_depth_bin')
-                max_depth_bin = pretrained_dict.get('max_depth_bin')
-                print('min depth', min_depth_bin, 'max_depth', max_depth_bin)
-                if min_depth_bin is not None:
-                    # recompute bins
-                    print('setting depth bins!')
-                    self.models['encoder'].compute_depth_bins(min_depth_bin, max_depth_bin)
-
-                    self.min_depth_tracker = min_depth_bin
-                    self.max_depth_tracker = max_depth_bin
 
             pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict}
             model_dict.update(pretrained_dict)

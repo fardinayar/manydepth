@@ -1,0 +1,20 @@
+2025-07-06 13:58:07,932 - INFO - Initialized GPS Frame Extractor:
+2025-07-06 13:58:07,932 - INFO -   GPS folder: our_data/extracted_gps
+2025-07-06 13:58:07,933 - INFO -   Video folder: our_data
+2025-07-06 13:58:07,933 - INFO -   Output folder: our_data/extracted_frames
+2025-07-06 13:58:07,933 - INFO -   Frame rate: 5.0 Hz
+2025-07-06 13:58:07,933 - INFO -   Filter bad GPS: True
+2025-07-06 13:58:07,933 - INFO -   Image quality: 95
+2025-07-06 13:58:07,933 - INFO - Starting batch processing of all GPS-video pairs
+2025-07-06 13:58:07,933 - INFO - Found 4 CSV files to process
+2025-07-06 13:58:07,933 - INFO - Processing GX010001_NorthQuays.csv
+2025-07-06 13:58:07,950 - INFO - Loaded 7658 GPS points from GX010001_NorthQuays.csv
+2025-07-06 13:58:07,957 - INFO - Filtered out 0 bad GPS points
+2025-07-06 13:58:08,226 - INFO - Selected 3829 frames at 5.0 Hz from 7658 GPS points
+2025-07-06 13:58:08,379 - INFO - Video properties: 29.97 FPS, 22905 frames, 764.26s duration
+2025-07-06 14:06:15,432 - INFO - Completed GX010001_NorthQuays.csv: {'total_gps_points': 3829, 'frames_extracted': 3821, 'frames_skipped': 8, 'errors': 0}
+2025-07-06 14:06:15,432 - INFO - Processing GX010001_PhoenixPark.csv
+2025-07-06 14:06:15,436 - INFO - Loaded 2372 GPS points from GX010001_PhoenixPark.csv
+2025-07-06 14:06:15,438 - INFO - Filtered out 0 bad GPS points
+2025-07-06 14:06:15,520 - INFO - Selected 1186 frames at 5.0 Hz from 2372 GPS points
+2025-07-06 14:06:15,633 - INFO - Video properties: 29.97 FPS, 7073 frames, 236.00s duration

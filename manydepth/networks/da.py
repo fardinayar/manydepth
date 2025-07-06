@@ -58,8 +58,7 @@ class ManyDepthAnythingEncoder(nn.Module):
         out_features = self.encoder.get_intermediate_layers(image, self.encoder.intermediate_layer_idx, return_class_token=return_class_token)
         b, n, c, h, w = lookup_frames.shape
         lookup_frames = lookup_frames.reshape((b*n, c, h, w))
-        with torch.no_grad():
-            lookup_features = self.encoder.get_intermediate_layers(lookup_frames, self.encoder.intermediate_layer_idx, return_class_token=return_class_token)
+        lookup_features = self.encoder.get_intermediate_layers(lookup_frames, self.encoder.intermediate_layer_idx, return_class_token=return_class_token)
 
         return out_features, lookup_features
 
@@ -169,8 +168,7 @@ class ManyDepthAnythingDecoder(nn.Module):
 
         return output
 
-    def forward(self, out_features, lookup_features, patch_h, patch_w,  poses, K, invK,
-                min_depth_bin=None, max_depth_bin=None):
+    def forward(self, out_features, lookup_features, patch_h, patch_w):
         out = []
         for i, (x, lookup_feature) in enumerate(zip(out_features, lookup_features)):
             if self.use_clstoken:

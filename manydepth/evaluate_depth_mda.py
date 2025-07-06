@@ -137,9 +137,6 @@ def evaluate(opt):
             pose_enc.load_state_dict(pose_enc_dict, strict=True)
             pose_dec.load_state_dict(pose_dec_dict, strict=True)
 
-            min_depth_bin = encoder_dict.get('min_depth_bin')
-            max_depth_bin = encoder_dict.get('max_depth_bin')
-
             pose_enc.eval()
             pose_dec.eval()
 
@@ -151,10 +148,9 @@ def evaluate(opt):
             depth_decoder = networks.ManyDepthAnythingDecoder(
                 matching_height=opt.height // 14, matching_width=opt.width //14)
         
-        encoder = replace_qkv_with_mergedlinear(encoder)
-        depth_decoder = replace_conv_with_loraconv(depth_decoder)
+            encoder = replace_qkv_with_mergedlinear(encoder)
+            depth_decoder = replace_conv_with_loraconv(depth_decoder)
 
-        #model_dict = encoder.state_dict()
         encoder.load_state_dict(encoder_dict, strict=False)
         depth_decoder.load_state_dict(torch.load(decoder_path))
         encoder.eval()
@@ -177,7 +173,7 @@ def evaluate(opt):
                 if opt.eval_teacher:
                     features = encoder.get_intermediate_layers(input_color, [2, 5, 8, 11], return_class_token=True)
                     patch_h, patch_w = input_color.shape[-2] // 14, input_color.shape[-1] // 14
-                    output, depth_feats = depth_decoder(features, patch_h, patch_w)
+                    output, _ = depth_decoder(features, patch_h, patch_w)
                 else:
 
                     if opt.static_camera:
@@ -240,11 +236,7 @@ def evaluate(opt):
                     output, depth_feats = depth_decoder(features,
                                                                                 lookup_features,
                                                                                 patch_h,
-                                                                                patch_w,
-                                                                                relative_poses,
-                                                                                K,
-                                                                                invK,
-                                                                                min_depth_bin, max_depth_bin)
+                                                                                patch_w,)
                 #scale, shift = scaler(features)
                 if not opt.eval_teacher:
                     output =  (output).sigmoid()
