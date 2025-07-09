@@ -74,7 +74,7 @@ class Trainer:
         self.models["encoder"] = networks.ManyDepthAnythingEncoder(encoder_name=self.opt.depth_anything_encoder)
         self.models['encoder'] = replace_qkv_with_mergedlinear(self.models["encoder"])
         
-        lora.mark_only_lora_as_trainable(self.models['encoder'])
+        lora.mark_only_lora_as_trainable(self.models['encoder'], bias='all')
         
         self.models["encoder"].to(self.device)
 
@@ -91,7 +91,7 @@ class Trainer:
 
         self.models["depth"].load_state_dict(depthanything_weights_decoder, strict=False)
         self.models['depth'] = replace_conv_with_loraconv(self.models["depth"])
-        lora.mark_only_lora_as_trainable(self.models['depth'])
+        lora.mark_only_lora_as_trainable(self.models['depth'], bias='all')
         for name, p in self.models['depth'].named_parameters():
             if 'multi_frame_feature_fusion' in name:
                 p.requires_grad = True
@@ -109,15 +109,16 @@ class Trainer:
         self.models["mono_depth"] = decoder
         self.models["mono_depth"].to(self.device)
         
+
         self.models["pose_encoder"] = \
             networks.ResnetEncoder(18, self.opt.weights_init == "pretrained",
-                                   num_input_images=self.num_pose_frames)
-        self.models["pose_encoder"].to(self.device)
-        
+                                    num_input_images=self.num_pose_frames)
         self.models["pose"] = \
             networks.PoseDecoder(self.models["pose_encoder"].num_ch_enc,
-                                 num_input_features=1,
-                                 num_frames_to_predict_for=2)
+                                    num_input_features=1,
+                                    num_frames_to_predict_for=2)
+        
+        self.models["pose_encoder"].to(self.device)
         self.models["pose"].to(self.device)
         
 
@@ -126,7 +127,7 @@ class Trainer:
 
         self.model_optimizer = optim.AdamW(self.parameters_to_train, self.opt.learning_rate)
         self.model_lr_scheduler = optim.lr_scheduler.StepLR(
-            self.model_optimizer, 5, 0.1)
+            self.model_optimizer, 2, 0.1)
 
         if self.opt.load_weights_folder is not None:
             self.load_model()
@@ -146,6 +147,9 @@ class Trainer:
 
         fpath = os.path.join("splits", self.opt.split, "{}_files.txt")
         train_filenames = readlines(fpath.format("train"))
+        # TODO
+        # Use only 10 percent of the training data
+        train_filenames = train_filenames[:int(len(train_filenames) * 1)]
         val_filenames = readlines(fpath.format("val"))
         img_ext = '.png' if self.opt.png else '.jpg'
 
@@ -203,7 +207,7 @@ class Trainer:
         self.save_opts()
 
     def g2s_weight(self):
-            return math.exp(0.01*(self.step - 1*2000)) * 1 if self.step <= 1*2000 else 1
+            return math.exp(0.005*(self.step - 1*10000)) * 1 if self.step <= 1*10000 else 1
         
     
 
@@ -570,16 +574,11 @@ class Trainer:
 
             if not self.opt.disable_automasking:
                 # add random numbers to break ties
-                identity_reprojection_loss += torch.randn(
-                    identity_reprojection_loss.shape).to(self.device) * 0.00001
+                identity_reprojection_loss += torch.randn(identity_reprojection_loss.shape).to(self.device) * 0.00001
 
             # find minimum losses from [reprojection, identity]
             reprojection_loss_mask = self.compute_loss_masks(reprojection_loss,
                                                              identity_reprojection_loss)
-            # Quantile mask
-            quantile_threshold = torch.quantile(reprojection_loss, 0.85, dim=1, keepdim=True)
-            quantile_mask = (reprojection_loss <= quantile_threshold).float()
-            reprojection_loss_mask = reprojection_loss_mask * quantile_mask
             
             reprojection_loss = reprojection_loss * reprojection_loss_mask 
             reprojection_loss = reprojection_loss.sum() / (reprojection_loss_mask.sum() + 1e-7)
@@ -628,20 +627,20 @@ class Trainer:
                 patches_mono_norm = (patches_mono - beta_mono) / alpha_mono
 
                 # Calculate patch-wise loss
-                # Add quantile mask
                 patch_ssi_loss = torch.abs(patches_multi_norm - patches_mono_norm).mean(dim=1)
-                quantile_threshold = torch.quantile(patch_ssi_loss, 0.85, dim=1, keepdim=True)
-                quantile_mask = (patch_ssi_loss <= quantile_threshold).float()
-                patch_ssi_loss = patch_ssi_loss * quantile_mask
-                ssi_loss = patch_ssi_loss.mean()
-                # Combine losses
-                ssi_weight = 0.05
+                # Mask outlier loss values using statistical threshold
+                mean_loss = patch_ssi_loss.mean(dim=-1, keepdim=True)
+                std_loss = patch_ssi_loss.std(dim=-1, keepdim=True)
+                threshold = mean_loss + 2.0 * std_loss  # 2-sigma threshold
+                outlier_mask = patch_ssi_loss <= threshold
+
+                masked_patch_ssi_loss = patch_ssi_loss * outlier_mask
+                ssi_loss = masked_patch_ssi_loss.sum(dim=-1) / (outlier_mask.sum(dim=-1) + 1e-7)
+                ssi_loss = ssi_loss.mean()
                 
-                # SSI quantile mask
-                quantile_threshold = torch.quantile(patch_ssi_loss, 0.85, dim=1, keepdim=True)
-                quantile_mask = (patch_ssi_loss <= quantile_threshold).float()
-                patch_ssi_loss = patch_ssi_loss * quantile_mask
-                ssi_loss = patch_ssi_loss.mean()
+                # Combine losses
+                ssi_weight = 0.1
+                
 
                 consistency_loss = (ssi_weight * ssi_loss)
                 

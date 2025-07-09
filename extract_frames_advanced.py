@@ -341,8 +341,8 @@ Examples:
     
     parser.add_argument('--frame-rate', 
                        type=float, 
-                       default=5.0,
-                       help='Frame extraction rate in Hz (frames per second). Default: 5.0')
+                       default=10.0,
+                       help='Frame extraction rate in Hz (frames per second). Default: 10.0')
     
     parser.add_argument('--no-filter-gps', 
                        action='store_true',
