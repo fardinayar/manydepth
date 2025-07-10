@@ -51,7 +51,7 @@ def replace_qkv_with_mergedlinear(model, r=1, lora_alpha=16, lora_dropout=0.0):
 
 
 
-def replace_conv_with_loraconv(model, r=1, lora_alpha=16, lora_dropout=0.0):
+def replace_conv_with_loraconv(model, r=4, lora_alpha=16, lora_dropout=0.0):
     """
     Recursively replace all convolutional layers in the model with LoRA-enhanced convolutional layers.
     

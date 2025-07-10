@@ -142,7 +142,8 @@ class Trainer:
         # DATA
         datasets_dict = {"kitti": datasets.KITTIRAWDataset,
                          "cityscapes_preprocessed": datasets.CityscapesPreprocessedDataset,
-                         "kitti_odom": datasets.KITTIOdomDataset}
+                         "kitti_odom": datasets.KITTIOdomDataset,
+                         "gopro": datasets.GoProDataset}
         self.dataset = datasets_dict[self.opt.dataset]
 
         fpath = os.path.join("splits", self.opt.split, "{}_files.txt")
@@ -207,7 +208,7 @@ class Trainer:
         self.save_opts()
 
     def g2s_weight(self):
-            return math.exp(0.005*(self.step - 1*10000)) * 1 if self.step <= 1*10000 else 1
+            return math.exp(0.01*(self.step - 1*4000)) * 0.1 if self.step <= 1*4000 else 0.1
         
     
 
@@ -256,7 +257,7 @@ class Trainer:
             duration = time.time() - before_op_time
 
             # log less frequently after the first 2000 steps to save time & disk space
-            early_phase = batch_idx % self.opt.log_frequency == 0 and self.step < 10000
+            early_phase = batch_idx % self.opt.log_frequency == 0 and self.step < 1000000
             late_phase = self.step % 10000 == 0
 
             if early_phase or late_phase:
@@ -574,7 +575,8 @@ class Trainer:
 
             if not self.opt.disable_automasking:
                 # add random numbers to break ties
-                identity_reprojection_loss += torch.randn(identity_reprojection_loss.shape).to(self.device) * 0.00001
+                if identity_reprojection_loss is not None:
+                    identity_reprojection_loss += torch.randn(identity_reprojection_loss.shape).to(self.device) * 0.00001
 
             # find minimum losses from [reprojection, identity]
             reprojection_loss_mask = self.compute_loss_masks(reprojection_loss,
@@ -671,9 +673,19 @@ class Trainer:
             t12 = torch.norm(outputs[("translation", 0, -1)][:, 0].squeeze(), dim=1)
             t23 = torch.norm(outputs[("translation", 0, 1)][:, 0].squeeze(), dim=1)
             #SCALES
+            
+            # Mask loss where t12 or t23 is are less than 10 cm
+            mask = (t12 >= 0.01)*(t23 >= 0.01)*(t12 <= 2)*(t23 <= 2)
+            mask = mask
             s1 = inputs["gps12"].float() / t12
             s2 = inputs["gps23"].float() / t23
-            g2s_loss = torch.mean((s1 - 1) ** 2 + (s2 - 1) ** 2)
+            
+            if mask.sum() > 0:  # Only compute loss if we have valid samples
+                s1_masked = s1[mask]
+                s2_masked = s2[mask]
+                g2s_loss = torch.mean((s1_masked - 1) ** 2 + (s2_masked - 1) ** 2)
+            else:
+                g2s_loss = torch.tensor(0.0, device=self.device)
             total_loss += self.g2s_weight() * g2s_loss
             losses["scale"] = 0.5 * torch.mean(s1 + s2)
             
@@ -747,16 +759,27 @@ class Trainer:
         for l, v in mono_losses.items():
             writer.add_scalar("mono_{}".format(l), v, self.step)
 
+        # Unnormalization function for ImageNet normalization
+        def unnormalize_image(img):
+            """Unnormalize image from ImageNet normalization"""
+            mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1).to(img.device)
+            std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1).to(img.device)
+            return img * std + mean
+
         for j in range(min(4, self.opt.batch_size)):  # write a maxmimum of four images
             s = 0  # log only max scale
             for frame_id in self.opt.frame_ids:
+                # Unnormalize color images before writing
+                color_img = unnormalize_image(inputs[("color", frame_id, s)][j])
                 writer.add_image(
                     "color_{}_{}/{}".format(frame_id, s, j),
-                    inputs[("color", frame_id, s)][j].data, self.step)
+                    color_img.data, self.step)
                 if s == 0 and frame_id != 0:
+                    # Unnormalize predicted color images before writing
+                    color_pred_img = unnormalize_image(outputs[("color", frame_id, s)][j])
                     writer.add_image(
                         "color_pred_{}_{}/{}".format(frame_id, s, j),
-                        outputs[("color", frame_id, s)][j].data, self.step)
+                        color_pred_img.data, self.step)
 
             disp = colormap(outputs[("disp", s)][j, 0])
             writer.add_image(
