@@ -347,13 +347,6 @@ class GoProDataset(MonoDataset):
         inputs["gps12"] = norm(translations[1], translations[0])  # Current to previous
         inputs["gps23"] = norm(translations[1], translations[2])  # Current to next
         
-        # Also add raw GPS data for debugging/analysis
-        video_info = self.video_data[folder]
-        if 'frame_mapping' in video_info and frame_index in video_info['frame_mapping']:
-            actual_frame_number = video_info['frame_mapping'][frame_index]
-        else:
-            actual_frame_number = frame_index
-                    
         return inputs
 
  

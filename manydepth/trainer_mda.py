@@ -118,6 +118,12 @@ class Trainer:
                                     num_input_features=1,
                                     num_frames_to_predict_for=2)
         
+        pose_encoder_pretrained_weights = torch.load(f'KITTI_MR/pose_encoder.pth', map_location='cpu')
+        self.models["pose_encoder"].load_state_dict(pose_encoder_pretrained_weights, strict=False)
+        
+        pose_decoder_pretrained_weights = torch.load(f'KITTI_MR/pose.pth', map_location='cpu')
+        self.models["pose"].load_state_dict(pose_decoder_pretrained_weights, strict=False)
+        
         self.models["pose_encoder"].to(self.device)
         self.models["pose"].to(self.device)
         
@@ -208,7 +214,7 @@ class Trainer:
         self.save_opts()
 
     def g2s_weight(self):
-            return math.exp(0.01*(self.step - 1*4000)) * 0.1 if self.step <= 1*4000 else 0.1
+            return math.exp(0.01*(self.step - 1*2000)) * 0.1 if self.step <= 1*2000 else 0.1
         
     
 
@@ -672,20 +678,13 @@ class Trainer:
             #TRANSLATIONS
             t12 = torch.norm(outputs[("translation", 0, -1)][:, 0].squeeze(), dim=1)
             t23 = torch.norm(outputs[("translation", 0, 1)][:, 0].squeeze(), dim=1)
-            #SCALES
             
-            # Mask loss where t12 or t23 is are less than 10 cm
-            mask = (t12 >= 0.01)*(t23 >= 0.01)*(t12 <= 2)*(t23 <= 2)
-            mask = mask
-            s1 = inputs["gps12"].float() / t12
-            s2 = inputs["gps23"].float() / t23
             
-            if mask.sum() > 0:  # Only compute loss if we have valid samples
-                s1_masked = s1[mask]
-                s2_masked = s2[mask]
-                g2s_loss = torch.mean((s1_masked - 1) ** 2 + (s2_masked - 1) ** 2)
-            else:
-                g2s_loss = torch.tensor(0.0, device=self.device)
+            s1 = inputs["gps12"].float() / t12 
+            s2 = inputs["gps23"].float() / t23 
+            
+            g2s_loss = torch.mean((s1 - 1) ** 2 + (s2 - 1) ** 2)
+
             total_loss += self.g2s_weight() * g2s_loss
             losses["scale"] = 0.5 * torch.mean(s1 + s2)
             

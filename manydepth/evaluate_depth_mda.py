@@ -94,12 +94,10 @@ def evaluate(opt):
         if opt.eval_teacher:
             encoder_path = os.path.join(opt.load_weights_folder, "mono_encoder.pth")
             decoder_path = os.path.join(opt.load_weights_folder, "mono_depth.pth")
-            scaler_path = os.path.join(opt.load_weights_folder, "mono_scaler.pth")
 
         else:
             encoder_path = os.path.join(opt.load_weights_folder, "encoder.pth")
             decoder_path = os.path.join(opt.load_weights_folder, "depth.pth")
-            scaler_path = os.path.join(opt.load_weights_folder, "multi_scaler.pth")
 
         encoder_dict = torch.load(encoder_path)
         try:

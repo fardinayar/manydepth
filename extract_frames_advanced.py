@@ -27,7 +27,7 @@ import logging
 from tqdm import tqdm
 import glob
 import re
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional, Dict, Any, cast
 
 # Set up logging
 logging.basicConfig(
@@ -123,10 +123,10 @@ class GPSFrameExtractor:
                 
                 # Filter out bad GPS fixes and precision
                 if 'GPSFIX' in df.columns:
-                    df = df[df['GPSFIX'] > 0]
+                    df = df[df['GPSFIX'] > 0].copy()
                     
                 if 'GPSP' in df.columns:
-                    df = df[df['GPSP'] <= 2000]
+                    df = df[df['GPSP'] <= 2000].copy()
                     
                 filtered_count = len(df)
                 logger.info(f"Filtered out {initial_count - filtered_count} bad GPS points")
@@ -151,10 +151,10 @@ class GPSFrameExtractor:
         
         # Select frames at regular intervals
         selected_indices = []
-        last_time = None
+        last_time: Optional[datetime] = None
         
         for idx, row in df.iterrows():
-            current_time = row['datetime']
+            current_time: datetime = cast(datetime, row['datetime'])
             
             if last_time is None or (current_time - last_time).total_seconds() >= interval_seconds:
                 selected_indices.append(idx)
@@ -184,7 +184,7 @@ class GPSFrameExtractor:
         logger.info(f"Video properties: {fps:.2f} FPS, {total_frames} frames, {duration_seconds:.2f}s duration")
         
         # Get video start time (assuming first GPS point is close to video start)
-        video_start_time = gps_df.iloc[0]['datetime']
+        video_start_time: datetime = cast(datetime, gps_df.iloc[0]['datetime'])
         
         stats = {
             'total_gps_points': len(gps_df),
@@ -200,7 +200,8 @@ class GPSFrameExtractor:
             
             try:
                 # Calculate frame number from timestamp
-                time_offset = (row['datetime'] - video_start_time).total_seconds()
+                current_time: datetime = cast(datetime, row['datetime'])
+                time_offset = (current_time - video_start_time).total_seconds()
                 frame_number = int(time_offset * fps)
                 
                 # Skip if frame is outside video bounds
@@ -218,9 +219,9 @@ class GPSFrameExtractor:
                     continue
                 
                 # Create filename with GPS info
-                timestamp_str = row['datetime'].strftime('%Y%m%d_%H%M%S_%f')[:-3]  # milliseconds
-                lat, lon = row['latitude'], row['longitude']
-                filename = f"{timestamp_str}_lat{lat:.6f}_lon{lon:.6f}_frame{frame_number:06d}.jpg"
+                timestamp_str = current_time.strftime('%Y%m%d_%H%M%S_%f')[:-3]  # milliseconds
+                lat, lon = float(row['latitude']), float(row['longitude'])
+                filename = f"{timestamp_str}_lat{lat:.8f}_lon{lon:.8f}_frame{frame_number:06d}.jpg"
                 
                 # Save frame
                 output_path = output_subdir / filename
@@ -306,6 +307,48 @@ class GPSFrameExtractor:
         logger.info(f"Batch processing completed: {total_stats}")
         return total_stats
 
+    def analyze_gps_quality(self, df: pd.DataFrame) -> Dict[str, float]:
+        """Analyze GPS data quality and return statistics"""
+        if len(df) < 2:
+            return {}
+        
+        # Calculate consecutive distances
+        distances = []
+        time_deltas = []
+        
+        for i in range(1, len(df)):
+            # Calculate distance between consecutive points
+            lat1, lon1 = df.iloc[i-1]['latitude'], df.iloc[i-1]['longitude']
+            lat2, lon2 = df.iloc[i]['latitude'], df.iloc[i]['longitude']
+            
+            # Simple distance calculation (meters)
+            lat_diff = (lat2 - lat1) * 111000
+            lon_diff = (lon2 - lon1) * 111000 * np.cos(np.radians(lat1))
+            distance = np.sqrt(lat_diff**2 + lon_diff**2)
+            distances.append(distance)
+            
+            # Time delta
+            time_delta = (df.iloc[i]['datetime'] - df.iloc[i-1]['datetime']).total_seconds()
+            time_deltas.append(time_delta)
+        
+        stats = {
+            'mean_distance_m': np.mean(distances),
+            'std_distance_m': np.std(distances),
+            'max_distance_m': np.max(distances),
+            'mean_time_delta_s': np.mean(time_deltas),
+            'zero_motion_ratio': np.sum(np.array(distances) < 1.0) / len(distances),
+            'estimated_speed_ms': np.mean(distances) / np.mean(time_deltas) if np.mean(time_deltas) > 0 else 0
+        }
+        
+        logger.info(f"GPS Quality Analysis:")
+        logger.info(f"  Mean distance between points: {stats['mean_distance_m']:.2f} ± {stats['std_distance_m']:.2f} m")
+        logger.info(f"  Max distance: {stats['max_distance_m']:.2f} m")
+        logger.info(f"  Mean time delta: {stats['mean_time_delta_s']:.2f} s")
+        logger.info(f"  Zero motion ratio: {stats['zero_motion_ratio']:.2%}")
+        logger.info(f"  Estimated speed: {stats['estimated_speed_ms']:.2f} m/s")
+        
+        return stats
+
 def main():
     """Main function with command line interface"""
     parser = argparse.ArgumentParser(
@@ -341,7 +384,7 @@ Examples:
     
     parser.add_argument('--frame-rate', 
                        type=float, 
-                       default=60.0,
+                       default=4.0,
                        help='Frame extraction rate in Hz (frames per second). Default: 10.0')
     
     parser.add_argument('--no-filter-gps', 

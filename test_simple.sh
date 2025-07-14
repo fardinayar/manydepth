@@ -1,0 +1,1 @@
+python manydepth/test_simple.py --target_image_path our_data/extracted_frames/GX010001_NorthQuays/20250410_110639_799_lat53.34820330_lon-6.29512440_frame000000.jpg --source_image_path our_data/extracted_frames/GX010001_NorthQuays/20250410_110639_799_lat53.34820330_lon-6.29512440_frame000000.jpg --model_path outs/kitti/mdp/models/weights_4/
