@@ -215,7 +215,7 @@ class Trainer:
         self.save_opts()
 
     def g2s_weight(self):
-            return math.exp(0.01*(self.step - 1*5000)) * 1 if self.step <= 1*5000 else 1
+            return math.exp(0.01*(self.step - 1*5000)) * 0.1 if self.step <= 1*5000 else 0.1
         
     
 
@@ -608,7 +608,7 @@ class Trainer:
                 # Patch-based implementation without using log
 
                 # Define patch size
-                patch_size = 64  # Can be adjusted based on input size
+                patch_size = 8  # Can be adjusted based on input size
 
                 # Unfold into patches
                 b, c, h, w = multi_depth.shape
@@ -648,6 +648,15 @@ class Trainer:
                 masked_patch_ssi_loss = patch_ssi_loss * outlier_mask
                 ssi_loss = masked_patch_ssi_loss.sum(dim=-1) / (outlier_mask.sum(dim=-1) + 1e-7)
                 ssi_loss = ssi_loss.mean()
+                
+                # Store patch-wise SSI loss for visualization
+                # Calculate spatial dimensions of patch grid
+                patch_grid_h = (h - patch_size) // (patch_size // 2) + 1
+                patch_grid_w = (w - patch_size) // (patch_size // 2) + 1
+                
+                # Reshape patch_ssi_loss to spatial dimensions for visualization
+                patch_ssi_loss_spatial = patch_ssi_loss.view(b, patch_grid_h, patch_grid_w)
+                outputs[("ssi_loss", scale)] = patch_ssi_loss_spatial
                 
                 # Combine losses
                 ssi_weight = 0.1
@@ -792,6 +801,13 @@ class Trainer:
             writer.add_image(
                 "disp_mono/{}".format(j),
                 disp, self.step)
+
+            # Log SSI loss if available (only for multi-frame)
+            if ("ssi_loss", s) in outputs:
+                ssi_loss_img = colormap(outputs[("ssi_loss", s)][j])
+                writer.add_image(
+                    "ssi_loss_{}/{}".format(s, j),
+                    ssi_loss_img, self.step)
 
         
 
