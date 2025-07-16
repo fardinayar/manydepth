@@ -118,12 +118,13 @@ class Trainer:
                                     num_input_features=1,
                                     num_frames_to_predict_for=2)
         
+        '''
         pose_encoder_pretrained_weights = torch.load(f'KITTI_MR/pose_encoder.pth', map_location='cpu')
         self.models["pose_encoder"].load_state_dict(pose_encoder_pretrained_weights, strict=False)
         
         pose_decoder_pretrained_weights = torch.load(f'KITTI_MR/pose.pth', map_location='cpu')
         self.models["pose"].load_state_dict(pose_decoder_pretrained_weights, strict=False)
-        
+        '''
         self.models["pose_encoder"].to(self.device)
         self.models["pose"].to(self.device)
         
@@ -214,7 +215,7 @@ class Trainer:
         self.save_opts()
 
     def g2s_weight(self):
-            return math.exp(0.01*(self.step - 1*2000)) * 0.1 if self.step <= 1*2000 else 0.1
+            return math.exp(0.01*(self.step - 1*5000)) * 1 if self.step <= 1*5000 else 1
         
     
 
@@ -224,6 +225,8 @@ class Trainer:
 
         for k, m in self.models.items():
             if k in ['depth', 'encoder']:
+                m.train()
+            elif k == 'gps_variance' and self.g2s:
                 m.train()
 
     def set_eval(self):
