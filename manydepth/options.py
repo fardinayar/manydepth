@@ -102,7 +102,7 @@ class MonodepthOptions:
         self.parser.add_argument("--num_epochs",
                                  type=int,
                                  help="number of epochs",
-                                 default=20)
+                                 default=5)
         self.parser.add_argument("--scheduler_step_size",
                                  type=int,
                                  help="step size of the scheduler",
@@ -256,7 +256,7 @@ class MonodepthOptions:
         
         self.parser.add_argument('--encoder_lr_coef',
                                  type=float,
-                                 default=0.1)
+                                 default=1.0)
         
         self.parser.add_argument("--g2s",
                          help="use g2s loss",

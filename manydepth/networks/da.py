@@ -69,7 +69,7 @@ class ManyDepthAnythingDecoder(nn.Module):
         features=64, 
         use_bn=False, 
         out_channels=[48, 96, 192, 384], 
-        use_clstoken=False,
+        use_clstoken=True,
         matching_height=518//14,
         matching_width=518//14
     ):

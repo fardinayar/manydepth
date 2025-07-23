@@ -76,6 +76,12 @@ class Trainer:
         
         lora.mark_only_lora_as_trainable(self.models['encoder'], bias='all')
         
+        # Enable grad for the cls token
+        for name, p in self.models['encoder'].named_parameters():
+            if 'cls_token' in name:
+                print(f"Enabling grad for {name}")
+                p.requires_grad = True
+        
         self.models["encoder"].to(self.device)
 
         self.models["depth"] = networks.ManyDepthAnythingDecoder(
@@ -93,7 +99,7 @@ class Trainer:
         self.models['depth'] = replace_conv_with_loraconv(self.models["depth"])
         lora.mark_only_lora_as_trainable(self.models['depth'], bias='all')
         for name, p in self.models['depth'].named_parameters():
-            if 'multi_frame_feature_fusion' in name:
+            if 'multi_frame_feature_fusion' in name or 'readout_projects' in name:
                 p.requires_grad = True
         
         self.models["depth"].to(self.device)
@@ -134,7 +140,7 @@ class Trainer:
 
         self.model_optimizer = optim.AdamW(self.parameters_to_train, self.opt.learning_rate)
         self.model_lr_scheduler = optim.lr_scheduler.StepLR(
-            self.model_optimizer, 2, 0.1)
+            self.model_optimizer, 5, 1)
 
         if self.opt.load_weights_folder is not None:
             self.load_model()
@@ -215,7 +221,7 @@ class Trainer:
         self.save_opts()
 
     def g2s_weight(self):
-            return math.exp(0.01*(self.step - 1*5000)) * 0.1 if self.step <= 1*5000 else 0.1
+            return math.exp(0.01*(self.step - 1*10000)) * 1 if self.step <= 1*10000 else 1
         
     
 
@@ -590,6 +596,13 @@ class Trainer:
             # find minimum losses from [reprojection, identity]
             reprojection_loss_mask = self.compute_loss_masks(reprojection_loss,
                                                              identity_reprojection_loss)
+            
+            # Mask outlier loss values using statistical threshold
+            mean_loss = reprojection_loss.mean(dim=-1, keepdim=True)
+            std_loss = reprojection_loss.std(dim=-1, keepdim=True)
+            threshold = mean_loss + 2.0 * std_loss  # 2-sigma threshold
+            outlier_mask = reprojection_loss <= threshold
+            reprojection_loss_mask = reprojection_loss_mask * outlier_mask
             
             reprojection_loss = reprojection_loss * reprojection_loss_mask 
             reprojection_loss = reprojection_loss.sum() / (reprojection_loss_mask.sum() + 1e-7)

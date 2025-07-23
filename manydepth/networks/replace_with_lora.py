@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import loralib as lora
 
-def replace_qkv_with_mergedlinear(model, r=1, lora_alpha=16, lora_dropout=0.0):
+def replace_qkv_with_mergedlinear(model, r=4, lora_alpha=4, lora_dropout=0.0):
     """
     Recursively replace all qkv linear layers in the model with MergedLinear from loralib.
     
@@ -29,7 +29,7 @@ def replace_qkv_with_mergedlinear(model, r=1, lora_alpha=16, lora_dropout=0.0):
                 r=r,
                 lora_alpha=lora_alpha,
                 lora_dropout=lora_dropout,
-                enable_lora=[True, True, True],  # Enable LoRA for q and v
+                enable_lora=[True, False, True],  # Enable LoRA for q and v
                 bias=bias,
                 merge_weights=True,
             )
@@ -51,7 +51,7 @@ def replace_qkv_with_mergedlinear(model, r=1, lora_alpha=16, lora_dropout=0.0):
 
 
 
-def replace_conv_with_loraconv(model, r=4, lora_alpha=16, lora_dropout=0.0):
+def replace_conv_with_loraconv(model, r=4, lora_alpha=4, lora_dropout=0.0):
     """
     Recursively replace all convolutional layers in the model with LoRA-enhanced convolutional layers.
     

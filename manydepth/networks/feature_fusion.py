@@ -107,7 +107,8 @@ class ViewEmbedding(nn.Module):
 
 class MultiFrameFeatureFusion(nn.Module):
     def __init__(self, input_dim, output_dim, matching_height, matching_width, 
-                 num_heads=4, dropout=0.1, use_rope=True, use_view_embedding=True):
+                 num_heads=4, dropout=0.1, use_rope=True, use_view_embedding=True, 
+                 neighborhood_size=5):
         super().__init__()
         self.input_dim = input_dim
         self.output_dim = output_dim
@@ -116,6 +117,7 @@ class MultiFrameFeatureFusion(nn.Module):
         self.num_heads = num_heads
         self.use_rope = use_rope
         self.use_view_embedding = use_view_embedding
+        self.neighborhood_size = neighborhood_size  # n for n×n neighborhood, None for global attention
 
         # Project inputs to output dimension
         self.input_proj_x1 = nn.Linear(input_dim, output_dim)
@@ -153,6 +155,56 @@ class MultiFrameFeatureFusion(nn.Module):
             nn.Linear(output_dim * 4, output_dim),
             nn.Dropout(dropout)
         )
+        
+        # Create attention mask for neighborhood constraint
+        self.attn_mask = self.create_neighborhood_mask(
+            self.matching_height, 
+            self.matching_width, 
+            self.neighborhood_size, 
+        )
+
+    def create_neighborhood_mask(self, height, width, neighborhood_size):
+        """
+        Create attention mask for n×n neighborhood attention.
+        
+        Args:
+            height, width: spatial dimensions
+            neighborhood_size: size of neighborhood (n for n×n)
+            device: torch device
+            
+        Returns:
+            mask: [height*width, 2*height*width] boolean mask where True means MASKED (not attend)
+        """
+        if neighborhood_size is None:
+            return None
+            
+        total_positions = height * width
+        # Create mask for [query_positions, key_positions] where key_positions = [x1_positions, x2_positions]
+        mask = torch.ones(total_positions, 2 * total_positions, dtype=torch.bool)
+        
+        half_size = neighborhood_size // 2
+        
+        for h in range(height):
+            for w in range(width):
+                query_idx = h * width + w
+                
+                # Define neighborhood bounds
+                h_min = max(0, h - half_size)
+                h_max = min(height, h + half_size + 1)
+                w_min = max(0, w - half_size)  
+                w_max = min(width, w + half_size + 1)
+                
+                # Mark positions in neighborhood as unmasked (False) for both x1 and x2
+                for nh in range(h_min, h_max):
+                    for nw in range(w_min, w_max):
+                        neighbor_idx = nh * width + nw
+                        
+                        # Unmask for x1 (first half of key/value)
+                        mask[query_idx, neighbor_idx] = False
+                        # Unmask for x2 (second half of key/value)  
+                        mask[query_idx, neighbor_idx + total_positions] = False
+        
+        return mask
 
     def forward(self, input):
         """
@@ -187,12 +239,14 @@ class MultiFrameFeatureFusion(nn.Module):
         # x1 attends to both itself and x2
         keys_values = torch.cat([x1_rope, x2_rope], dim=1)  # [B, 2*N, output_dim]
         
+        
         # Use PyTorch's MultiheadAttention
         # query: x1, key/value: [x1, x2]
         attn_output, _ = self.multihead_attention(
             query=x1_rope,           # [B, N, output_dim]
             key=keys_values,         # [B, 2*N, output_dim]  
             value=keys_values,       # [B, 2*N, output_dim]
+            attn_mask=self.attn_mask.to(x1_rope.device),     # [N, 2*N] attention mask
             need_weights=False       # Don't return attention weights for efficiency
         )
         
