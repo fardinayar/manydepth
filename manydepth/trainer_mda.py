@@ -76,12 +76,6 @@ class Trainer:
         
         lora.mark_only_lora_as_trainable(self.models['encoder'], bias='all')
         
-        # Enable grad for the cls token
-        for name, p in self.models['encoder'].named_parameters():
-            if 'cls_token' in name:
-                print(f"Enabling grad for {name}")
-                p.requires_grad = True
-        
         self.models["encoder"].to(self.device)
 
         self.models["depth"] = networks.ManyDepthAnythingDecoder(
@@ -99,7 +93,7 @@ class Trainer:
         self.models['depth'] = replace_conv_with_loraconv(self.models["depth"])
         lora.mark_only_lora_as_trainable(self.models['depth'], bias='all')
         for name, p in self.models['depth'].named_parameters():
-            if 'multi_frame_feature_fusion' in name or 'readout_projects' in name:
+            if 'multi_frame_feature_fusion' in name:
                 p.requires_grad = True
         
         self.models["depth"].to(self.device)
@@ -161,9 +155,14 @@ class Trainer:
 
         fpath = os.path.join("splits", self.opt.split, "{}_files.txt")
         train_filenames = readlines(fpath.format("train"))
-        # TODO
-        # Use only 10 percent of the training data
-        train_filenames = train_filenames[:int(len(train_filenames) * 1)]
+        
+        percent = self.opt.data_percent
+        print(f"Using {percent} percent of the training data")
+        len_train_filenames = len(train_filenames)
+        train_filenames = train_filenames[:int(len(train_filenames) * percent)]
+        # Duplicate the train filenames to keep it len fixed
+        train_filenames = train_filenames * (len_train_filenames // len(train_filenames))
+        
         val_filenames = readlines(fpath.format("val"))
         img_ext = '.png' if self.opt.png else '.jpg'
 
@@ -221,7 +220,7 @@ class Trainer:
         self.save_opts()
 
     def g2s_weight(self):
-            return math.exp(0.01*(self.step - 1*10000)) * 1 if self.step <= 1*10000 else 1
+            return math.exp(0.005*(self.step - 1*3000)) * 0.1 if self.step <= 1*3000 else 0.1
         
     
 

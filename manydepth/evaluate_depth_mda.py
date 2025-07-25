@@ -146,8 +146,8 @@ def evaluate(opt):
             depth_decoder = networks.ManyDepthAnythingDecoder(
                 matching_height=opt.height // 14, matching_width=opt.width //14)
         
-            encoder = replace_qkv_with_mergedlinear(encoder)
-            depth_decoder = replace_conv_with_loraconv(depth_decoder)
+            encoder = replace_qkv_with_mergedlinear(encoder,lora_dropout=0.0)
+            depth_decoder = replace_conv_with_loraconv(depth_decoder,lora_dropout=0.0)
 
         encoder.load_state_dict(encoder_dict, strict=False)
         depth_decoder.load_state_dict(torch.load(decoder_path))

@@ -1,1 +1,10 @@
-python manydepth/test_simple.py --target_image_path our_data/extracted_frames/GX010001_NorthQuays/20250410_110639_799_lat53.34820330_lon-6.29512440_frame000000.jpg --source_image_path our_data/extracted_frames/GX010001_NorthQuays/20250410_110639_799_lat53.34820330_lon-6.29512440_frame000000.jpg --model_path outs/kitti/mdp/models/weights_4/
+DATA_PERCENTS=(0.01 0.05 0.10 0.20 0.50 1.00)
+
+for PERCENT in "${DATA_PERCENTS[@]}"; do
+    python manydepth/train.py \
+        --data_path kitti_data/ \
+        --png \
+        --g2s \
+        --data_percent "$PERCENT" \
+        --log_dir "outs/kitti_dp${PERCENT}"
+done

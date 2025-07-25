@@ -262,6 +262,10 @@ class MonodepthOptions:
                          help="use g2s loss",
                          action="store_true")
         
+        self.parser.add_argument('--data_percent',
+                                 type=float,
+                                 default=1.0)
+        
     def parse(self):
         self.options = self.parser.parse_args()
         return self.options

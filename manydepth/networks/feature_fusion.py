@@ -107,8 +107,8 @@ class ViewEmbedding(nn.Module):
 
 class MultiFrameFeatureFusion(nn.Module):
     def __init__(self, input_dim, output_dim, matching_height, matching_width, 
-                 num_heads=4, dropout=0.1, use_rope=True, use_view_embedding=True, 
-                 neighborhood_size=5):
+                 num_heads=4, dropout=0.2, use_rope=True, use_view_embedding=True, 
+                 neighborhood_size=3):
         super().__init__()
         self.input_dim = input_dim
         self.output_dim = output_dim
@@ -213,6 +213,7 @@ class MultiFrameFeatureFusion(nn.Module):
         Only x1 gets updated, attending to both x1 and x2
         """
         x1, x2 = input[:, :, :self.input_dim], input[:, :, self.input_dim:]
+        return x1
         b, n, _ = x1.shape
         
         # Verify spatial dimensions
@@ -257,5 +258,5 @@ class MultiFrameFeatureFusion(nn.Module):
         ff_output = self.feed_forward(x1_updated)
         x1_final = self.layer_norm_2(ff_output + x1_updated)
         
-        return x1_final
+        return x1_final + x1
 
