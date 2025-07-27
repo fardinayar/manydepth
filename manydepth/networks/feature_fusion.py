@@ -213,7 +213,6 @@ class MultiFrameFeatureFusion(nn.Module):
         Only x1 gets updated, attending to both x1 and x2
         """
         x1, x2 = input[:, :, :self.input_dim], input[:, :, self.input_dim:]
-        return x1
         b, n, _ = x1.shape
         
         # Verify spatial dimensions
