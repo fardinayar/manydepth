@@ -101,7 +101,11 @@ class Trainer:
         if self.opt.encoder_lr_coef != 0.0:
             self.parameters_to_train.append({'params': self.models["encoder"].parameters(), 'lr': self.opt.encoder_lr_coef * self.opt.learning_rate})
         self.parameters_to_train.append({'params': self.models["depth"].parameters(), 'lr': self.opt.learning_rate})
-
+        # Print total number of learnable parameters
+        encoder_params = sum(p.numel() for p in self.models["encoder"].parameters() if p.requires_grad)
+        depth_params = sum(p.numel() for p in self.models["depth"].parameters() if p.requires_grad)
+        print(f"Total learnable parameters in encoder: {encoder_params}")
+        print(f"Total learnable parameters in depth: {depth_params}")
         encoder, decoder = networks.get_da_encoder_decoder(encoder_name=self.opt.depth_anything_encoder)
         self.models["mono_encoder"] = encoder
         self.models["mono_encoder"].to(self.device)
