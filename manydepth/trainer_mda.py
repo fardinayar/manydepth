@@ -138,7 +138,7 @@ class Trainer:
 
         self.model_optimizer = optim.AdamW(self.parameters_to_train, self.opt.learning_rate)
         self.model_lr_scheduler = optim.lr_scheduler.StepLR(
-            self.model_optimizer, 5, 1)
+            self.model_optimizer, 3, 0.1)
 
         if self.opt.load_weights_folder is not None:
             self.load_model()
@@ -224,7 +224,7 @@ class Trainer:
         self.save_opts()
 
     def g2s_weight(self):
-            return math.exp(0.005*(self.step - 1*3000)) * 0.1 if self.step <= 1*3000 else 0.1
+            return math.exp(0.01*(self.step - 1*10000)) * 1 if self.step <= 1*10000 else 1
         
     
 
@@ -675,7 +675,7 @@ class Trainer:
                 outputs[("ssi_loss", scale)] = patch_ssi_loss_spatial
                 
                 # Combine losses
-                ssi_weight = 0.1
+                ssi_weight = self.g2s_weight() /10
                 
 
                 consistency_loss = (ssi_weight * ssi_loss)

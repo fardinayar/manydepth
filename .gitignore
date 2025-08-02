@@ -7,3 +7,4 @@ kitti_data/
 *.pth
 our_data/
 splits/cityscapes/gt_depths/*
+outs_edited
