@@ -24,8 +24,8 @@ class GoProDataset(MonoDataset):
         # Camera calibration from your calib.txt (non-square pixels)
         # Given focal (858.84 px) matches fy from vFoV perfectly
         # fx estimated with 2% difference due to pixel pitch
-        focal_x_px = 876.02  # Horizontal focal length
-        focal_y_px = 858.84  # Vertical focal length (from vFoV)
+        focal_x_px = 898.15   # Horizontal focal length
+        focal_y_px = 899.20   # Vertical focal length (from vFoV)
         
         # Image dimensions for normalization
         self.img_width = 1920  # GoPro 1080p width

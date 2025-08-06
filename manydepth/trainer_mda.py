@@ -121,14 +121,13 @@ class Trainer:
             networks.PoseDecoder(self.models["pose_encoder"].num_ch_enc,
                                     num_input_features=1,
                                     num_frames_to_predict_for=2)
-        
-        '''
-        pose_encoder_pretrained_weights = torch.load(f'KITTI_MR/pose_encoder.pth', map_location='cpu')
+    
+        '''pose_encoder_pretrained_weights = torch.load(f'KITTI_MR/pose_encoder.pth', map_location='cpu')
         self.models["pose_encoder"].load_state_dict(pose_encoder_pretrained_weights, strict=False)
         
         pose_decoder_pretrained_weights = torch.load(f'KITTI_MR/pose.pth', map_location='cpu')
-        self.models["pose"].load_state_dict(pose_decoder_pretrained_weights, strict=False)
-        '''
+        self.models["pose"].load_state_dict(pose_decoder_pretrained_weights, strict=False)'''
+        
         self.models["pose_encoder"].to(self.device)
         self.models["pose"].to(self.device)
         
@@ -224,7 +223,7 @@ class Trainer:
         self.save_opts()
 
     def g2s_weight(self):
-            return math.exp(0.01*(self.step - 1*10000)) * 1 if self.step <= 1*10000 else 1
+            return math.exp(0.01*(self.step - 1*1000)) * 1 if self.step <= 1*1000 else 1
         
     
 
@@ -624,7 +623,7 @@ class Trainer:
                 # Patch-based implementation without using log
 
                 # Define patch size
-                patch_size = 8  # Can be adjusted based on input size
+                patch_size = 8 * 4
 
                 # Unfold into patches
                 b, c, h, w = multi_depth.shape
@@ -663,7 +662,8 @@ class Trainer:
 
                 masked_patch_ssi_loss = patch_ssi_loss * outlier_mask
                 ssi_loss = masked_patch_ssi_loss.sum(dim=-1) / (outlier_mask.sum(dim=-1) + 1e-7)
-                ssi_loss = ssi_loss.mean()
+
+                ssi_loss = ssi_loss.mean() 
                 
                 # Store patch-wise SSI loss for visualization
                 # Calculate spatial dimensions of patch grid
@@ -675,8 +675,7 @@ class Trainer:
                 outputs[("ssi_loss", scale)] = patch_ssi_loss_spatial
                 
                 # Combine losses
-                ssi_weight = self.g2s_weight() /10
-                
+                ssi_weight = self.g2s_weight() /10                
 
                 consistency_loss = (ssi_weight * ssi_loss)
                 

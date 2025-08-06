@@ -312,7 +312,7 @@ def overlay_masks_with_distance(image, masks, labels, depth_map, alpha=0.3):
             # Add text background for better visibility
             font = cv2.FONT_HERSHEY_SIMPLEX
             font_scale = 0.6
-            thickness = 2
+            thickness = 1
             text_size = cv2.getTextSize(distance_text, font, font_scale, thickness)[0]
             
             # Ensure text coordinates are within image bounds
@@ -385,8 +385,8 @@ def predict_depth_student(encoder, depth_decoder, input_color, lookup_frames):
 
 def create_video_demo(image_folder, weights_folder, output_video, 
                      depth_anything_encoder="vits", height=288, width=512, fps=15,
-                     min_depth=0.1, max_depth=80, num_matching_frames=2, max_frames=None, mask_folder=None):
-    """Create a video demo with original images, depth predictions, BEV point cloud visualization, and optional mask overlays with distance labels
+                     min_depth=0.1, max_depth=80, num_matching_frames=2, max_frames=None, mask_folder=None, enable_bev=False):
+    """Create a video demo with original images, depth predictions, optional BEV point cloud visualization, and optional mask overlays with distance labels
     When masks are provided, the BEV visualization only shows masked regions colored by object type
     """
     
@@ -419,11 +419,19 @@ def create_video_demo(image_folder, weights_folder, output_video,
     print(f"-> Computing predictions with size {HEIGHT}x{WIDTH}")
     print(f"-> Using {num_matching_frames} matching frames")
     
+    # Get original image dimensions from first image for display resolution
+    first_image = cv2.imread(image_files[0])
+    original_display_height, original_display_width = first_image.shape[:2]
+    print(f"-> Displaying results at original resolution {original_display_height}x{original_display_width}")
+    
     # Setup video writer with better codec options
-    # Three panels: original image, depth map, and BEV point cloud
-    bev_size = 256  # BEV visualization size
-    combined_width = WIDTH + bev_size  # Original/depth side by side, BEV on right
-    combined_height = HEIGHT * 2  # Original image + depth map stacked vertically
+    # Two or three panels: original image, depth map, and optionally BEV point cloud
+    bev_size = int(original_display_width * 0.4)  # BEV size proportional to original width
+    if enable_bev:
+        combined_width = original_display_width + bev_size  # Original/depth side by side, BEV on right
+    else:
+        combined_width = original_display_width  # Just original and depth stacked vertically
+    combined_height = original_display_height * 2  # Original image + depth map stacked vertically
     
     # Try different codecs for better compatibility
     if output_video.lower().endswith('.avi'):
@@ -483,48 +491,44 @@ def create_video_demo(image_folder, weights_folder, output_video,
             depth_map = pred_depth.cpu().squeeze().numpy()
             
             # Load original image for display
-            original_image = cv2.imread(image_path)
-            original_image_full = original_image.copy()  # Keep full resolution for mask loading
+            original_image_full = cv2.imread(image_path)  # Keep full resolution
             original_height, original_width = original_image_full.shape[:2]
-            original_image = cv2.resize(original_image, (WIDTH, HEIGHT))
             
-            # Load masks and prepare for processing
+            # Resize depth map back to original resolution for display
+            depth_map_original = cv2.resize(depth_map, (original_width, original_height), interpolation=cv2.INTER_LINEAR)
+            disp_map_original = cv2.resize(disp_map, (original_width, original_height), interpolation=cv2.INTER_LINEAR)
+            
+            # Load masks and prepare for processing at original resolution
             masks_original = None
-            masks_resized = None
             labels = []
             
             if mask_folder is not None:
                 image_name = os.path.basename(image_path)
                 masks_original, labels, boxes = load_masks_and_labels(mask_folder, image_name)
                 if masks_original is not None:
-                    # Resize masks to match the processed image dimensions for display
-                    masks_resized = []
-                    for mask in masks_original:
-                        resized_mask = cv2.resize(mask.astype(np.uint8), (WIDTH, HEIGHT), interpolation=cv2.INTER_NEAREST)
-                        masks_resized.append(resized_mask.astype(bool))
-                    masks_resized = np.array(masks_resized)
-                    
-                    # Overlay masks on the display image
-                    original_image = overlay_masks_with_distance(original_image, masks_resized, labels, depth_map)
+                    # Overlay masks on the full resolution image with original resolution depth
+                    original_image_full = overlay_masks_with_distance(original_image_full, masks_original, labels, depth_map_original)
             
-            # Resize depth and image back to original size for BEV generation
-            depth_map_original = cv2.resize(depth_map, (original_width, original_height), interpolation=cv2.INTER_LINEAR)
+            # Create BEV point cloud visualization if enabled
+            if enable_bev:
+                # Create BEV point cloud visualization using original size data and masks
+                bev_image = create_bev_pointcloud(depth_map_original, original_height, original_width, 
+                                                max_depth, bev_size, bev_size, masks_original)
             
-            # Create BEV point cloud visualization using original size data and masks
-            bev_image = create_bev_pointcloud(depth_map_original, original_height, original_width, 
-                                            max_depth, bev_size, bev_size, masks_original)
+            # Colorize disparity map at original resolution (disparity has different range than depth)
+            depth_colored = colorize_depth(disp_map_original, disp_map_original.min(), disp_map_original.max())
             
-            # Colorize disparity map (disparity has different range than depth)
-            depth_colored = colorize_depth(disp_map, disp_map.min(), disp_map.max())
+            # Combine images: original and depth stacked vertically, optionally with BEV on right
+            left_panel = np.vstack([original_image_full, depth_colored])  # Stack original and depth
             
-            # Combine images: original and depth stacked vertically on left, BEV on right
-            left_panel = np.vstack([original_image, depth_colored])  # Stack original and depth
-            
-            # Resize BEV to match the height of the left panel
-            bev_resized = cv2.resize(bev_image, (bev_size, combined_height))
-            
-            # Combine left panel and BEV horizontally
-            combined_frame = np.hstack([left_panel, bev_resized])
+            if enable_bev:
+                # Resize BEV to match the height of the left panel
+                bev_resized = cv2.resize(bev_image, (bev_size, combined_height))
+                # Combine left panel and BEV horizontally
+                combined_frame = np.hstack([left_panel, bev_resized])
+            else:
+                # Just use the left panel (original + depth)
+                combined_frame = left_panel
             
             # Ensure frame is in correct format (uint8)
             combined_frame = combined_frame.astype(np.uint8)
@@ -562,7 +566,7 @@ def main():
                         help='Input image height')
     parser.add_argument('--width', type=int, default=512,
                         help='Input image width')
-    parser.add_argument('--fps', type=int, default=5,
+    parser.add_argument('--fps', type=int, default=2,
                         help='Output video frame rate')
     parser.add_argument('--min_depth', type=float, default=0.1,
                         help='Minimum depth for visualization')
@@ -574,6 +578,8 @@ def main():
                         help='Maximum number of frames to process (default: process all frames)')
     parser.add_argument('--mask_folder', type=str, default=None,
                         help='Path to output_mask folder containing mask_data/ and json_data/ subdirectories (optional)')
+    parser.add_argument('--enable_bev', action='store_true', default=False,
+                        help='Enable Bird\'s Eye View point cloud visualization (default: disabled)')
     
     args = parser.parse_args()
     
@@ -599,10 +605,16 @@ def main():
         print(f"Max frames to process: {args.max_frames}")
     if args.mask_folder:
         print(f"Mask folder: {args.mask_folder}")
-        print(f"Output layout: Original + Masks + Depth + BEV Point Cloud (masked regions only)")
-        print(f"BEV will show only detected objects with distance labels")
+        if args.enable_bev:
+            print(f"Output layout: Original + Masks + Depth + BEV Point Cloud (masked regions only)")
+            print(f"BEV will show only detected objects with distance labels")
+        else:
+            print(f"Output layout: Original + Masks + Depth")
     else:
-        print(f"Output layout: Original + Depth + BEV Point Cloud (full scene)")
+        if args.enable_bev:
+            print(f"Output layout: Original + Depth + BEV Point Cloud (full scene)")
+        else:
+            print(f"Output layout: Original + Depth")
     
     # Run video demo
     create_video_demo(
@@ -617,7 +629,8 @@ def main():
         args.max_depth,
         args.num_matching_frames,
         args.max_frames,
-        args.mask_folder
+        args.mask_folder,
+        args.enable_bev
     )
 
 if __name__ == "__main__":

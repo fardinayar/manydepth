@@ -8,3 +8,10 @@ kitti_data/
 our_data/
 splits/cityscapes/gt_depths/*
 outs_edited
+
+
+Grounded-SAM-2
+*.zip
+*.npy
+*.mp4
+*.ply
