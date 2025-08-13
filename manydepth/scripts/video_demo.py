@@ -562,9 +562,9 @@ def main():
     parser.add_argument('--depth_anything_encoder', type=str, 
                         choices=["vits", "vitb", "vitl", "vitg"], default="vits",
                         help='Depth Anything encoder variant')
-    parser.add_argument('--height', type=int, default=288,
+    parser.add_argument('--height', type=int, default=182,
                         help='Input image height')
-    parser.add_argument('--width', type=int, default=512,
+    parser.add_argument('--width', type=int, default=630,
                         help='Input image width')
     parser.add_argument('--fps', type=int, default=2,
                         help='Output video frame rate')

@@ -223,7 +223,8 @@ class Trainer:
         self.save_opts()
 
     def g2s_weight(self):
-            return math.exp(0.01*(self.step - 1*1000)) * 1 if self.step <= 1*1000 else 1
+        
+            return math.exp(0.005*(self.step - 1*10000)) * 0.1 if self.step <= 1*10000 else 1
         
     
 
@@ -604,7 +605,7 @@ class Trainer:
             std_loss = reprojection_loss.std(dim=-1, keepdim=True)
             threshold = mean_loss + 2.0 * std_loss  # 2-sigma threshold
             outlier_mask = reprojection_loss <= threshold
-            reprojection_loss_mask = reprojection_loss_mask * outlier_mask
+            #reprojection_loss_mask = reprojection_loss_mask * outlier_mask
             
             reprojection_loss = reprojection_loss * reprojection_loss_mask 
             reprojection_loss = reprojection_loss.sum() / (reprojection_loss_mask.sum() + 1e-7)
@@ -618,12 +619,16 @@ class Trainer:
                 multi_depth = outputs[("depth", 0, scale)]
                 # no gradients for mono prediction!
                 mono_depth = outputs[("mono_depth", 0, scale)].detach()
+                
+                # Resize both to 630x182
+                multi_depth = F.interpolate(multi_depth, (182, 630), mode='bilinear', align_corners=False)
+                mono_depth = F.interpolate(mono_depth, (182, 630), mode='bilinear', align_corners=False)
 
                 # Scale-shift invariant loss between mono_depth and multi_depth
                 # Patch-based implementation without using log
 
                 # Define patch size
-                patch_size = 8 * 4
+                patch_size = 8 
 
                 # Unfold into patches
                 b, c, h, w = multi_depth.shape
@@ -675,7 +680,7 @@ class Trainer:
                 outputs[("ssi_loss", scale)] = patch_ssi_loss_spatial
                 
                 # Combine losses
-                ssi_weight = self.g2s_weight() /10                
+                ssi_weight = self.g2s_weight() / 10
 
                 consistency_loss = (ssi_weight * ssi_loss)
                 
