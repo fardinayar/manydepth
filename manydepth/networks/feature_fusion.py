@@ -1,79 +1,71 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
+
+def init_t_xy(end_x: int, end_y: int):
+    """Initialize 2D position indices for axial RoPE"""
+    t = torch.arange(end_x * end_y, dtype=torch.float32)
+    t_x = (t % end_x).float()
+    t_y = torch.div(t, end_x, rounding_mode='floor').float()
+    return t_x, t_y
+
+def compute_axial_cis(dim: int, end_x: int, end_y: int, theta: float = 100.0):
+    """Compute axial complex exponentials for 2D RoPE using complex numbers"""
+    freqs_x = 1.0 / (theta ** (torch.arange(0, dim, 4)[: (dim // 4)].float() / dim))
+    freqs_y = 1.0 / (theta ** (torch.arange(0, dim, 4)[: (dim // 4)].float() / dim))
+
+    t_x, t_y = init_t_xy(end_x, end_y)
+    freqs_x = torch.outer(t_x, freqs_x)
+    freqs_y = torch.outer(t_y, freqs_y)
+    freqs_cis_x = torch.polar(torch.ones_like(freqs_x), freqs_x)
+    freqs_cis_y = torch.polar(torch.ones_like(freqs_y), freqs_y)
+    return torch.cat([freqs_cis_x, freqs_cis_y], dim=-1)
+
+def apply_axial_rope(x: torch.Tensor, freqs_cis: torch.Tensor):
+    """Apply axial RoPE using complex number operations for efficiency"""
+    # Reshape to complex representation: [B, N, dim] -> [B, N, dim//2, 2] -> [B, N, dim//2]
+    # Ensure tensor is contiguous for view_as_complex
+    x_reshaped = x.float().reshape(*x.shape[:-1], -1, 2).contiguous()
+    x_complex = torch.view_as_complex(x_reshaped)
+    
+    # Apply rotation via complex multiplication
+    freqs_cis = freqs_cis.to(x.device)
+    x_rotated = x_complex * freqs_cis
+    
+    # Convert back to real representation
+    x_out = torch.view_as_real(x_rotated).flatten(-2)
+    return x_out.type_as(x)
 
 class RoPE2D(nn.Module):
-    """2D Rotary Position Embedding for spatial data"""
-    def __init__(self, dim, max_height=512, max_width=512):
+    """2D Axial Rotary Position Embedding using complex number operations"""
+    def __init__(self, dim, theta: float = 100.0):
         super().__init__()
         self.dim = dim
-        self.max_height = max_height
-        self.max_width = max_width
+        self.theta = theta
+        assert dim % 4 == 0, "Dimension must be divisible by 4 for axial RoPE"
         
-        # Create frequency bases for height and width dimensions
-        half_dim = dim // 4  # Split into 4 parts for 2D (h_cos, h_sin, w_cos, w_sin)
-        
-        # Frequency calculation similar to standard RoPE
-        freqs = 1.0 / (10000 ** (torch.arange(0, half_dim).float() / half_dim))
-        
-        # Pre-compute position encodings for maximum dimensions
-        h_pos = torch.arange(max_height).float().unsqueeze(1)  # [max_height, 1]
-        w_pos = torch.arange(max_width).float().unsqueeze(1)   # [max_width, 1]
-        
-        h_freqs = h_pos * freqs.unsqueeze(0)  # [max_height, half_dim]
-        w_freqs = w_pos * freqs.unsqueeze(0)  # [max_width, half_dim]
-        
-        # Register as buffers so they're moved to device with module
-        self.register_buffer('h_cos', h_freqs.cos())
-        self.register_buffer('h_sin', h_freqs.sin())
-        self.register_buffer('w_cos', w_freqs.cos())
-        self.register_buffer('w_sin', w_freqs.sin())
+        # Cache for computed frequencies to avoid recomputation
+        self._cached_freqs = {}
         
     def forward(self, x, height, width):
         """
-        Apply 2D RoPE to input tensor
+        Apply axial 2D RoPE to input tensor
         x: [B, H*W, dim] - flattened spatial features
         height, width: spatial dimensions
         """
         batch_size, seq_len, dim = x.shape
         assert seq_len == height * width
-        assert dim % 4 == 0, "Dimension must be divisible by 4 for 2D RoPE"
+        assert dim == self.dim, f"Input dim {dim} doesn't match expected {self.dim}"
         
-        quarter_dim = dim // 4
+        # Use cache for frequencies if available
+        cache_key = (height, width, x.device)
+        if cache_key not in self._cached_freqs:
+            freqs_cis = compute_axial_cis(dim, width, height, self.theta)
+            self._cached_freqs[cache_key] = freqs_cis
+        else:
+            freqs_cis = self._cached_freqs[cache_key]
         
-        # Create position grids
-        h_indices = torch.arange(height, device=x.device).repeat_interleave(width)  # [H*W]
-        w_indices = torch.arange(width, device=x.device).repeat(height)             # [H*W]
-        
-        # Get position encodings (cast to tensor to satisfy linter)
-        h_cos_tensor = torch.as_tensor(self.h_cos)
-        h_sin_tensor = torch.as_tensor(self.h_sin)
-        w_cos_tensor = torch.as_tensor(self.w_cos)
-        w_sin_tensor = torch.as_tensor(self.w_sin)
-        
-        h_cos = h_cos_tensor[h_indices, :quarter_dim]  # [H*W, quarter_dim]
-        h_sin = h_sin_tensor[h_indices, :quarter_dim]  # [H*W, quarter_dim]
-        w_cos = w_cos_tensor[w_indices, :quarter_dim]  # [H*W, quarter_dim]
-        w_sin = w_sin_tensor[w_indices, :quarter_dim]  # [H*W, quarter_dim]
-        
-        # Split input into 4 parts for 2D rotation
-        x1 = x[..., :quarter_dim]                    # Height cos component
-        x2 = x[..., quarter_dim:quarter_dim*2]       # Height sin component  
-        x3 = x[..., quarter_dim*2:quarter_dim*3]     # Width cos component
-        x4 = x[..., quarter_dim*3:]                  # Width sin component
-        
-        # Apply 2D rotations
-        # Height rotation
-        x1_rot = x1 * h_cos - x2 * h_sin
-        x2_rot = x1 * h_sin + x2 * h_cos
-        
-        # Width rotation  
-        x3_rot = x3 * w_cos - x4 * w_sin
-        x4_rot = x3 * w_sin + x4 * w_cos
-        
-        # Concatenate rotated components
-        return torch.cat([x1_rot, x2_rot, x3_rot, x4_rot], dim=-1)
+        return apply_axial_rope(x, freqs_cis)
 
 class ViewEmbedding(nn.Module):
     """Learnable view embeddings to distinguish between different frames/views"""
@@ -106,12 +98,11 @@ class ViewEmbedding(nn.Module):
         return x + view_embed
 
 class MultiFrameFeatureFusion(nn.Module):
-    def __init__(self, input_dim, output_dim, matching_height, matching_width, 
+    def __init__(self, input_dim, matching_height, matching_width, 
                  num_heads=4, dropout=0.2, use_rope=True, use_view_embedding=True, 
                  neighborhood_size=3):
         super().__init__()
         self.input_dim = input_dim
-        self.output_dim = output_dim
         self.matching_height = matching_height
         self.matching_width = matching_width
         self.num_heads = num_heads
@@ -119,13 +110,9 @@ class MultiFrameFeatureFusion(nn.Module):
         self.use_view_embedding = use_view_embedding
         self.neighborhood_size = neighborhood_size  # n for n×n neighborhood, None for global attention
 
-        # Project inputs to output dimension
-        self.input_proj_x1 = nn.Linear(input_dim, output_dim)
-        self.input_proj_x2 = nn.Linear(input_dim, output_dim)
-        
         # Use PyTorch's built-in MultiheadAttention
         self.multihead_attention = nn.MultiheadAttention(
-            embed_dim=output_dim,
+            embed_dim=input_dim,
             num_heads=num_heads,
             dropout=dropout,
             batch_first=True  # Use batch_first=True for easier handling
@@ -133,35 +120,40 @@ class MultiFrameFeatureFusion(nn.Module):
         
         # Optional 2D Rotary Position Embedding for spatial awareness
         if self.use_rope:
-            if output_dim % 4 != 0:
-                raise ValueError(f"output_dim ({output_dim}) must be divisible by 4 when using RoPE")
-            self.rope_2d = RoPE2D(
-                dim=output_dim,
-                max_height=max(matching_height, 64),  # Set reasonable maximums
-                max_width=max(matching_width, 64)
-            )
+            if input_dim % 4 != 0:
+                raise ValueError(f"input_dim ({input_dim}) must be divisible by 4 when using RoPE")
+            self.rope_2d = RoPE2D(dim=input_dim)
         
         # Optional view embeddings to distinguish between frames
         if self.use_view_embedding:
-            self.view_embedding = ViewEmbedding(embed_dim=output_dim, num_views=2)
+            self.view_embedding = ViewEmbedding(embed_dim=input_dim, num_views=2)
         
-        # Layer normalization and feed-forward
-        self.layer_norm_1 = nn.LayerNorm(output_dim)
-        self.layer_norm_2 = nn.LayerNorm(output_dim)
+        # Pre-LN: normalize before attention and before feed-forward
+        self.attn_norm = nn.LayerNorm(input_dim)
+        self.ffn_norm = nn.LayerNorm(input_dim)
         
         self.feed_forward = nn.Sequential(
-            nn.Linear(output_dim, output_dim * 4),
+            nn.Linear(input_dim, input_dim * 2),
             nn.GELU(),
-            nn.Linear(output_dim * 4, output_dim),
+            nn.Linear(input_dim * 2, input_dim),
             nn.Dropout(dropout)
         )
         
         # Create attention mask for neighborhood constraint
-        self.attn_mask = self.create_neighborhood_mask(
-            self.matching_height, 
-            self.matching_width, 
-            self.neighborhood_size, 
+        _mask = self.create_neighborhood_mask(
+            self.matching_height,
+            self.matching_width,
+            self.neighborhood_size,
         )
+        if _mask is not None:
+            self.register_buffer("attn_mask", _mask, persistent=False)
+        else:
+            self.attn_mask = None
+        
+        
+        
+
+        
 
     def create_neighborhood_mask(self, height, width, neighborhood_size):
         """
@@ -214,13 +206,14 @@ class MultiFrameFeatureFusion(nn.Module):
         """
         x1, x2 = input[:, :, :self.input_dim], input[:, :, self.input_dim:]
         b, n, _ = x1.shape
+
         
         # Verify spatial dimensions
         assert n == self.matching_height * self.matching_width, f"Expected N={self.matching_height * self.matching_width}, got N={n}"
         
-        # Project to output dimension
-        x1_proj = self.input_proj_x1(x1)  # [B, N, output_dim]
-        x2_proj = self.input_proj_x2(x2)  # [B, N, output_dim]
+        # Inputs to the block (no projection)
+        x1_proj = x1  # [B, N, input_dim]
+        x2_proj = x2  # [B, N, input_dim]
         
         # Apply view embeddings if enabled
         if self.use_view_embedding:
@@ -235,27 +228,25 @@ class MultiFrameFeatureFusion(nn.Module):
             x1_rope = x1_proj
             x2_rope = x2_proj
         
-        # Concatenate x1 and x2 as keys and values for cross-attention
-        # x1 attends to both itself and x2
-        keys_values = torch.cat([x1_rope, x2_rope], dim=1)  # [B, 2*N, output_dim]
-        
-        
-        # Use PyTorch's MultiheadAttention
-        # query: x1, key/value: [x1, x2]
+        # Pre-LN Attention
+        q = self.attn_norm(x1_rope)
+        k = self.attn_norm(x1_rope)
+        v = self.attn_norm(x1_rope)
+        k2 = self.attn_norm(x2_rope)
+        v2 = self.attn_norm(x2_rope)
+        keys = torch.cat([k, k2], dim=1)
+        values = torch.cat([v, v2], dim=1)
+        attn_mask = self.attn_mask if hasattr(self, "attn_mask") else None
         attn_output, _ = self.multihead_attention(
-            query=x1_rope,           # [B, N, output_dim]
-            key=keys_values,         # [B, 2*N, output_dim]  
-            value=keys_values,       # [B, 2*N, output_dim]
-            attn_mask=self.attn_mask.to(x1_rope.device),     # [N, 2*N] attention mask
-            need_weights=False       # Don't return attention weights for efficiency
+            query=q,                  # [B, N, input_dim]
+            key=keys,          # [B, 2*N, input_dim]
+            value=values,             # [B, 2*N, input_dim]
+            attn_mask=attn_mask,      # [N, 2*N] or None
+            need_weights=False
         )
+        x = x1_proj + attn_output
         
-        # Residual connection and layer norm
-        x1_updated = self.layer_norm_1(attn_output + x1_proj)
+        # Pre-LN Feed-forward
+        x1_final = x + self.feed_forward(self.ffn_norm(x))
         
-        # Feed-forward network
-        ff_output = self.feed_forward(x1_updated)
-        x1_final = self.layer_norm_2(ff_output + x1_updated)
-        
-        return x1_final + x1
-
+        return x1_final

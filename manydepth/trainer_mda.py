@@ -78,7 +78,12 @@ class Trainer:
         
         self.models["encoder"].to(self.device)
 
+        model_config = networks.MODEL_CONFIGS[self.opt.depth_anything_encoder]
+        
         self.models["depth"] = networks.ManyDepthAnythingDecoder(
+            in_channels=model_config['in_channels'],
+            out_channels=model_config['out_channels'],
+            features=model_config['features'],
             matching_height=self.opt.height // 14, matching_width=self.opt.width //14)
 
         depthanything_weights = torch.load(f'checkpoints/depth_anything_v2_{self.opt.depth_anything_encoder}.pth', map_location='cpu')
@@ -136,8 +141,8 @@ class Trainer:
         self.parameters_to_train.append({'params': self.models["pose"].parameters(), 'lr': self.opt.learning_rate})
 
         self.model_optimizer = optim.AdamW(self.parameters_to_train, self.opt.learning_rate)
-        self.model_lr_scheduler = optim.lr_scheduler.StepLR(
-            self.model_optimizer, 3, 0.1)
+        self.model_lr_scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            self.model_optimizer, T_0=1000, T_mult=2, eta_min=1e-5)
 
         if self.opt.load_weights_folder is not None:
             self.load_model()
@@ -296,7 +301,7 @@ class Trainer:
 
             self.step += 1
 
-        self.model_lr_scheduler.step()
+            self.model_lr_scheduler.step()
 
     def process_batch(self, inputs, is_train=False):
         """Pass a minibatch through the network and generate images and losses
@@ -345,7 +350,7 @@ class Trainer:
             patch_h, patch_w = input_image.shape[-2] // 14, input_image.shape[-1] // 14
             feats = self.models["mono_encoder"].get_intermediate_layers(input_image, [2, 5, 8, 11], return_class_token=True)
             monodepth, depth_feats = self.models['mono_depth'](feats, patch_h, patch_w)
-        monodepth = {("disp", 0): monodepth.sigmoid()}
+        monodepth = {("disp", 0): F.relu(monodepth)}
         mono_outputs.update(monodepth)
        
 
@@ -373,7 +378,7 @@ class Trainer:
                                             patch_h,
                                             patch_w)
         
-        depth =  (depth ).sigmoid()
+        depth =  (F.sigmoid(depth ))
         outputs.update({("disp", 0): depth})
 
         self.generate_images_pred(inputs, outputs, is_multi=True)
@@ -628,7 +633,7 @@ class Trainer:
                 # Patch-based implementation without using log
 
                 # Define patch size
-                patch_size = 8 
+                patch_size = 16
 
                 # Unfold into patches
                 b, c, h, w = multi_depth.shape

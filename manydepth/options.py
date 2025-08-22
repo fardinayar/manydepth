@@ -79,11 +79,11 @@ class MonodepthOptions:
         self.parser.add_argument("--min_depth",
                                  type=float,
                                  help="minimum depth",
-                                 default=0.1)
+                                 default=0.01)
         self.parser.add_argument("--max_depth",
                                  type=float,
                                  help="maximum depth",
-                                 default=100.0)
+                                 default=500.0)
         self.parser.add_argument("--frame_ids",
                                  nargs="+",
                                  type=int,
@@ -232,10 +232,7 @@ class MonodepthOptions:
                                  help="if set will perform the flipping post processing "
                                       "from the original monodepth paper",
                                  action="store_true")
-        self.parser.add_argument("--zero_cost_volume",
-                                 action="store_true",
-                                 help="If set, during evaluation all poses will be set to 0, and "
-                                      "so we will evaluate the model in single frame mode")
+
         self.parser.add_argument('--static_camera',
                                  action='store_true',
                                  help='If set, during evaluation the current frame will also be'

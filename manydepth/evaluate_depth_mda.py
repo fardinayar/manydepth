@@ -135,6 +135,7 @@ def evaluate(opt):
             pose_enc.load_state_dict(pose_enc_dict, strict=True)
             pose_dec.load_state_dict(pose_dec_dict, strict=True)
 
+            
             pose_enc.eval()
             pose_dec.eval()
 
@@ -143,13 +144,15 @@ def evaluate(opt):
                 pose_dec.cuda()
 
             encoder = networks.ManyDepthAnythingEncoder(encoder_name=opt.depth_anything_encoder)
+            config = networks.MODEL_CONFIGS[opt.depth_anything_encoder]
             depth_decoder = networks.ManyDepthAnythingDecoder(
-                matching_height=opt.height // 14, matching_width=opt.width //14)
+                matching_height=opt.height // 14, matching_width=opt.width //14, features=config['features'], in_channels=config['in_channels'], out_channels=config['out_channels'])
         
             encoder = replace_qkv_with_mergedlinear(encoder,lora_dropout=0.0)
             depth_decoder = replace_conv_with_loraconv(depth_decoder,lora_dropout=0.0)
 
         encoder.load_state_dict(encoder_dict, strict=False)
+        
         depth_decoder.load_state_dict(torch.load(decoder_path))
         encoder.eval()
         depth_decoder.eval()
@@ -174,72 +177,28 @@ def evaluate(opt):
                     output, _ = depth_decoder(features, patch_h, patch_w)
                 else:
 
-                    if opt.static_camera:
-                        for f_i in frames_to_load:
-                            data["color", f_i, 0] = data[('color', 0, 0)]
-
-                    # predict poses
-                    pose_feats = {f_i: data["color", f_i, 0] for f_i in frames_to_load}
-                    if torch.cuda.is_available():
-                        pose_feats = {k: v.cuda() for k, v in pose_feats.items()}
-                    # compute pose from 0->-1, -1->-2, -2->-3 etc and multiply to find 0->-3
-                    for fi in frames_to_load[1:]:
-                        if fi < 0:
-                            pose_inputs = [pose_feats[fi], pose_feats[fi + 1]]
-                            pose_inputs = [pose_enc(torch.cat(pose_inputs, 1))]
-                            axisangle, translation = pose_dec(pose_inputs)
-                            pose = transformation_from_parameters(
-                                axisangle[:, 0], translation[:, 0], invert=True)
-
-                            # now find 0->fi pose
-                            if fi != -1:
-                                pose = torch.matmul(pose, data[('relative_pose', fi + 1)])
-
-                        else:
-                            pose_inputs = [pose_feats[fi - 1], pose_feats[fi]]
-                            pose_inputs = [pose_enc(torch.cat(pose_inputs, 1))]
-                            axisangle, translation = pose_dec(pose_inputs)
-                            pose = transformation_from_parameters(
-                                axisangle[:, 0], translation[:, 0], invert=False)
-
-                            # now find 0->fi pose
-                            if fi != 1:
-                                pose = torch.matmul(pose, data[('relative_pose', fi - 1)])
-
-                        data[('relative_pose', fi)] = pose
 
                     lookup_frames = [data[('color', idx, 0)] for idx in frames_to_load[1:]]
                     lookup_frames = torch.stack(lookup_frames, 1)  # batch x frames x 3 x h x w
 
-                    relative_poses = [data[('relative_pose', idx)] for idx in frames_to_load[1:]]
-                    relative_poses = torch.stack(relative_poses, 1)
-
-                    K = data[('K', 2)]  # quarter resolution for matching
-                    invK = data[('inv_K', 2)]
-
                     if torch.cuda.is_available():
                         lookup_frames = lookup_frames.cuda()
-                        relative_poses = relative_poses.cuda()
-                        K = K.cuda()
-                        invK = invK.cuda()
 
-                    if opt.zero_cost_volume:
-                        relative_poses *= 0
 
                     if opt.post_process:
                         raise NotImplementedError
 
                     features, lookup_features = encoder(input_color, lookup_frames)
                     patch_h, patch_w = input_color.shape[-2] // 14, input_color.shape[-1] // 14
-                    output, depth_feats = depth_decoder(features,
+                    output, _ = depth_decoder(features,
                                                                                 lookup_features,
                                                                                 patch_h,
                                                                                 patch_w,)
-                #scale, shift = scaler(features)
-                if not opt.eval_teacher:
-                    output =  (output).sigmoid()
+                if opt.eval_teacher:
+                    output = output.relu()
                 else:
                     output =  (output).sigmoid()
+                
                 pred_disp, _ = disp_to_depth(output, opt.min_depth, opt.max_depth)
                 
                 pred_disp = pred_disp.cpu()[:, 0].numpy()
@@ -261,9 +220,7 @@ def evaluate(opt):
             pred_disps = pred_disps[eigen_to_benchmark_ids]
 
     if opt.save_pred_disps:
-        if opt.zero_cost_volume:
-            tag = "zero_cv"
-        elif opt.eval_teacher:
+        if opt.eval_teacher:
             tag = "teacher"
         else:
             tag = "multi"
@@ -357,7 +314,17 @@ def evaluate(opt):
         pred_depth_metric = deepcopy(pred_depth)
 
         pred_depth *= opt.pred_depth_scale_factor
-        if not opt.disable_median_scaling:
+        if opt.eval_teacher and not opt.disable_median_scaling:
+            p = pred_depth.astype(np.float64).reshape(-1)
+            g = gt_depth.astype(np.float64).reshape(-1)
+            if p.size >= 2:
+                A = np.vstack([p, np.ones_like(p)]).T
+                a, b = np.linalg.lstsq(A, g, rcond=None)[0]
+            else:
+                a, b = 1.0, 0.0
+            ratios.append(float(a))
+            pred_depth = a * pred_depth + b
+        elif not opt.disable_median_scaling:
             ratio = np.median(gt_depth) / np.median(pred_depth)
             ratios.append(ratio)
             pred_depth *= ratio

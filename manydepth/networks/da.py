@@ -7,15 +7,20 @@ import copy
 from .feature_fusion import MultiFrameFeatureFusion
 
 MODEL_CONFIGS = {
-    'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
-    'vitb': {'encoder': 'vitb', 'features': 128, 'out_channels': [96, 192, 384, 768]},
-    'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
-    'vitg': {'encoder': 'vitg', 'features': 384, 'out_channels': [1536, 1536, 1536, 1536]}
+    'vits': {'encoder': 'vits', 'features': 64, 'in_channels': 384, 'out_channels': [48, 96, 192, 384]},
+    'vitb': {'encoder': 'vitb', 'features': 128, 'in_channels': 768, 'out_channels': [96, 192, 384, 768]},
+    'vitl': {'encoder': 'vitl', 'features': 256, 'in_channels': 1024, 'out_channels': [256, 512, 1024, 1024]},
+    'vitg': {'encoder': 'vitg', 'features': 384, 'in_channels': 1536, 'out_channels': [1536, 1536, 1536, 1536]}
 }
 
 
 def get_da_encoder_decoder(encoder_name='vits', checkpoint=True):
-    da_model = DepthAnythingV2(**MODEL_CONFIGS[encoder_name])
+    cfg = MODEL_CONFIGS[encoder_name]
+    da_model = DepthAnythingV2(
+        encoder=cfg['encoder'],
+        features=cfg['features'],
+        out_channels=cfg['out_channels']
+    )
     if checkpoint:
         da_model.load_state_dict(torch.load(f'checkpoints/depth_anything_v2_{encoder_name}.pth', map_location='cpu'))
     encoder = da_model.pretrained
@@ -130,8 +135,8 @@ class ManyDepthAnythingDecoder(nn.Module):
 
         
         self.multi_frame_feature_fusion = nn.ModuleList([
-            MultiFrameFeatureFusion(in_channels, in_channels, self.matching_height, self.matching_width)
-            for _ in range(4)
+            MultiFrameFeatureFusion(in_channels, self.matching_height, self.matching_width)
+            for _ in range(1)
         ])
         
         self.scratch.stem_transpose = None

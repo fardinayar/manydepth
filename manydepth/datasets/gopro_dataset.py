@@ -21,14 +21,12 @@ class GoProDataset(MonoDataset):
         
         super(GoProDataset, self).__init__(*args, **kwargs)
 
-        # Camera calibration from your calib.txt (non-square pixels)
-        # Given focal (858.84 px) matches fy from vFoV perfectly
-        # fx estimated with 2% difference due to pixel pitch
+        # Estimated Camera calibration
         focal_x_px = 898.15   # Horizontal focal length
         focal_y_px = 899.20   # Vertical focal length (from vFoV)
         
         # Image dimensions for normalization
-        self.img_width = 1920  # GoPro 1080p width
+        self.img_width = 1920  # GoPro 1920p width
         self.img_height = 1080  # GoPro 1080p height
         
         # Convert to normalized coordinates (same format as KITTI)
@@ -41,16 +39,10 @@ class GoProDataset(MonoDataset):
                            [0, 0, 1, 0],
                            [0, 0, 0, 1]], dtype=np.float32)
 
-        # GoPro camera parameters
-        self.roll_deg = -1.85
-        self.pitch_deg = -2.15
-        self.vfov_deg = 64.32
         
         # Set full resolution shape (width, height) - same format as KITTI
         self.full_res_shape = (self.img_width, self.img_height)
-        
-        # Side map for compatibility (GoPro has no stereo, but keep interface)
-        self.side_map = {"l": 2, "r": 2}  # Map both to same camera
+
         
         # Load video data and create filenames list (KITTI-compatible format)
         self.video_data = self._load_video_data()
@@ -60,66 +52,41 @@ class GoProDataset(MonoDataset):
         """Load metadata from all processed videos"""
         video_data = {}
         
-        # Look for extracted_frames directory or other possible structures
-        possible_dirs = ['extracted_frames', 'frame_gps_output', 'out_data', 'gopro_output']
-        data_dir = None
-        
-        for dir_name in possible_dirs:
-            candidate_path = os.path.join(self.data_path, dir_name)
-            if os.path.exists(candidate_path):
-                data_dir = candidate_path
-                break
-        
-        if data_dir is None:
-            # If no standard directory found, use data_path directly
-            data_dir = self.data_path
-        
+        data = os.path.join(self.data_path, "extracted_frames")
+
         # Find all video subdirectories
-        for video_dir in Path(data_dir).iterdir():
+        for video_dir in Path(data).iterdir():
             if video_dir.is_dir():
-                # Look for either metadata JSON file or frame files with GPS in filename
-                metadata_file = video_dir / 'frame_gps_metadata.json'
+                # Generate metadata from files with GPS in filename
+                frame_files = list(video_dir.glob('*.jpg')) + list(video_dir.glob('*.png'))
+                frame_gps_pairs = []
+                    
+                for frame_file in sorted(frame_files):
+                    gps_data = self.parse_gps_from_filename(frame_file.name)
+                    if gps_data:
+                        # Extract frame number from filename
+                        frame_start = frame_file.name.find('_frame') + 6
+                        frame_end = frame_file.name.find('.jpg')
+                        if frame_end == -1:
+                            frame_end = frame_file.name.find('.png')
+                        frame_number = int(frame_file.name[frame_start:frame_end])
+                        
+                        frame_gps_pairs.append({
+                            'frame_number': frame_number,
+                            'frame_filename': frame_file.name,
+                            'gps': gps_data
+                        })
                 
-                if metadata_file.exists():
-                    # Use existing metadata format
-                    with open(metadata_file, 'r') as f:
-                        metadata = json.load(f)
+                if frame_gps_pairs:
+                    metadata = {
+                        'frame_gps_pairs': frame_gps_pairs,
+                        'total_frames': len(frame_gps_pairs)
+                    }
                     video_data[video_dir.name] = {
                         'metadata': metadata,
                         'video_dir': str(video_dir),
-                        'use_filename_gps': False
+                        'use_filename_gps': True
                     }
-                else:
-                    # Generate metadata from files with GPS in filename
-                    frame_files = list(video_dir.glob('*.jpg')) + list(video_dir.glob('*.png'))
-                    frame_gps_pairs = []
-                    
-                    for frame_file in sorted(frame_files):
-                        gps_data = self.parse_gps_from_filename(frame_file.name)
-                        if gps_data:
-                            # Extract frame number from filename
-                            frame_start = frame_file.name.find('_frame') + 6
-                            frame_end = frame_file.name.find('.jpg')
-                            if frame_end == -1:
-                                frame_end = frame_file.name.find('.png')
-                            frame_number = int(frame_file.name[frame_start:frame_end])
-                            
-                            frame_gps_pairs.append({
-                                'frame_number': frame_number,
-                                'frame_filename': frame_file.name,
-                                'gps': gps_data
-                            })
-                    
-                    if frame_gps_pairs:
-                        metadata = {
-                            'frame_gps_pairs': frame_gps_pairs,
-                            'total_frames': len(frame_gps_pairs)
-                        }
-                        video_data[video_dir.name] = {
-                            'metadata': metadata,
-                            'video_dir': str(video_dir),
-                            'use_filename_gps': True
-                        }
         
         return video_data
 
