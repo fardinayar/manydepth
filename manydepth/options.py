@@ -83,7 +83,7 @@ class MonodepthOptions:
         self.parser.add_argument("--max_depth",
                                  type=float,
                                  help="maximum depth",
-                                 default=500.0)
+                                 default=400.0)
         self.parser.add_argument("--frame_ids",
                                  nargs="+",
                                  type=int,
@@ -98,7 +98,7 @@ class MonodepthOptions:
         self.parser.add_argument("--learning_rate",
                                  type=float,
                                  help="learning rate",
-                                 default=1e-4)
+                                 default=5e-5)
         self.parser.add_argument("--num_epochs",
                                  type=int,
                                  help="number of epochs",

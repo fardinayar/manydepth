@@ -135,7 +135,7 @@ class ManyDepthAnythingDecoder(nn.Module):
 
         
         self.multi_frame_feature_fusion = nn.ModuleList([
-            MultiFrameFeatureFusion(in_channels, self.matching_height, self.matching_width)
+            MultiFrameFeatureFusion(in_channels, self.matching_height, self.matching_width, dropout=0.0)
             for _ in range(1)
         ])
         

@@ -314,7 +314,7 @@ def evaluate(opt):
         pred_depth_metric = deepcopy(pred_depth)
 
         pred_depth *= opt.pred_depth_scale_factor
-        if opt.eval_teacher and not opt.disable_median_scaling:
+        if opt.eval_teacher:
             p = pred_depth.astype(np.float64).reshape(-1)
             g = gt_depth.astype(np.float64).reshape(-1)
             if p.size >= 2:

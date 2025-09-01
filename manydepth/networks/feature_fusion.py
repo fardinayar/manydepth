@@ -99,8 +99,8 @@ class ViewEmbedding(nn.Module):
 
 class MultiFrameFeatureFusion(nn.Module):
     def __init__(self, input_dim, matching_height, matching_width, 
-                 num_heads=4, dropout=0.2, use_rope=True, use_view_embedding=True, 
-                 neighborhood_size=3):
+                 num_heads=4, dropout=0.2, use_rope=False, use_view_embedding=False, 
+                 neighborhood_size=5):
         super().__init__()
         self.input_dim = input_dim
         self.matching_height = matching_height
@@ -172,7 +172,7 @@ class MultiFrameFeatureFusion(nn.Module):
             
         total_positions = height * width
         # Create mask for [query_positions, key_positions] where key_positions = [x1_positions, x2_positions]
-        mask = torch.ones(total_positions, 2 * total_positions, dtype=torch.bool)
+        mask = torch.ones(total_positions, total_positions, dtype=torch.bool)
         
         half_size = neighborhood_size // 2
         
@@ -192,10 +192,7 @@ class MultiFrameFeatureFusion(nn.Module):
                         neighbor_idx = nh * width + nw
                         
                         # Unmask for x1 (first half of key/value)
-                        mask[query_idx, neighbor_idx] = False
-                        # Unmask for x2 (second half of key/value)  
-                        mask[query_idx, neighbor_idx + total_positions] = False
-        
+                        mask[query_idx, neighbor_idx] = False        
         return mask
 
     def forward(self, input):
@@ -230,17 +227,13 @@ class MultiFrameFeatureFusion(nn.Module):
         
         # Pre-LN Attention
         q = self.attn_norm(x1_rope)
-        k = self.attn_norm(x1_rope)
-        v = self.attn_norm(x1_rope)
-        k2 = self.attn_norm(x2_rope)
-        v2 = self.attn_norm(x2_rope)
-        keys = torch.cat([k, k2], dim=1)
-        values = torch.cat([v, v2], dim=1)
+        k = self.attn_norm(x2_rope)
+        v = self.attn_norm(x2_rope)
         attn_mask = self.attn_mask if hasattr(self, "attn_mask") else None
         attn_output, _ = self.multihead_attention(
             query=q,                  # [B, N, input_dim]
-            key=keys,          # [B, 2*N, input_dim]
-            value=values,             # [B, 2*N, input_dim]
+            key=k,          # [B, 2*N, input_dim]
+            value=v,             # [B, 2*N, input_dim]
             attn_mask=attn_mask,      # [N, 2*N] or None
             need_weights=False
         )

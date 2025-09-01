@@ -22,8 +22,8 @@ class GoProDataset(MonoDataset):
         super(GoProDataset, self).__init__(*args, **kwargs)
 
         # Estimated Camera calibration
-        focal_x_px = 898.15   # Horizontal focal length
-        focal_y_px = 899.20   # Vertical focal length (from vFoV)
+        focal_x_px = 897.7   # Horizontal focal length
+        focal_y_px = 897.9   # Vertical focal length (from vFoV)
         
         # Image dimensions for normalization
         self.img_width = 1920  # GoPro 1920p width

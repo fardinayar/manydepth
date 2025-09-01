@@ -76,6 +76,7 @@ class Trainer:
         
         lora.mark_only_lora_as_trainable(self.models['encoder'], bias='all')
         
+        
         self.models["encoder"].to(self.device)
 
         model_config = networks.MODEL_CONFIGS[self.opt.depth_anything_encoder]
@@ -98,7 +99,7 @@ class Trainer:
         self.models['depth'] = replace_conv_with_loraconv(self.models["depth"])
         lora.mark_only_lora_as_trainable(self.models['depth'], bias='all')
         for name, p in self.models['depth'].named_parameters():
-            if 'multi_frame_feature_fusion' in name:
+            if 'multi_frame_feature_fusion' in name or 'output_' in name:
                 p.requires_grad = True
         
         self.models["depth"].to(self.device)
@@ -127,11 +128,11 @@ class Trainer:
                                     num_input_features=1,
                                     num_frames_to_predict_for=2)
     
-        '''pose_encoder_pretrained_weights = torch.load(f'KITTI_MR/pose_encoder.pth', map_location='cpu')
+        pose_encoder_pretrained_weights = torch.load(f'CityScapes_MR/pose_encoder.pth', map_location='cpu')
         self.models["pose_encoder"].load_state_dict(pose_encoder_pretrained_weights, strict=False)
         
-        pose_decoder_pretrained_weights = torch.load(f'KITTI_MR/pose.pth', map_location='cpu')
-        self.models["pose"].load_state_dict(pose_decoder_pretrained_weights, strict=False)'''
+        pose_decoder_pretrained_weights = torch.load(f'CityScapes_MR/pose.pth', map_location='cpu')
+        self.models["pose"].load_state_dict(pose_decoder_pretrained_weights, strict=False)
         
         self.models["pose_encoder"].to(self.device)
         self.models["pose"].to(self.device)
@@ -140,15 +141,9 @@ class Trainer:
         self.parameters_to_train.append({'params': self.models["pose_encoder"].parameters(), 'lr': self.opt.learning_rate})
         self.parameters_to_train.append({'params': self.models["pose"].parameters(), 'lr': self.opt.learning_rate})
 
-        self.model_optimizer = optim.AdamW(self.parameters_to_train, self.opt.learning_rate)
-        self.model_lr_scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            self.model_optimizer, T_0=1000, T_mult=2, eta_min=1e-5)
 
-        if self.opt.load_weights_folder is not None:
-            self.load_model()
 
-        if self.opt.mono_weights_folder is not None:
-            self.load_mono_model()
+
 
         print("Training model named:\n  ", self.opt.model_name)
         print("Models and tensorboard events files are saved to:\n  ", self.opt.log_dir)
@@ -176,13 +171,20 @@ class Trainer:
 
         num_train_samples = len(train_filenames)
         self.num_total_steps = num_train_samples // self.opt.batch_size * self.opt.num_epochs
-
+        
+        self.model_optimizer = optim.AdamW(self.parameters_to_train, self.opt.learning_rate)
+        self.model_lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(self.model_optimizer, T_max=self.num_total_steps, eta_min=5e-5)
 
         self.g2s = self.opt.g2s
 
         train_dataset = self.dataset(
             self.opt.data_path, train_filenames, self.opt.height, self.opt.width,
             frames_to_load, 4, is_train=True, img_ext=img_ext, load_gps=self.g2s)
+        
+        if self.opt.dataset == "gopro":
+            num_train_samples = len(train_dataset)
+            self.num_total_steps = num_train_samples // self.opt.batch_size * self.opt.num_epochs
+        
         self.train_loader = DataLoader(
             train_dataset, self.opt.batch_size, True,
             num_workers=self.opt.num_workers, pin_memory=True, drop_last=True,
@@ -222,15 +224,29 @@ class Trainer:
         print("Using split:\n  ", self.opt.split)
         print("There are {:d} training items and {:d} validation items\n".format(
             len(train_dataset), len(val_dataset)))
+        
+        print(f"Total number of steps: {self.num_total_steps}")
+        
+        if self.opt.load_weights_folder is not None:
+            self.load_model()
 
+        if self.opt.mono_weights_folder is not None:
+            self.load_mono_model()
         
         
         self.save_opts()
 
-    def g2s_weight(self):
-        
-            return math.exp(0.005*(self.step - 1*10000)) * 0.1 if self.step <= 1*10000 else 1
-        
+    def g2s_weight(self, mode='poly'):
+        maximum_steps = ((2*self.num_total_steps)) // 5
+        if mode == 'linear':
+            return self.step / maximum_steps if self.step <= maximum_steps else 1
+        elif mode == 'exp':
+            return math.exp((self.step - maximum_steps)) * 1 if self.step <= maximum_steps else 1
+        elif mode == 'poly':
+            return (self.step / maximum_steps) ** 3 if self.step <= maximum_steps else 1
+        else:
+            raise ValueError(f"Invalid mode: {mode}")
+                    
     
 
     def set_train(self):
@@ -606,10 +622,10 @@ class Trainer:
                                                              identity_reprojection_loss)
             
             # Mask outlier loss values using statistical threshold
-            mean_loss = reprojection_loss.mean(dim=-1, keepdim=True)
-            std_loss = reprojection_loss.std(dim=-1, keepdim=True)
-            threshold = mean_loss + 2.0 * std_loss  # 2-sigma threshold
-            outlier_mask = reprojection_loss <= threshold
+            #mean_loss = reprojection_loss.median(dim=-1, keepdim=True).values
+            #std_loss = reprojection_loss.std(dim=-1, keepdim=True)
+            #threshold = mean_loss + 2.0 * std_loss  # 2-sigma threshold
+            #outlier_mask = reprojection_loss <= threshold
             #reprojection_loss_mask = reprojection_loss_mask * outlier_mask
             
             reprojection_loss = reprojection_loss * reprojection_loss_mask 
@@ -653,8 +669,8 @@ class Trainer:
                 var_mono = ((patches_mono - mean_mono)**2).mean(dim=1, keepdim=True)
 
                 # Normalize patches using alpha (scale) and beta (shift)
-                alpha_multi = torch.sqrt(var_multi + 1e-7)
-                alpha_mono = torch.sqrt(var_mono + 1e-7)
+                alpha_multi = torch.sqrt(var_multi + 1e-5)
+                alpha_mono = torch.sqrt(var_mono + 1e-5)
 
                 beta_multi = mean_multi
                 beta_mono = mean_mono
@@ -665,13 +681,25 @@ class Trainer:
                 # Calculate patch-wise loss
                 patch_ssi_loss = torch.abs(patches_multi_norm - patches_mono_norm).mean(dim=1)
                 # Mask outlier loss values using statistical threshold
-                mean_loss = patch_ssi_loss.mean(dim=-1, keepdim=True)
-                std_loss = patch_ssi_loss.std(dim=-1, keepdim=True)
-                threshold = mean_loss + 2.0 * std_loss  # 2-sigma threshold
-                outlier_mask = patch_ssi_loss <= threshold
+                # mean_loss = patch_ssi_loss.mean(dim=-1, keepdim=True)
+                # std_loss = patch_ssi_loss.std(dim=-1, keepdim=True)
+                # threshold = mean_loss + 110000.0 * std_loss  # 2-sigma threshold
+                # outlier_mask = patch_ssi_loss <= threshold
 
-                masked_patch_ssi_loss = patch_ssi_loss * outlier_mask
-                ssi_loss = masked_patch_ssi_loss.sum(dim=-1) / (outlier_mask.sum(dim=-1) + 1e-7)
+                # Filter out low-texture (smooth) patches where variance is very small
+                # Use the larger variance between the two predictions as a texture score
+                depth_var = torch.min(var_multi, var_mono)  # [B, 1, n_patches]
+
+                texture_mask = depth_var > 0.01  # [B, 1, n_patches]
+
+                # Broadcast texture mask to match [B, n_patches]
+                texture_mask = texture_mask.squeeze(1)
+
+                # Combine masks and aggregate
+                valid_mask = texture_mask
+
+                masked_patch_ssi_loss = patch_ssi_loss * valid_mask
+                ssi_loss = masked_patch_ssi_loss.sum(dim=-1) / (valid_mask.sum(dim=-1) + 1e-7)
 
                 ssi_loss = ssi_loss.mean() 
                 
@@ -686,7 +714,7 @@ class Trainer:
                 
                 # Combine losses
                 ssi_weight = self.g2s_weight() / 10
-
+                
                 consistency_loss = (ssi_weight * ssi_loss)
                 
                 losses['consistency_loss/{}'.format(scale)] = consistency_loss

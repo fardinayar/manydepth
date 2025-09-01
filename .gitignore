@@ -10,7 +10,7 @@ splits/cityscapes/gt_depths/*
 outs_edited
 
 
-Grounded-SAM-2
+Grounded-SAM-2/
 *.zip
 *.npy
 *.mp4

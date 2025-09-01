@@ -28,6 +28,10 @@ def load_image(image_path, height, width):
     image = image.resize((width, height), Image.LANCZOS)
     image = np.array(image).astype(np.float32) / 255.0
     image = torch.from_numpy(image).permute(2, 0, 1).unsqueeze(0)
+    # Normalize using ImageNet statistics expected by ViT/Depth Anything encoders
+    mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+    image = (image - mean) / std
     return image
 
 def load_image_from_array(image_array: np.ndarray, height: int, width: int) -> torch.Tensor:
@@ -42,6 +46,10 @@ def load_image_from_array(image_array: np.ndarray, height: int, width: int) -> t
         image_array = image_array / 255.0
     resized = cv2.resize(image_array, (width, height), interpolation=cv2.INTER_LANCZOS4)
     tensor = torch.from_numpy(resized).permute(2, 0, 1).unsqueeze(0)
+    # Normalize using ImageNet statistics expected by ViT/Depth Anything encoders
+    mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+    tensor = (tensor - mean) / std
     return tensor
 
 def get_original_rgb_image(image_or_path: Union[str, np.ndarray]) -> np.ndarray:
@@ -97,9 +105,11 @@ def setup_models(weights_folder, depth_anything_encoder, height, width, device):
         HEIGHT, WIDTH = height, width
 
     # Setup models - student mode
+    
+    config = networks.MODEL_CONFIGS[depth_anything_encoder]
     encoder = networks.ManyDepthAnythingEncoder(encoder_name=depth_anything_encoder)
     depth_decoder = networks.ManyDepthAnythingDecoder(
-        matching_height=HEIGHT // 14, matching_width=WIDTH // 14)
+        matching_height=HEIGHT // 14, matching_width=WIDTH // 14, features=config['features'], in_channels=config['in_channels'], out_channels=config['out_channels'])
 
     encoder = replace_qkv_with_mergedlinear(encoder, lora_dropout=0.0)
     depth_decoder = replace_conv_with_loraconv(depth_decoder, lora_dropout=0.0)
@@ -116,6 +126,7 @@ def setup_models(weights_folder, depth_anything_encoder, height, width, device):
     
     return encoder, depth_decoder, HEIGHT, WIDTH
 
+@torch.no_grad()
 def predict_depth_student(encoder, depth_decoder, input_color, lookup_frames):
     """Student mode depth prediction - multi-frame without poses"""
     
@@ -134,7 +145,8 @@ def depth_to_pointcloud(depth_map: np.ndarray,
                         cx: Optional[float] = None,
                         cy: Optional[float] = None,
                         min_depth: float = 0.1,
-                        max_depth: float = 80.0) -> o3d.geometry.PointCloud:
+                        max_depth: float = 80.0,
+                        coordinate_system: str = "lidar") -> o3d.geometry.PointCloud:
     """Convert depth map and image to colored point cloud using pixel-space intrinsics.
 
     Parameters
@@ -143,6 +155,7 @@ def depth_to_pointcloud(depth_map: np.ndarray,
     - fx, fy: focal lengths in pixels (unnormalized)
     - cx, cy: principal point in pixels (defaults to image center)
     - min_depth, max_depth: clamp for valid depth range
+    - coordinate_system: 'camera' (X right, Y up, Z forward) or 'lidar' (X forward, Y left, Z up)
     """
 
     if cx is None:
@@ -162,7 +175,21 @@ def depth_to_pointcloud(depth_map: np.ndarray,
 
     valid_mask = (z > min_depth) & (z < max_depth)
 
-    points_3d = np.stack([x_world[valid_mask], -y_world[valid_mask], z_world[valid_mask]], axis=1)
+    # Output coordinate frame selection
+    # - camera: X right, Y up, Z forward
+    # - lidar:  X forward, Y left, Z up (KITTI/Velodyne)
+    if coordinate_system == "lidar":
+        points_3d = np.stack([
+            z_world[valid_mask],        # X forward
+            -x_world[valid_mask],       # Y left
+            -y_world[valid_mask],       # Z up
+        ], axis=1)
+    else:
+        points_3d = np.stack([
+            x_world[valid_mask],        # X right
+            y_world[valid_mask],       # Y up
+            z_world[valid_mask],        # Z forward
+        ], axis=1)
     colors = image[valid_mask] / 255.0
 
     pcd = o3d.geometry.PointCloud()
@@ -184,6 +211,7 @@ def infer_depth_disparity_and_pointcloud(
     fy: float = None,
     device: Optional[torch.device] = None,
     output_dir: Optional[str] = None,
+    coordinate_system: str = "lidar",
 ) -> Dict[str, Any]:
     """High-level API to run inference and optionally save outputs.
 
@@ -245,6 +273,7 @@ def infer_depth_disparity_and_pointcloud(
                 fy=fy,
                 min_depth=min_depth,
                 max_depth=max_depth,
+                coordinate_system=coordinate_system,
             )
 
         saved_paths: Dict[str, Optional[str]] = {"ply": None, "depth": None, "disp": None}
@@ -287,6 +316,7 @@ def infer_depths_for_folder(
     output_dir: Optional[str] = None,
     device: Optional[torch.device] = None,
     extensions: Tuple[str, ...] = (".png", ".jpg", ".jpeg", ".bmp", ".webp"),
+    coordinate_system: str = "lidar",
 ) -> Dict[str, Dict[str, Any]]:
     """Process a folder of images, pairing each image with its previous one as lookup.
 
@@ -294,9 +324,6 @@ def infer_depths_for_folder(
     - Saves point clouds only if fx and fy are provided.
     - Returns a dict mapping target image path to result dict (same schema as single API).
     """
-
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     if not os.path.isdir(input_folder):
         raise ValueError(f"Input folder not found or not a directory: {input_folder}")
@@ -310,73 +337,32 @@ def infer_depths_for_folder(
     if len(image_files) < 2:
         raise ValueError("Need at least two images in the folder to form (target, lookup) pairs")
 
-    # Setup models once
-    encoder, depth_decoder, HEIGHT, WIDTH = setup_models(
-        weights_folder, depth_anything_encoder, height=0, width=0, device=device
-    )
-
     if output_dir is not None and not os.path.exists(output_dir):
         os.makedirs(output_dir, exist_ok=True)
 
     results: Dict[str, Dict[str, Any]] = {}
+    # Iterate over images, pairing each with its previous one as lookup
+    for idx in range(1, len(image_files)):
+        target_path = image_files[idx]
+        lookup_path = image_files[idx - 1]
 
-    with torch.no_grad():
-        # Pre-load first image for reuse if desired; simple approach loads per-iteration
-        for idx in range(1, len(image_files)):
-            target_path = image_files[idx]
-            lookup_path = image_files[idx - 1]
+        result = infer_depth_disparity_and_pointcloud(
+            target_image=target_path,
+            lookup_frame=lookup_path,
+            weights_folder=weights_folder,
+            depth_anything_encoder=depth_anything_encoder,
+            height=None,
+            width=None,
+            min_depth=min_depth,
+            max_depth=max_depth,
+            fx=fx,
+            fy=fy,
+            device=device,
+            output_dir=output_dir,
+            coordinate_system=coordinate_system,
+        )
 
-            # Prepare input tensors
-            target_color = load_image(target_path, HEIGHT, WIDTH).to(device)
-            lookup_color = load_image(lookup_path, HEIGHT, WIDTH)
-            lookup_frames = lookup_color.unsqueeze(1).to(device)
-
-            output = predict_depth_student(encoder, depth_decoder, target_color, lookup_frames)
-            output = output.sigmoid()
-            pred_disp, pred_depth = disp_to_depth(output, min_depth, max_depth)
-
-            disp_map = pred_disp.cpu().squeeze().numpy()
-            depth_map = pred_depth.cpu().squeeze().numpy()
-
-            original_rgb = get_original_rgb_image(target_path)
-            oh, ow = original_rgb.shape[:2]
-            depth_map_original = cv2.resize(depth_map, (ow, oh), interpolation=cv2.INTER_LINEAR)
-            disp_map_original = cv2.resize(disp_map, (ow, oh), interpolation=cv2.INTER_LINEAR)
-
-            pcd = None
-            if fx is not None and fy is not None:
-                pcd = depth_to_pointcloud(
-                    depth_map_original,
-                    original_rgb,
-                    oh,
-                    ow,
-                    fx=fx,
-                    fy=fy,
-                    min_depth=min_depth,
-                    max_depth=max_depth,
-                )
-
-            save_paths = {"ply": None, "depth": None, "disp": None}
-            if output_dir is not None:
-                base_name = os.path.splitext(os.path.basename(target_path))[0]
-                base = os.path.join(output_dir, base_name)
-                depth_path = f"{base}_depth.npy"
-                disp_path = f"{base}_disp.npy"
-                np.save(depth_path, depth_map_original)
-                np.save(disp_path, disp_map_original)
-                ply_path = None
-                if pcd is not None:
-                    ply_path = f"{base}.ply"
-                    o3d.io.write_point_cloud(ply_path, pcd)
-                save_paths = {"ply": ply_path, "depth": depth_path, "disp": disp_path}
-
-            results[target_path] = {
-                "disp": disp_map_original,
-                "depth": depth_map_original,
-                "pointcloud": pcd,
-                "paths": save_paths,
-                "model_input_size": (HEIGHT, WIDTH),
-            }
+        results[target_path] = result
 
     return results
 
@@ -384,20 +370,20 @@ def main():
     parser = argparse.ArgumentParser(description='Run inference and save point cloud, depth, and disparity - student mode, multi-frame, no poses')
     parser.add_argument('--target_image', type=str, default="kitti_data/2011_09_26/2011_09_26_drive_0001_sync/image_02/data/0000000005.png",
                         help='Path to target image (main image for depth prediction)')
-    parser.add_argument('--lookup_frame', type=str, default="kitti_data/2011_09_26/2011_09_26_drive_0001_sync/image_02/data/0000000000.png",
+    parser.add_argument('--lookup_frame', type=str, default="kitti_data/2011_09_26/2011_09_26_drive_0001_sync/image_02/data/0000000004.png",
                         help='Path to lookup frame image for matching')
     parser.add_argument('--input_folder', type=str, default=None,
                         help='Folder containing images; each image is paired with the previous one as lookup')
     parser.add_argument('--output_dir', type=str, default="output_pointclouds",
                         help='Directory to save outputs into')
-    parser.add_argument('--weights_folder', type=str, default="outs/kitti/base/mdp/models/weights_4",
+    parser.add_argument('--weights_folder', type=str, default="outs/kitti/base/mdp/models/weights_1",
                         help='Path to folder containing model weights (encoder.pth and depth.pth)')
     parser.add_argument('--depth_anything_encoder', type=str, 
                         choices=["vits", "vitb", "vitl", "vitg"], default="vits",
                         help='Depth Anything encoder variant')
-    parser.add_argument('--height', type=int, default=182,
+    parser.add_argument('--height', type=int, default=None,
                         help='Input image height (used only if not present in weights)')
-    parser.add_argument('--width', type=int, default=630,
+    parser.add_argument('--width', type=int, default=None,
                         help='Input image width (used only if not present in weights)')
     parser.add_argument('--min_depth', type=float, default=0.1,
                         help='Minimum depth for visualization / validity')
@@ -407,6 +393,8 @@ def main():
                         help='Camera focal length in pixels along x (unnormalized); if provided, PLY is generated')
     parser.add_argument('--fy', type=float, default=None,
                         help='Camera focal length in pixels along y (unnormalized); if provided, PLY is generated')
+    parser.add_argument('--coordinate_system', type=str, choices=['camera', 'lidar'], default='camera',
+                        help='Coordinate frame for saved PLY: camera (Z forward) or lidar (Z up)')
     
     args = parser.parse_args()
 
@@ -421,6 +409,7 @@ def main():
             fy=args.fy,
             output_dir=args.output_dir,
             device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+            coordinate_system=args.coordinate_system,
         )
 
         num_items = len(results)
@@ -442,6 +431,7 @@ def main():
             fy=args.fy,
             device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
             output_dir=args.output_dir,
+            coordinate_system=args.coordinate_system,
         )
 
         if result["paths"]["depth"]:
