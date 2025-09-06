@@ -75,16 +75,18 @@ class ManyDepthAnythingDecoder(nn.Module):
         use_bn=False, 
         out_channels=[48, 96, 192, 384], 
         use_clstoken=False,
-        matching_height=518//14,
-        matching_width=518//14
+        patch_h=518//14,
+        patch_w=518//14,
+        temporal_fusion=True
     ):
         super(ManyDepthAnythingDecoder, self).__init__()
         self.num_ch_enc = in_channels
-        self.matching_height = matching_height
-        self.matching_width = matching_width
+        self.patch_h = patch_h
+        self.patch_w = patch_w
         self.out_channels = out_channels
         self.use_clstoken = use_clstoken
-                
+        self.temporal_fusion = temporal_fusion
+        
         self.projects = nn.ModuleList([
             nn.Conv2d(
                 in_channels=in_channels,
@@ -135,7 +137,7 @@ class ManyDepthAnythingDecoder(nn.Module):
 
         
         self.multi_frame_feature_fusion = nn.ModuleList([
-            MultiFrameFeatureFusion(in_channels, self.matching_height, self.matching_width, dropout=0.0)
+            MultiFrameFeatureFusion(in_channels, self.patch_h, self.patch_w, dropout=0.2, temporal_fusion=self.temporal_fusion)
             for _ in range(1)
         ])
         
@@ -173,7 +175,7 @@ class ManyDepthAnythingDecoder(nn.Module):
 
         return output
 
-    def forward(self, out_features, lookup_features, patch_h, patch_w):
+    def forward(self, out_features, lookup_features):
         out = []
         for i, (x, lookup_feature) in enumerate(zip(out_features, lookup_features)):
             if self.use_clstoken:
@@ -188,8 +190,8 @@ class ManyDepthAnythingDecoder(nn.Module):
                 x = x[0]
                 lookup_feature = lookup_feature[0]
                 
-            x = x.permute(0, 2, 1).reshape((x.shape[0], x.shape[-1], patch_h, patch_w))
-            lookup_feature = lookup_feature.permute(0, 2, 1).reshape((lookup_feature.shape[0], lookup_feature.shape[-1], patch_h, patch_w))
+            x = x.permute(0, 2, 1).reshape((x.shape[0], x.shape[-1], self.patch_h, self.patch_w))
+            lookup_feature = lookup_feature.permute(0, 2, 1).reshape((lookup_feature.shape[0], lookup_feature.shape[-1], self.patch_h, self.patch_w))
             if i > -1:
                 x = self._fuse_features_multi_frame(x, lookup_feature, 0)
             x = self.projects[i](x)
@@ -210,7 +212,7 @@ class ManyDepthAnythingDecoder(nn.Module):
         path_1 = self.scratch.refinenet1(path_2, layer_1_rn)
         
         out = self.scratch.output_conv1(path_1)
-        out_ = nn.functional.interpolate(out, (int(patch_h * 14), int(patch_w * 14)), mode="bilinear", align_corners=True)
+        out_ = nn.functional.interpolate(out, (int(self.patch_h * 14), int(self.patch_w * 14)), mode="bilinear", align_corners=True)
         depth = self.scratch.output_conv2(out_)
         # Normalize depth
         return depth, out_

@@ -58,7 +58,8 @@ def export_gt_depths_kitti():
 
     print("Saving to {}".format(opt.split))
 
-    np.savez_compressed(output_path, data=np.array(gt_depths))
+    # Depth maps can have varying sizes across sequences; store as an object array
+    np.savez_compressed(output_path, data=np.array(gt_depths, dtype=object))
 
 
 if __name__ == "__main__":

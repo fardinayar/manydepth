@@ -40,16 +40,6 @@ class MonodepthOptions:
                                  help="number of resnet layers",
                                  default=18,
                                  choices=[18, 34, 50, 101, 152])
-        self.parser.add_argument("--depth_binning",
-                                 help="defines how the depth bins are constructed for the cost"
-                                      "volume. 'linear' is uniformly sampled in depth space,"
-                                      "'inverse' is uniformly sampled in inverse depth space",
-                                 type=str,
-                                 choices=['linear', 'inverse'],
-                                 default='linear'),
-        self.parser.add_argument("--num_depth_bins",
-                                 type=int,
-                                 default=96)
         self.parser.add_argument("--dataset",
                                  type=str,
                                  help="dataset to train on",
@@ -76,10 +66,6 @@ class MonodepthOptions:
                                  type=int,
                                  help="scales used in the loss",
                                  default=[0])
-        self.parser.add_argument("--min_depth",
-                                 type=float,
-                                 help="minimum depth",
-                                 default=0.01)
         self.parser.add_argument("--max_depth",
                                  type=float,
                                  help="maximum depth",
@@ -98,46 +84,21 @@ class MonodepthOptions:
         self.parser.add_argument("--learning_rate",
                                  type=float,
                                  help="learning rate",
-                                 default=5e-5)
+                                 default=1e-4)
         self.parser.add_argument("--num_epochs",
                                  type=int,
                                  help="number of epochs",
-                                 default=5)
-        self.parser.add_argument("--scheduler_step_size",
-                                 type=int,
-                                 help="step size of the scheduler",
-                                 default=15)
-        self.parser.add_argument("--freeze_teacher_and_pose",
-                                 action="store_true",
-                                 help="If set, freeze the weights of the single frame teacher"
-                                      " network and pose network.")
-        self.parser.add_argument("--freeze_teacher_epoch",
-                                 type=int,
-                                 default=20,
-                                 help="Sets the epoch number at which to freeze the teacher"
-                                      "network and the pose network.")
-        self.parser.add_argument("--freeze_teacher_step",
-                                 type=int,
-                                 default=-1,
-                                 help="Sets the step number at which to freeze the teacher"
-                                      "network and the pose network. By default is -1 and so"
-                                      "will not be used.")
+                                 default=3)
         self.parser.add_argument("--pytorch_random_seed",
                                  default=None,
                                  type=int)
 
         # ABLATION options
-        self.parser.add_argument("--v1_multiscale",
-                                 help="if set, uses monodepth v1 multiscale",
-                                 action="store_true")
         self.parser.add_argument("--avg_reprojection",
                                  help="if set, uses average reprojection loss",
                                  action="store_true")
         self.parser.add_argument("--disable_automasking",
                                  help="if set, doesn't do auto-masking",
-                                 action="store_true")
-        self.parser.add_argument("--no_ssim",
-                                 help="if set, disables ssim in the loss",
                                  action="store_true")
         self.parser.add_argument("--weights_init",
                                  type=str,
@@ -157,6 +118,19 @@ class MonodepthOptions:
                                  action='store_true',
                                  help="If set, will not apply static camera augmentation or "
                                       "zero cost volume augmentation during training")
+        self.parser.add_argument("--no_temporal_fusion",
+                                 action='store_true',
+                                 help="If set, will not use temporal fusion in the depth decoder")
+        self.parser.add_argument("--no_lora",
+                                 action='store_true',
+                                 help="If set, will not use LoRA in the depth decoder and encoder")
+        self.parser.add_argument("--no_consistency_loss",
+                                 action='store_true',
+                                 help="If set, will not use consistency loss in the depth decoder")
+        self.parser.add_argument("--no_loss_dynamic_weight",
+                                 action='store_true',
+                                 help="If set, will not use dynamic weight for the loss")
+        
 
         # SYSTEM options
         self.parser.add_argument("--no_cuda",
@@ -193,9 +167,6 @@ class MonodepthOptions:
                                  action='store_true')
 
         # EVALUATION options
-        self.parser.add_argument("--eval_stereo",
-                                 help="if set evaluates in stereo mode",
-                                 action="store_true")
         self.parser.add_argument("--eval_mono",
                                  help="if set evaluates in mono mode",
                                  action="store_true")
@@ -228,10 +199,6 @@ class MonodepthOptions:
         self.parser.add_argument("--eval_out_dir",
                                  help="if set will output the disparities to this folder",
                                  type=str)
-        self.parser.add_argument("--post_process",
-                                 help="if set will perform the flipping post processing "
-                                      "from the original monodepth paper",
-                                 action="store_true")
 
         self.parser.add_argument('--static_camera',
                                  action='store_true',
@@ -255,14 +222,22 @@ class MonodepthOptions:
                                  type=float,
                                  default=1.0)
         
+        self.parser.add_argument('--fusion_lr_coef',
+                                 type=float,
+                                 default=4.0,
+                                 help='Learning rate multiplier for feature fusion parameters')
+        
         self.parser.add_argument("--g2s",
                          help="use g2s loss",
                          action="store_true")
         
         self.parser.add_argument('--data_percent',
                                  type=float,
-                                 default=1.0)
+                                 default=100.0)
         
+        self.parser.add_argument('--pose_from_scratch',
+                                 action='store_true',
+                                 help='If set, the pose encoder and decoder will be initialized randomly')
     def parse(self):
         self.options = self.parser.parse_args()
         return self.options

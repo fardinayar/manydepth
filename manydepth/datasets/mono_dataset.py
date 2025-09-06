@@ -218,11 +218,6 @@ class MonoDataset(data.Dataset):
             del inputs[("color", i, -1)]
             del inputs[("color_aug", i, -1)]
 
-        if self.load_depth and False:
-            depth_gt = self.get_depth(folder, frame_index, side, do_flip)
-            inputs["depth_gt"] = np.expand_dims(depth_gt, 0)
-            inputs["depth_gt"] = torch.from_numpy(inputs["depth_gt"].astype(np.float32))
-
         # Add sample index for per-sample variance tracking
         inputs["sample_index"] = index
 

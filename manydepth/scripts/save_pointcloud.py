@@ -376,7 +376,7 @@ def main():
                         help='Folder containing images; each image is paired with the previous one as lookup')
     parser.add_argument('--output_dir', type=str, default="output_pointclouds",
                         help='Directory to save outputs into')
-    parser.add_argument('--weights_folder', type=str, default="outs/kitti/base/mdp/models/weights_1",
+    parser.add_argument('--weights_folder', type=str, default="outs/kitti/base/mdp/models/weights_4",
                         help='Path to folder containing model weights (encoder.pth and depth.pth)')
     parser.add_argument('--depth_anything_encoder', type=str, 
                         choices=["vits", "vitb", "vitl", "vitg"], default="vits",

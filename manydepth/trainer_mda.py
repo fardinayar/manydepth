@@ -32,7 +32,7 @@ from networks.replace_with_lora import replace_qkv_with_mergedlinear, replace_co
 _DEPTH_COLORMAP = plt.get_cmap('plasma', 256)  # for plotting
 
 
-def seed_worker(worker_id):
+def seed_worker(_worker_id):
     worker_seed = torch.initial_seed() % 2**32
     np.random.seed(worker_seed)
     random.seed(worker_seed)
@@ -72,20 +72,25 @@ class Trainer:
 
         # MODEL SETUP
         self.models["encoder"] = networks.ManyDepthAnythingEncoder(encoder_name=self.opt.depth_anything_encoder)
-        self.models['encoder'] = replace_qkv_with_mergedlinear(self.models["encoder"])
-        
-        lora.mark_only_lora_as_trainable(self.models['encoder'], bias='all')
+        if not self.opt.no_lora:
+            print("Using LoRA in the encoder")
+            self.models['encoder'] = replace_qkv_with_mergedlinear(self.models["encoder"])
+            lora.mark_only_lora_as_trainable(self.models['encoder'], bias='all')
         
         
         self.models["encoder"].to(self.device)
 
         model_config = networks.MODEL_CONFIGS[self.opt.depth_anything_encoder]
         
+        if self.opt.no_temporal_fusion:
+            print("Disabling temporal fusion in the depth decoder")
         self.models["depth"] = networks.ManyDepthAnythingDecoder(
             in_channels=model_config['in_channels'],
             out_channels=model_config['out_channels'],
             features=model_config['features'],
-            matching_height=self.opt.height // 14, matching_width=self.opt.width //14)
+            patch_h=self.opt.height // 14,
+            patch_w=self.opt.width // 14,
+            temporal_fusion=not self.opt.no_temporal_fusion)
 
         depthanything_weights = torch.load(f'checkpoints/depth_anything_v2_{self.opt.depth_anything_encoder}.pth', map_location='cpu')
         depthanything_weights_decoder = {}
@@ -96,28 +101,51 @@ class Trainer:
                 })
 
         self.models["depth"].load_state_dict(depthanything_weights_decoder, strict=False)
-        self.models['depth'] = replace_conv_with_loraconv(self.models["depth"])
-        lora.mark_only_lora_as_trainable(self.models['depth'], bias='all')
+        
+        if not self.opt.no_lora:
+            print("Using LoRA in the depth decoder")
+            self.models['depth'] = replace_conv_with_loraconv(self.models["depth"])
+            lora.mark_only_lora_as_trainable(self.models['depth'], bias='all')
+            print("Enable gradient for output convolution")
+            # We need to enable gradient for output convolution to train the depth decoder, beacuse we have changed the activation function from relu to sigmoid
+            for name, param in self.models['depth'].named_parameters():
+                if 'output_conv' in name:
+                    param.requires_grad = True
+            
         for name, p in self.models['depth'].named_parameters():
-            if 'multi_frame_feature_fusion' in name or 'output_' in name:
+            if 'multi_frame_feature_fusion' in name:
                 p.requires_grad = True
         
         self.models["depth"].to(self.device)
 
         if self.opt.encoder_lr_coef != 0.0:
             self.parameters_to_train.append({'params': self.models["encoder"].parameters(), 'lr': self.opt.encoder_lr_coef * self.opt.learning_rate})
-        self.parameters_to_train.append({'params': self.models["depth"].parameters(), 'lr': self.opt.learning_rate})
+        
+        # Separate feature fusion parameters for higher learning rate
+        depth_params = []
+        fusion_params = []
+        for name, param in self.models["depth"].named_parameters():
+            if 'multi_frame_feature_fusion' in name:
+                fusion_params.append(param)
+            else:
+                depth_params.append(param)
+        
+        self.parameters_to_train.append({'params': depth_params, 'lr': self.opt.learning_rate})
+        self.parameters_to_train.append({'params': fusion_params, 'lr': self.opt.learning_rate * self.opt.fusion_lr_coef})  # Higher LR for feature fusion
         # Print total number of learnable parameters
         encoder_params = sum(p.numel() for p in self.models["encoder"].parameters() if p.requires_grad)
         depth_params = sum(p.numel() for p in self.models["depth"].parameters() if p.requires_grad)
+        fusion_params = sum(p.numel() for p in fusion_params)
         print(f"Total learnable parameters in encoder: {encoder_params}")
-        print(f"Total learnable parameters in depth: {depth_params}")
+        print(f"Total learnable parameters in depth decoder: {depth_params - fusion_params}")
+        print(f"Total learnable parameters in feature fusion: {fusion_params}")
+        print(f"Feature fusion learning rate: {self.opt.learning_rate * self.opt.fusion_lr_coef}")
         encoder, decoder = networks.get_da_encoder_decoder(encoder_name=self.opt.depth_anything_encoder)
         self.models["mono_encoder"] = encoder
-        self.models["mono_encoder"].to(self.device)
+        self.models["mono_encoder"].to(self.device).eval()
 
         self.models["mono_depth"] = decoder
-        self.models["mono_depth"].to(self.device)
+        self.models["mono_depth"].to(self.device).eval()
         
 
         self.models["pose_encoder"] = \
@@ -127,12 +155,16 @@ class Trainer:
             networks.PoseDecoder(self.models["pose_encoder"].num_ch_enc,
                                     num_input_features=1,
                                     num_frames_to_predict_for=2)
-    
-        pose_encoder_pretrained_weights = torch.load(f'CityScapes_MR/pose_encoder.pth', map_location='cpu')
-        self.models["pose_encoder"].load_state_dict(pose_encoder_pretrained_weights, strict=False)
-        
-        pose_decoder_pretrained_weights = torch.load(f'CityScapes_MR/pose.pth', map_location='cpu')
-        self.models["pose"].load_state_dict(pose_decoder_pretrained_weights, strict=False)
+
+        if not self.opt.pose_from_scratch:
+            print("Using pretrained pose encoder and decoder")
+            pose_encoder_pretrained_weights = torch.load(f'checkpoints/pose_encoder_R18.pth', map_location='cpu')
+            self.models["pose_encoder"].load_state_dict(pose_encoder_pretrained_weights, strict=False)
+            
+            pose_decoder_pretrained_weights = torch.load(f'checkpoints/pose_R18.pth', map_location='cpu')
+            self.models["pose"].load_state_dict(pose_decoder_pretrained_weights, strict=False)
+        else:
+            print("Using random pose encoder and decoder")
         
         self.models["pose_encoder"].to(self.device)
         self.models["pose"].to(self.device)
@@ -140,10 +172,6 @@ class Trainer:
 
         self.parameters_to_train.append({'params': self.models["pose_encoder"].parameters(), 'lr': self.opt.learning_rate})
         self.parameters_to_train.append({'params': self.models["pose"].parameters(), 'lr': self.opt.learning_rate})
-
-
-
-
 
         print("Training model named:\n  ", self.opt.model_name)
         print("Models and tensorboard events files are saved to:\n  ", self.opt.log_dir)
@@ -154,15 +182,18 @@ class Trainer:
                          "cityscapes_preprocessed": datasets.CityscapesPreprocessedDataset,
                          "kitti_odom": datasets.KITTIOdomDataset,
                          "gopro": datasets.GoProDataset}
+        
         self.dataset = datasets_dict[self.opt.dataset]
 
         fpath = os.path.join("splits", self.opt.split, "{}_files.txt")
         train_filenames = readlines(fpath.format("train"))
         
+        
+        # TODO: Check if this is correct
         percent = self.opt.data_percent
         print(f"Using {percent} percent of the training data")
         len_train_filenames = len(train_filenames)
-        train_filenames = train_filenames[:int(len(train_filenames) * percent)]
+        train_filenames = train_filenames[:int(len(train_filenames) * percent/100)]
         # Duplicate the train filenames to keep it len fixed
         train_filenames = train_filenames * (len_train_filenames // len(train_filenames))
         
@@ -171,9 +202,10 @@ class Trainer:
 
         num_train_samples = len(train_filenames)
         self.num_total_steps = num_train_samples // self.opt.batch_size * self.opt.num_epochs
+        print('Total number of steps: ', self.num_total_steps, "Total number of epochs:", self.opt.num_epochs)
         
         self.model_optimizer = optim.AdamW(self.parameters_to_train, self.opt.learning_rate)
-        self.model_lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(self.model_optimizer, T_max=self.num_total_steps, eta_min=5e-5)
+        self.model_lr_scheduler = optim.lr_scheduler.StepLR(self.model_optimizer, step_size= 3 * ((self.num_total_steps)) // 3, gamma=1)
 
         self.g2s = self.opt.g2s
 
@@ -201,9 +233,8 @@ class Trainer:
         for mode in ["train", "val"]:
             self.writers[mode] = SummaryWriter(os.path.join(self.log_path, mode))
 
-        if not self.opt.no_ssim:
-            self.ssim = SSIM()
-            self.ssim.to(self.device)
+        self.ssim = SSIM()
+        self.ssim.to(self.device)
 
         self.backproject_depth = {}
         self.project_3d = {}
@@ -236,27 +267,17 @@ class Trainer:
         
         self.save_opts()
 
-    def g2s_weight(self, mode='poly'):
-        maximum_steps = ((2*self.num_total_steps)) // 5
-        if mode == 'linear':
-            return self.step / maximum_steps if self.step <= maximum_steps else 1
-        elif mode == 'exp':
-            return math.exp((self.step - maximum_steps)) * 1 if self.step <= maximum_steps else 1
-        elif mode == 'poly':
-            return (self.step / maximum_steps) ** 3 if self.step <= maximum_steps else 1
-        else:
-            raise ValueError(f"Invalid mode: {mode}")
-                    
+    def g2s_weight(self):
+        maximum_steps = ((2 * self.num_total_steps)) // 3
+        return (self.step / maximum_steps) ** 2 if self.step <= maximum_steps else 1
+
     
 
     def set_train(self):
         """Convert all models to training mode
         """
-
         for k, m in self.models.items():
-            if k in ['depth', 'encoder']:
-                m.train()
-            elif k == 'gps_variance' and self.g2s:
+            if k not in ['mono_encoder', 'mono_depth']:
                 m.train()
 
     def set_eval(self):
@@ -296,10 +317,9 @@ class Trainer:
             duration = time.time() - before_op_time
 
             # log less frequently after the first 2000 steps to save time & disk space
-            early_phase = batch_idx % self.opt.log_frequency == 0 and self.step < 1000000
-            late_phase = self.step % 10000 == 0
+            log_step = batch_idx % self.opt.log_frequency == 0
 
-            if early_phase or late_phase:
+            if log_step:
                 if self.g2s:
                     self.log_time(batch_idx, duration, losses["loss"].cpu().data, mono_losses["loss"].cpu().data, losses["scale"].cpu().data)
                 else:
@@ -311,7 +331,7 @@ class Trainer:
                 self.log("train", inputs, outputs, losses, mono_losses)
                 self.val()
 
-            if self.opt.save_intermediate_models and late_phase:
+            if self.opt.save_intermediate_models:
                 self.save_model(save_step=True)
 
 
@@ -365,7 +385,7 @@ class Trainer:
             input_image = inputs["color_aug", 0, 0]
             patch_h, patch_w = input_image.shape[-2] // 14, input_image.shape[-1] // 14
             feats = self.models["mono_encoder"].get_intermediate_layers(input_image, [2, 5, 8, 11], return_class_token=True)
-            monodepth, depth_feats = self.models['mono_depth'](feats, patch_h, patch_w)
+            monodepth, _ = self.models['mono_depth'](feats, patch_h, patch_w)
         monodepth = {("disp", 0): F.relu(monodepth)}
         mono_outputs.update(monodepth)
        
@@ -390,11 +410,9 @@ class Trainer:
         
 
         depth, _ = self.models["depth"](features,
-                                            lookup_features,
-                                            patch_h,
-                                            patch_w)
+                                            lookup_features)
         
-        depth =  (F.sigmoid(depth ))
+        depth =  F.sigmoid(depth)
         outputs.update({("disp", 0): depth})
 
         self.generate_images_pred(inputs, outputs, is_multi=True)
@@ -496,14 +514,12 @@ class Trainer:
         """
         for scale in self.opt.scales:
             disp = outputs[("disp", scale)]
-            if self.opt.v1_multiscale:
-                source_scale = scale
-            else:
-                disp = F.interpolate(
-                    disp, [self.opt.height, self.opt.width], mode="bilinear", align_corners=False)
-                source_scale = 0
 
-            _, depth = disp_to_depth(disp, self.opt.min_depth, self.opt.max_depth)
+            disp = F.interpolate(
+                disp, [self.opt.height, self.opt.width], mode="bilinear", align_corners=False)
+            source_scale = 0
+
+            _, depth = disp_to_depth(disp, self.opt.max_depth)
 
             # TODO
             outputs[("depth", 0, scale)] = depth
@@ -511,11 +527,7 @@ class Trainer:
             for i, frame_id in enumerate(self.opt.frame_ids[1:]):
 
                 T = outputs[("cam_T_cam", 0, frame_id)]
-                if is_multi:
-                    # don't update posenet based on multi frame prediction
-                    # TODO
-                    pass
-                    #T = T.detach()
+
 
                 cam_points = self.backproject_depth[source_scale](
                     depth, inputs[("inv_K", source_scale)])
@@ -539,11 +551,9 @@ class Trainer:
         abs_diff = torch.abs(target - pred)
         l1_loss = abs_diff.mean(1, True)
 
-        if self.opt.no_ssim:
-            reprojection_loss = l1_loss
-        else:
-            ssim_loss = self.ssim(pred, target).mean(1, True)
-            reprojection_loss = 0.85 * ssim_loss + 0.15 * l1_loss
+
+        ssim_loss = self.ssim(pred, target).mean(1, True)
+        reprojection_loss = 0.85 * ssim_loss + 0.15 * l1_loss
 
         return reprojection_loss
 
@@ -574,10 +584,7 @@ class Trainer:
             loss = 0
             reprojection_losses = []
 
-            if self.opt.v1_multiscale:
-                source_scale = scale
-            else:
-                source_scale = 0
+            source_scale = 0
 
             disp = outputs[("disp", scale)]
             color = inputs[("color", 0, scale)]
@@ -621,33 +628,19 @@ class Trainer:
             reprojection_loss_mask = self.compute_loss_masks(reprojection_loss,
                                                              identity_reprojection_loss)
             
-            # Mask outlier loss values using statistical threshold
-            #mean_loss = reprojection_loss.median(dim=-1, keepdim=True).values
-            #std_loss = reprojection_loss.std(dim=-1, keepdim=True)
-            #threshold = mean_loss + 2.0 * std_loss  # 2-sigma threshold
-            #outlier_mask = reprojection_loss <= threshold
-            #reprojection_loss_mask = reprojection_loss_mask * outlier_mask
             
             reprojection_loss = reprojection_loss * reprojection_loss_mask 
             reprojection_loss = reprojection_loss.sum() / (reprojection_loss_mask.sum() + 1e-7)
 
 
             # consistency loss:
-            # encourage multi frame prediction to be like singe frame where masking is happening
-            if is_multi:
+            if is_multi and not self.opt.no_consistency_loss:
 
                 # Get the depth outputs
                 multi_depth = outputs[("depth", 0, scale)]
                 # no gradients for mono prediction!
                 mono_depth = outputs[("mono_depth", 0, scale)].detach()
                 
-                # Resize both to 630x182
-                multi_depth = F.interpolate(multi_depth, (182, 630), mode='bilinear', align_corners=False)
-                mono_depth = F.interpolate(mono_depth, (182, 630), mode='bilinear', align_corners=False)
-
-                # Scale-shift invariant loss between mono_depth and multi_depth
-                # Patch-based implementation without using log
-
                 # Define patch size
                 patch_size = 16
 
@@ -680,23 +673,11 @@ class Trainer:
 
                 # Calculate patch-wise loss
                 patch_ssi_loss = torch.abs(patches_multi_norm - patches_mono_norm).mean(dim=1)
-                # Mask outlier loss values using statistical threshold
-                # mean_loss = patch_ssi_loss.mean(dim=-1, keepdim=True)
-                # std_loss = patch_ssi_loss.std(dim=-1, keepdim=True)
-                # threshold = mean_loss + 110000.0 * std_loss  # 2-sigma threshold
-                # outlier_mask = patch_ssi_loss <= threshold
 
-                # Filter out low-texture (smooth) patches where variance is very small
-                # Use the larger variance between the two predictions as a texture score
                 depth_var = torch.min(var_multi, var_mono)  # [B, 1, n_patches]
 
-                texture_mask = depth_var > 0.01  # [B, 1, n_patches]
+                valid_mask = (depth_var > 0.01).squeeze(1)  # [B, 1, n_patches]
 
-                # Broadcast texture mask to match [B, n_patches]
-                texture_mask = texture_mask.squeeze(1)
-
-                # Combine masks and aggregate
-                valid_mask = texture_mask
 
                 masked_patch_ssi_loss = patch_ssi_loss * valid_mask
                 ssi_loss = masked_patch_ssi_loss.sum(dim=-1) / (valid_mask.sum(dim=-1) + 1e-7)
@@ -713,7 +694,10 @@ class Trainer:
                 outputs[("ssi_loss", scale)] = patch_ssi_loss_spatial
                 
                 # Combine losses
-                ssi_weight = self.g2s_weight() / 10
+                if not self.opt.no_loss_dynamic_weight:
+                    ssi_weight = max((1.0-self.g2s_weight()), 0.0001)
+                else:
+                    ssi_weight = 0.01
                 
                 consistency_loss = (ssi_weight * ssi_loss)
                 
@@ -748,9 +732,12 @@ class Trainer:
             s1 = inputs["gps12"].float() / t12 
             s2 = inputs["gps23"].float() / t23 
             
-            g2s_loss = torch.mean((s1 - 1) ** 2 + (s2 - 1) ** 2)
-
-            total_loss += self.g2s_weight() * g2s_loss
+            g2s_loss = torch.nn.functional.huber_loss(s1, torch.ones_like(s1), delta=0.1) + torch.nn.functional.huber_loss(s2, torch.ones_like(s2), delta=0.1)
+            
+            if not self.opt.no_loss_dynamic_weight:
+                total_loss += self.g2s_weight() * g2s_loss
+            else:
+                total_loss += g2s_loss
             losses["scale"] = 0.5 * torch.mean(s1 + s2)
             
         losses["loss"] = total_loss

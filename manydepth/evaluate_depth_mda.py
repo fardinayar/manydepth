@@ -76,9 +76,7 @@ def evaluate(opt):
         if idx not in frames_to_load:
             frames_to_load.append(idx)
 
-    assert sum((opt.eval_mono, opt.eval_stereo)) == 1, \
-        "Please choose mono or stereo evaluation by setting either --eval_mono or --eval_stereo"
-
+    
     if opt.ext_disp_to_eval is None:
 
         opt.load_weights_folder = os.path.expanduser(opt.load_weights_folder)
@@ -146,10 +144,11 @@ def evaluate(opt):
             encoder = networks.ManyDepthAnythingEncoder(encoder_name=opt.depth_anything_encoder)
             config = networks.MODEL_CONFIGS[opt.depth_anything_encoder]
             depth_decoder = networks.ManyDepthAnythingDecoder(
-                matching_height=opt.height // 14, matching_width=opt.width //14, features=config['features'], in_channels=config['in_channels'], out_channels=config['out_channels'])
-        
-            encoder = replace_qkv_with_mergedlinear(encoder,lora_dropout=0.0)
-            depth_decoder = replace_conv_with_loraconv(depth_decoder,lora_dropout=0.0)
+                patch_h=opt.height // 14, patch_w=opt.width //14, features=config['features'], in_channels=config['in_channels'], out_channels=config['out_channels'], temporal_fusion=not opt.no_temporal_fusion)
+            
+            if not opt.no_lora:
+                encoder = replace_qkv_with_mergedlinear(encoder,lora_dropout=0.0)
+                depth_decoder = replace_conv_with_loraconv(depth_decoder,lora_dropout=0.0)
 
         encoder.load_state_dict(encoder_dict, strict=False)
         
@@ -185,21 +184,18 @@ def evaluate(opt):
                         lookup_frames = lookup_frames.cuda()
 
 
-                    if opt.post_process:
-                        raise NotImplementedError
-
                     features, lookup_features = encoder(input_color, lookup_frames)
                     patch_h, patch_w = input_color.shape[-2] // 14, input_color.shape[-1] // 14
-                    output, _ = depth_decoder(features,
-                                                                                lookup_features,
-                                                                                patch_h,
-                                                                                patch_w,)
+                    output, _ = depth_decoder(features,lookup_features)
                 if opt.eval_teacher:
                     output = output.relu()
                 else:
                     output =  (output).sigmoid()
                 
-                pred_disp, _ = disp_to_depth(output, opt.min_depth, opt.max_depth)
+                if opt.eval_teacher:
+                    pred_disp, _ = disp_to_depth(output, opt.max_depth)
+                else:
+                    pred_disp, _ = disp_to_depth(output, opt.max_depth)
                 
                 pred_disp = pred_disp.cpu()[:, 0].numpy()
                 pred_disps.append(pred_disp)
@@ -259,17 +255,12 @@ def evaluate(opt):
 
     print("-> Evaluating")
 
-    if opt.eval_stereo:
-        print("   Stereo evaluation - "
-              "disabling median scaling, scaling by {}".format(STEREO_SCALE_FACTOR))
-        opt.disable_median_scaling = True
-        opt.pred_depth_scale_factor = STEREO_SCALE_FACTOR
-    else:
-        print("   Mono evaluation - using median scaling")
+    print("   Mono evaluation - using median scaling")
 
     errors = []
     errors_metric = []
     ratios = []
+    shifts = []
     for i in tqdm.tqdm(range(pred_disps.shape[0])):
 
         if opt.eval_split == 'cityscapes':
@@ -315,15 +306,16 @@ def evaluate(opt):
 
         pred_depth *= opt.pred_depth_scale_factor
         if opt.eval_teacher:
-            p = pred_depth.astype(np.float64).reshape(-1)
-            g = gt_depth.astype(np.float64).reshape(-1)
-            if p.size >= 2:
-                A = np.vstack([p, np.ones_like(p)]).T
-                a, b = np.linalg.lstsq(A, g, rcond=None)[0]
-            else:
-                a, b = 1.0, 0.0
-            ratios.append(float(a))
-            pred_depth = a * pred_depth + b
+            # Align using inverse-depth affine fit: inv_truth ≈ scale * disp_pred + shift
+            epsilon = 1e-6
+            pred_disp_masked = pred_disp[mask]
+            inverse_truth = 1.0 / (gt_depth + epsilon)
+            A = np.vstack([pred_disp_masked, np.ones_like(pred_disp_masked)]).T
+            scale, shift = np.linalg.lstsq(A, inverse_truth, rcond=None)[0]
+            print(f"scale: {scale}, shift: {shift}")
+            shifts.append(float(shift))
+            ratios.append(float(scale))
+            pred_depth = 1.0 / (pred_disp_masked * scale + shift + epsilon)
         elif not opt.disable_median_scaling:
             ratio = np.median(gt_depth) / np.median(pred_depth)
             ratios.append(ratio)
@@ -347,8 +339,14 @@ def evaluate(opt):
 
     if not opt.disable_median_scaling:
         ratios = np.array(ratios)
+        
         med = np.median(ratios)
         print(" Scaling ratios | med: {:0.3f} | std: {:0.3f}".format(med, np.std(ratios)))
+        if opt.eval_teacher:
+            shifts = np.array(shifts)
+            med_shift = np.median(shifts)
+            print(" Scaling shifts | med: {:0.3f} | std: {:0.3f}".format(med_shift, np.std(shifts)))
+
 
     mean_errors = np.array(errors).mean(0)
     mean_errors_metric = np.array(errors_metric).mean(0)

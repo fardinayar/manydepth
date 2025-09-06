@@ -14,7 +14,6 @@ from PIL import Image
 import glob
 from tqdm import tqdm
 import matplotlib.pyplot as plt
-import matplotlib.cm as cm
 import json
 
 # Add the parent directory to Python path so we can import from manydepth
