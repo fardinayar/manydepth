@@ -88,10 +88,14 @@ class MonodepthOptions:
         self.parser.add_argument("--num_epochs",
                                  type=int,
                                  help="number of epochs",
-                                 default=3)
+                                 default=5)
         self.parser.add_argument("--pytorch_random_seed",
                                  default=None,
                                  type=int)
+        self.parser.add_argument("--max_grad_norm",
+                                 type=float,
+                                 help="maximum gradient norm for clipping (0 to disable)",
+                                 default=20.0)
 
         # ABLATION options
         self.parser.add_argument("--avg_reprojection",
@@ -224,7 +228,7 @@ class MonodepthOptions:
         
         self.parser.add_argument('--fusion_lr_coef',
                                  type=float,
-                                 default=4.0,
+                                 default=2.0,
                                  help='Learning rate multiplier for feature fusion parameters')
         
         self.parser.add_argument("--g2s",
@@ -238,6 +242,7 @@ class MonodepthOptions:
         self.parser.add_argument('--pose_from_scratch',
                                  action='store_true',
                                  help='If set, the pose encoder and decoder will be initialized randomly')
+        
     def parse(self):
         self.options = self.parser.parse_args()
         return self.options

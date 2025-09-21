@@ -205,7 +205,7 @@ class Trainer:
         print('Total number of steps: ', self.num_total_steps, "Total number of epochs:", self.opt.num_epochs)
         
         self.model_optimizer = optim.AdamW(self.parameters_to_train, self.opt.learning_rate)
-        self.model_lr_scheduler = optim.lr_scheduler.StepLR(self.model_optimizer, step_size= 3 * ((self.num_total_steps)) // 3, gamma=1)
+        self.model_lr_scheduler = optim.lr_scheduler.StepLR(self.model_optimizer, step_size= 2 * ((self.num_total_steps)) // 5, gamma=0.1)
 
         self.g2s = self.opt.g2s
 
@@ -268,7 +268,7 @@ class Trainer:
         self.save_opts()
 
     def g2s_weight(self):
-        maximum_steps = ((2 * self.num_total_steps)) // 3
+        maximum_steps = ((2 * self.num_total_steps)) // 5
         return (self.step / maximum_steps) ** 2 if self.step <= maximum_steps else 1
 
     
@@ -312,6 +312,31 @@ class Trainer:
             outputs, losses, mono_losses = self.process_batch(inputs, is_train=True)
             self.model_optimizer.zero_grad()
             losses["loss"].backward()
+            
+            # Apply gradient clipping if enabled (max_grad_norm > 0)
+            if self.opt.max_grad_norm > 0:
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    [p for group in self.parameters_to_train for p in group['params']], 
+                    self.opt.max_grad_norm
+                )
+                # Store gradient norm for logging
+                losses["grad_norm"] = grad_norm
+                # Log gradient norm for monitoring
+                if batch_idx % self.opt.log_frequency == 0:
+                    print(f"Gradient norm (clipped): {grad_norm:.4f}")
+            else:
+                # Calculate gradient norm without clipping for monitoring
+                if batch_idx % self.opt.log_frequency == 0:
+                    total_norm = 0
+                    for group in self.parameters_to_train:
+                        for p in group['params']:
+                            if p.grad is not None:
+                                param_norm = p.grad.data.norm(2)
+                                total_norm += param_norm.item() ** 2
+                    total_norm = total_norm ** (1. / 2)
+                    losses["grad_norm"] = total_norm
+                    print(f"Gradient norm (no clipping): {total_norm:.4f}")
+            
             self.model_optimizer.step()
 
             duration = time.time() - before_op_time
@@ -384,7 +409,7 @@ class Trainer:
         with torch.no_grad():
             input_image = inputs["color_aug", 0, 0]
             patch_h, patch_w = input_image.shape[-2] // 14, input_image.shape[-1] // 14
-            feats = self.models["mono_encoder"].get_intermediate_layers(input_image, [2, 5, 8, 11], return_class_token=True)
+            feats = self.models["mono_encoder"].get_intermediate_layers(input_image, self.models["mono_encoder"].intermediate_layer_idx, return_class_token=True)
             monodepth, _ = self.models['mono_depth'](feats, patch_h, patch_w)
         monodepth = {("disp", 0): F.relu(monodepth)}
         mono_outputs.update(monodepth)
@@ -412,7 +437,7 @@ class Trainer:
         depth, _ = self.models["depth"](features,
                                             lookup_features)
         
-        depth =  F.sigmoid(depth)
+        depth =  F.relu(depth)
         outputs.update({("disp", 0): depth})
 
         self.generate_images_pred(inputs, outputs, is_multi=True)
@@ -695,7 +720,7 @@ class Trainer:
                 
                 # Combine losses
                 if not self.opt.no_loss_dynamic_weight:
-                    ssi_weight = max((1.0-self.g2s_weight()), 0.0001)
+                    ssi_weight = max((1.0-self.g2s_weight()), 0.001)
                 else:
                     ssi_weight = 0.01
                 
@@ -732,7 +757,8 @@ class Trainer:
             s1 = inputs["gps12"].float() / t12 
             s2 = inputs["gps23"].float() / t23 
             
-            g2s_loss = torch.nn.functional.huber_loss(s1, torch.ones_like(s1), delta=0.1) + torch.nn.functional.huber_loss(s2, torch.ones_like(s2), delta=0.1)
+            #g2s_loss = torch.nn.functional.huber_loss(s1, torch.ones_like(s1), delta=0.1) + torch.nn.functional.huber_loss(s2, torch.ones_like(s2), delta=0.1)
+            g2s_loss = torch.nn.functional.mse_loss(s1, torch.ones_like(s1)) + torch.nn.functional.mse_loss(s2, torch.ones_like(s2))
             
             if not self.opt.no_loss_dynamic_weight:
                 total_loss += self.g2s_weight() * g2s_loss

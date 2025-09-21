@@ -6,7 +6,7 @@ for PERCENT in "${DATA_PERCENTS[@]}"; do
         --png \
         --g2s \
         --data_percent "$PERCENT" \
-        --log_dir "outs/kitti_dp${PERCENT}" \
+        --log_dir "outs/kitti_dp_${PERCENT}" \
         
 done
 

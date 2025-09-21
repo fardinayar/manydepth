@@ -100,6 +100,7 @@ def evaluate(opt):
         encoder_dict = torch.load(encoder_path)
         try:
             HEIGHT, WIDTH = encoder_dict['height'], encoder_dict['width']
+            opt.height, opt.width = HEIGHT, WIDTH
         except KeyError:
             print('No "height" or "width" keys found in the encoder state_dict, resorting to '
                   'using command line values!')
@@ -190,7 +191,7 @@ def evaluate(opt):
                 if opt.eval_teacher:
                     output = output.relu()
                 else:
-                    output =  (output).sigmoid()
+                    output =  (output).relu()
                 
                 if opt.eval_teacher:
                     pred_disp, _ = disp_to_depth(output, opt.max_depth)

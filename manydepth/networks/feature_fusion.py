@@ -1,12 +1,13 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from .depth_anything_v2.dinov2_layers.drop_path import DropPath
 
 
 class MultiFrameFeatureFusion(nn.Module):
     def __init__(self, input_dim, matching_height, matching_width, 
-                 num_heads=4, dropout=0.2, 
-                 neighborhood_size=7,
+                 num_heads=4, dropout=0.1, drop_path=0.0,
+                 neighborhood_size=15,
                  temporal_fusion=True):
         super().__init__()
         self.input_dim = input_dim
@@ -15,6 +16,7 @@ class MultiFrameFeatureFusion(nn.Module):
         self.num_heads = num_heads
         self.temporal_fusion = temporal_fusion
         self.neighborhood_size = neighborhood_size  # n for n×n neighborhood, None for global attention
+        self.drop_path = drop_path
 
         # Use PyTorch's built-in MultiheadAttention
         self.multihead_attention = nn.MultiheadAttention(
@@ -38,6 +40,10 @@ class MultiFrameFeatureFusion(nn.Module):
             nn.Dropout(dropout)
         )
         
+        # DropPath modules for stochastic depth
+        self.drop_path_attn = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+        self.drop_path_ffn = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+        
         # Create attention mask for neighborhood constraint
         _mask = self.create_neighborhood_mask(
             self.matching_height,
@@ -51,10 +57,10 @@ class MultiFrameFeatureFusion(nn.Module):
         
         
         
-        nn.init.constant_(self.feed_forward[2].weight, 0.02)
-        nn.init.constant_(self.feed_forward[2].bias, 0.02)
-        nn.init.constant_(self.multihead_attention.out_proj.weight, 0.02)
-        nn.init.constant_(self.multihead_attention.out_proj.bias, 0.02)
+        #nn.init.constant_(self.feed_forward[2].weight, 0.02)
+        #nn.init.constant_(self.feed_forward[2].bias, 0.02)
+        #nn.init.constant_(self.multihead_attention.out_proj.weight, 0.02)
+        #nn.init.constant_(self.multihead_attention.out_proj.bias, 0.02)
         
 
     def create_neighborhood_mask(self, height, width, neighborhood_size):
@@ -135,12 +141,12 @@ class MultiFrameFeatureFusion(nn.Module):
             query=q,                  # [B, N, input_dim]
             key=k,          # [B, 2*N, input_dim]
             value=v,             # [B, 2*N, input_dim]
-            attn_mask=attn_mask,      # [N, 2*N] or None
+            #attn_mask=attn_mask,      # [N, 2*N] or None
             need_weights=False
         )
-        x = x1 + attn_output
+        x = x1 + self.drop_path_attn(attn_output)
         
         # Pre-LN Feed-forward
-        x1_final = x + self.feed_forward(self.ffn_norm(x))
+        x1_final = x + self.drop_path_ffn(self.feed_forward(self.ffn_norm(x)))
         
         return x1_final

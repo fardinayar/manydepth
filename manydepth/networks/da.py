@@ -192,7 +192,7 @@ class ManyDepthAnythingDecoder(nn.Module):
                 
             x = x.permute(0, 2, 1).reshape((x.shape[0], x.shape[-1], self.patch_h, self.patch_w))
             lookup_feature = lookup_feature.permute(0, 2, 1).reshape((lookup_feature.shape[0], lookup_feature.shape[-1], self.patch_h, self.patch_w))
-            if i > -1:
+            if i > 2:
                 x = self._fuse_features_multi_frame(x, lookup_feature, 0)
             x = self.projects[i](x)
             x = self.resize_layers[i](x)
