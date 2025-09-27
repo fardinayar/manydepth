@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch
 from .depth_anything_v2.util.blocks import FeatureFusionBlock, _make_scratch
 import copy
-from .feature_fusion import MultiFrameFeatureFusion
+from .feature_fusion import MultiFrameFeatureFusion, CostVolumeFeatureFusion
 
 MODEL_CONFIGS = {
     'vits': {'encoder': 'vits', 'features': 64, 'in_channels': 384, 'out_channels': [48, 96, 192, 384]},
@@ -77,7 +77,11 @@ class ManyDepthAnythingDecoder(nn.Module):
         use_clstoken=False,
         patch_h=518//14,
         patch_w=518//14,
-        temporal_fusion=True
+        temporal_fusion=True,
+        use_cost_volume_fusion=False,
+        cost_volume_depth_bins=32,
+        cost_volume_depth_min=0.1,
+        cost_volume_depth_max=80.0,
     ):
         super(ManyDepthAnythingDecoder, self).__init__()
         self.num_ch_enc = in_channels
@@ -86,6 +90,7 @@ class ManyDepthAnythingDecoder(nn.Module):
         self.out_channels = out_channels
         self.use_clstoken = use_clstoken
         self.temporal_fusion = temporal_fusion
+        self.use_cost_volume_fusion = use_cost_volume_fusion
         
         self.projects = nn.ModuleList([
             nn.Conv2d(
@@ -136,10 +141,23 @@ class ManyDepthAnythingDecoder(nn.Module):
         
 
         
-        self.multi_frame_feature_fusion = nn.ModuleList([
-            MultiFrameFeatureFusion(in_channels, self.patch_h, self.patch_w, dropout=0.2, temporal_fusion=self.temporal_fusion)
-            for _ in range(1)
-        ])
+        # Choose fusion method based on configuration
+        if self.use_cost_volume_fusion:
+            self.multi_frame_feature_fusion = nn.ModuleList([
+                CostVolumeFeatureFusion(
+                    in_channels, self.patch_h, self.patch_w,
+                    num_depth_bins=cost_volume_depth_bins,
+                    depth_min=cost_volume_depth_min,
+                    depth_max=cost_volume_depth_max,
+                    dropout=0.2
+                )
+                for _ in range(1)
+            ])
+        else:
+            self.multi_frame_feature_fusion = nn.ModuleList([
+                MultiFrameFeatureFusion(in_channels, self.patch_h, self.patch_w, dropout=0.2, temporal_fusion=self.temporal_fusion)
+                for _ in range(1)
+            ])
         
         self.scratch.stem_transpose = None
         
@@ -159,23 +177,33 @@ class ManyDepthAnythingDecoder(nn.Module):
         )
         
     
-    def _fuse_features_multi_frame(self, current_feats, lookup_feats, i):
+    def _fuse_features_multi_frame(self, current_feats, lookup_feats, i, poses=None, intrinsics=None):
         batch_size, channels, height, width = current_feats.shape
         
-        # Reshape current_feats
-        current_feats_flat = current_feats.view(batch_size, channels, -1)
-        
-        # Reshape lookup_feats
-        lookup_feats_flat = lookup_feats.view(batch_size, -1, height * width)
-        
-        #concatenate features along channel dim
-        fused_features = torch.cat((current_feats_flat, lookup_feats_flat), 1).permute(0,2,1)
-        output = self.multi_frame_feature_fusion[i](fused_features).permute(0,2,1)
-        output = output.view(batch_size, channels, height, width)
+        if self.use_cost_volume_fusion:
+            # Cost volume fusion expects [B, N, C, H, W] for lookup features
+            # Reshape lookup_feats from [B, N*C, H, W] to [B, N, C, H, W]
+            num_frames = lookup_feats.shape[1] // channels
+            lookup_feats_reshaped = lookup_feats.view(batch_size, num_frames, channels, height, width)
+            
+            # Apply cost volume fusion with intrinsics
+            output = self.multi_frame_feature_fusion[i](current_feats, lookup_feats_reshaped, poses, intrinsics)
+        else:
+            # Original attention-based fusion
+            # Reshape current_feats
+            current_feats_flat = current_feats.view(batch_size, channels, -1)
+            
+            # Reshape lookup_feats
+            lookup_feats_flat = lookup_feats.view(batch_size, -1, height * width)
+            
+            #concatenate features along channel dim
+            fused_features = torch.cat((current_feats_flat, lookup_feats_flat), 1).permute(0,2,1)
+            output = self.multi_frame_feature_fusion[i](fused_features).permute(0,2,1)
+            output = output.view(batch_size, channels, height, width)
 
         return output
 
-    def forward(self, out_features, lookup_features):
+    def forward(self, out_features, lookup_features, poses=None, intrinsics=None):
         out = []
         for i, (x, lookup_feature) in enumerate(zip(out_features, lookup_features)):
             if self.use_clstoken:
@@ -193,7 +221,7 @@ class ManyDepthAnythingDecoder(nn.Module):
             x = x.permute(0, 2, 1).reshape((x.shape[0], x.shape[-1], self.patch_h, self.patch_w))
             lookup_feature = lookup_feature.permute(0, 2, 1).reshape((lookup_feature.shape[0], lookup_feature.shape[-1], self.patch_h, self.patch_w))
             if i > 2:
-                x = self._fuse_features_multi_frame(x, lookup_feature, 0)
+                x = self._fuse_features_multi_frame(x, lookup_feature, 0, poses, intrinsics)
             x = self.projects[i](x)
             x = self.resize_layers[i](x)
             

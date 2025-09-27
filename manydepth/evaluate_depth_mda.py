@@ -145,7 +145,11 @@ def evaluate(opt):
             encoder = networks.ManyDepthAnythingEncoder(encoder_name=opt.depth_anything_encoder)
             config = networks.MODEL_CONFIGS[opt.depth_anything_encoder]
             depth_decoder = networks.ManyDepthAnythingDecoder(
-                patch_h=opt.height // 14, patch_w=opt.width //14, features=config['features'], in_channels=config['in_channels'], out_channels=config['out_channels'], temporal_fusion=not opt.no_temporal_fusion)
+                patch_h=opt.height // 14, patch_w=opt.width //14, features=config['features'], in_channels=config['in_channels'], out_channels=config['out_channels'], temporal_fusion=not opt.no_temporal_fusion,
+                use_cost_volume_fusion=getattr(opt, 'use_cost_volume_fusion', False),
+                cost_volume_depth_bins=getattr(opt, 'cost_volume_depth_bins', 32),
+                cost_volume_depth_min=getattr(opt, 'cost_volume_depth_min', 0.1),
+                cost_volume_depth_max=getattr(opt, 'cost_volume_depth_max', 80.0))
             
             if not opt.no_lora:
                 encoder = replace_qkv_with_mergedlinear(encoder,lora_dropout=0.0)
@@ -176,18 +180,33 @@ def evaluate(opt):
                     patch_h, patch_w = input_color.shape[-2] // 14, input_color.shape[-1] // 14
                     output, _ = depth_decoder(features, patch_h, patch_w)
                 else:
-
-
                     lookup_frames = [data[('color', idx, 0)] for idx in frames_to_load[1:]]
                     lookup_frames = torch.stack(lookup_frames, 1)  # batch x frames x 3 x h x w
 
                     if torch.cuda.is_available():
                         lookup_frames = lookup_frames.cuda()
 
-
                     features, lookup_features = encoder(input_color, lookup_frames)
                     patch_h, patch_w = input_color.shape[-2] // 14, input_color.shape[-1] // 14
-                    output, _ = depth_decoder(features,lookup_features)
+                    
+                    # Handle poses and intrinsics for cost volume fusion (pose required)
+                    if getattr(opt, 'use_cost_volume_fusion', False):
+                        # Compute poses for evaluation
+                        pose_inputs = [pose_enc(torch.cat([input_color, lookup_frames[:, 0]], 1))]
+                        axisangle, translation = pose_dec(pose_inputs)
+                        pose = transformation_from_parameters(axisangle[:, 0], translation[:, 0], invert=True)
+                        
+                        # Stack poses for all lookup frames (simplified - using same pose for all)
+                        poses = pose.unsqueeze(1).expand(-1, lookup_frames.shape[1], -1, -1)
+                        
+                        # Get camera intrinsics for evaluation
+                        intrinsics = data[("K", 0)]  # [B, 3x3 or 4x4] camera intrinsics
+                        if torch.cuda.is_available():
+                            intrinsics = intrinsics.cuda()
+                        
+                        output, _ = depth_decoder(features, lookup_features, poses, intrinsics)
+                    else:
+                        output, _ = depth_decoder(features, lookup_features)
                 if opt.eval_teacher:
                     output = output.relu()
                 else:

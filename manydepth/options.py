@@ -243,6 +243,29 @@ class MonodepthOptions:
                                  action='store_true',
                                  help='If set, the pose encoder and decoder will be initialized randomly')
         
+        self.parser.add_argument('--gradient_accumulation_steps',
+                                 type=int,
+                                 default=1,
+                                 help='Number of gradient accumulation steps')
+        
+        # Cost Volume Feature Fusion options
+        self.parser.add_argument('--use_cost_volume_fusion',
+                                 help='Use cost volume feature fusion instead of attention-based fusion',
+                                 action='store_true')
+        self.parser.add_argument('--cost_volume_depth_bins',
+                                 type=int,
+                                 default=96,
+                                 help='Number of depth bins for cost volume')
+        self.parser.add_argument('--cost_volume_depth_min',
+                                 type=float,
+                                 default=0.1,
+                                 help='Minimum depth for cost volume')
+        self.parser.add_argument('--cost_volume_depth_max',
+                                 type=float,
+                                 default=80.0,
+                                 help='Maximum depth for cost volume')
+        # Pose is mandatory for cost volume fusion; keep no option flag
+        
     def parse(self):
         self.options = self.parser.parse_args()
         return self.options

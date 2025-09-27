@@ -56,6 +56,12 @@ class Trainer:
         self.num_scales = len(self.opt.scales)
         self.num_input_frames = len(self.opt.frame_ids)
         self.num_pose_frames = 2
+        
+        # Gradient accumulation parameters
+        self.gradient_accumulation_steps = getattr(self.opt, 'gradient_accumulation_steps', 1)
+        self.effective_batch_size = self.opt.batch_size * self.gradient_accumulation_steps
+        print(f"Gradient accumulation steps: {self.gradient_accumulation_steps}")
+        print(f"Effective batch size: {self.effective_batch_size}")
 
         assert self.opt.frame_ids[0] == 0, "frame_ids must start with 0"
         assert len(self.opt.frame_ids) > 1, "frame_ids must have more than 1 frame specified"
@@ -84,13 +90,22 @@ class Trainer:
         
         if self.opt.no_temporal_fusion:
             print("Disabling temporal fusion in the depth decoder")
+        
+        if getattr(self.opt, 'use_cost_volume_fusion', False):
+            print("Using cost volume feature fusion (pose required)")
+            print(f"Cost volume depth bins: {getattr(self.opt, 'cost_volume_depth_bins', 32)}")
+            print(f"Cost volume depth range: [{getattr(self.opt, 'cost_volume_depth_min', 0.1)}, {getattr(self.opt, 'cost_volume_depth_max', 80.0)}]")
         self.models["depth"] = networks.ManyDepthAnythingDecoder(
             in_channels=model_config['in_channels'],
             out_channels=model_config['out_channels'],
             features=model_config['features'],
             patch_h=self.opt.height // 14,
             patch_w=self.opt.width // 14,
-            temporal_fusion=not self.opt.no_temporal_fusion)
+            temporal_fusion=not self.opt.no_temporal_fusion,
+            use_cost_volume_fusion=getattr(self.opt, 'use_cost_volume_fusion', False),
+            cost_volume_depth_bins=getattr(self.opt, 'cost_volume_depth_bins', 32),
+            cost_volume_depth_min=getattr(self.opt, 'cost_volume_depth_min', 0.1),
+            cost_volume_depth_max=getattr(self.opt, 'cost_volume_depth_max', 80.0))
 
         depthanything_weights = torch.load(f'checkpoints/depth_anything_v2_{self.opt.depth_anything_encoder}.pth', map_location='cpu')
         depthanything_weights_decoder = {}
@@ -305,39 +320,60 @@ class Trainer:
         print("Training")
         self.set_train()
 
+        # Initialize gradient accumulation variables
+        accumulated_loss = 0.0
+        accumulated_mono_loss = 0.0
+        accumulated_scale = 0.0 if self.g2s else None
+        accumulation_count = 0
+
         for batch_idx, inputs in enumerate(self.train_loader):
 
             before_op_time = time.time()
 
             outputs, losses, mono_losses = self.process_batch(inputs, is_train=True)
-            self.model_optimizer.zero_grad()
-            losses["loss"].backward()
             
-            # Apply gradient clipping if enabled (max_grad_norm > 0)
-            if self.opt.max_grad_norm > 0:
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    [p for group in self.parameters_to_train for p in group['params']], 
-                    self.opt.max_grad_norm
-                )
-                # Store gradient norm for logging
-                losses["grad_norm"] = grad_norm
-                # Log gradient norm for monitoring
-                if batch_idx % self.opt.log_frequency == 0:
-                    print(f"Gradient norm (clipped): {grad_norm:.4f}")
-            else:
-                # Calculate gradient norm without clipping for monitoring
-                if batch_idx % self.opt.log_frequency == 0:
-                    total_norm = 0
-                    for group in self.parameters_to_train:
-                        for p in group['params']:
-                            if p.grad is not None:
-                                param_norm = p.grad.data.norm(2)
-                                total_norm += param_norm.item() ** 2
-                    total_norm = total_norm ** (1. / 2)
-                    losses["grad_norm"] = total_norm
-                    print(f"Gradient norm (no clipping): {total_norm:.4f}")
+            # Scale loss by accumulation steps to maintain correct gradient magnitude
+            scaled_loss = losses["loss"] / self.gradient_accumulation_steps
+            scaled_loss.backward()
             
-            self.model_optimizer.step()
+            # Accumulate losses for logging
+            accumulated_loss += losses["loss"].item()
+            accumulated_mono_loss += mono_losses["loss"].item()
+            if self.g2s and "scale" in losses:
+                accumulated_scale += losses["scale"].item()
+            accumulation_count += 1
+
+            # Only update optimizer and scheduler after accumulating gradients
+            if (batch_idx + 1) % self.gradient_accumulation_steps == 0:
+                # Apply gradient clipping if enabled (max_grad_norm > 0)
+                if self.opt.max_grad_norm > 0:
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        [p for group in self.parameters_to_train for p in group['params']], 
+                        self.opt.max_grad_norm
+                    )
+                    # Store gradient norm for logging
+                    losses["grad_norm"] = grad_norm
+                    # Log gradient norm for monitoring
+                    if batch_idx % self.opt.log_frequency == 0:
+                        print(f"Gradient norm (clipped): {grad_norm:.4f}")
+                else:
+                    # Calculate gradient norm without clipping for monitoring
+                    if batch_idx % self.opt.log_frequency == 0:
+                        total_norm = 0
+                        for group in self.parameters_to_train:
+                            for p in group['params']:
+                                if p.grad is not None:
+                                    param_norm = p.grad.data.norm(2)
+                                    total_norm += param_norm.item() ** 2
+                        total_norm = total_norm ** (1. / 2)
+                        losses["grad_norm"] = total_norm
+                        print(f"Gradient norm (no clipping): {total_norm:.4f}")
+                
+                self.model_optimizer.step()
+                self.model_optimizer.zero_grad()
+                self.model_lr_scheduler.step()
+                
+                
 
             duration = time.time() - before_op_time
 
@@ -345,24 +381,38 @@ class Trainer:
             log_step = batch_idx % self.opt.log_frequency == 0
 
             if log_step:
+                # Use accumulated losses for logging
+                avg_loss = accumulated_loss / max(accumulation_count, 1)
+                avg_mono_loss = accumulated_mono_loss / max(accumulation_count, 1)
+                avg_scale = accumulated_scale / max(accumulation_count, 1) if self.g2s else None
+                
                 if self.g2s:
-                    self.log_time(batch_idx, duration, losses["loss"].cpu().data, mono_losses["loss"].cpu().data, losses["scale"].cpu().data)
+                    self.log_time(batch_idx, duration, avg_loss, avg_mono_loss, avg_scale)
                 else:
-                    self.log_time(batch_idx, duration, losses["loss"].cpu().data, mono_losses["loss"].cpu())
+                    self.log_time(batch_idx, duration, avg_loss, avg_mono_loss)
 
                 if "depth_gt" in inputs:
                     self.compute_depth_losses(inputs, outputs, losses)
 
+                # Update losses with averaged values for logging
+                losses["loss"] = torch.tensor(avg_loss, device=losses["loss"].device)
+                mono_losses["loss"] = torch.tensor(avg_mono_loss, device=mono_losses["loss"].device)
+                if self.g2s and avg_scale is not None:
+                    losses["scale"] = torch.tensor(avg_scale, device=losses["scale"].device)
+                
                 self.log("train", inputs, outputs, losses, mono_losses)
                 self.val()
+                
+            # Reset accumulation variables
+            accumulated_loss = 0.0
+            accumulated_mono_loss = 0.0
+            accumulated_scale = 0.0 if self.g2s else None
+            accumulation_count = 0
 
             if self.opt.save_intermediate_models:
                 self.save_model(save_step=True)
 
-
             self.step += 1
-
-            self.model_lr_scheduler.step()
 
     def process_batch(self, inputs, is_train=False):
         """Pass a minibatch through the network and generate images and losses
@@ -434,8 +484,13 @@ class Trainer:
             features, lookup_features = self.models["encoder"](inputs["color_aug", 0, 0], lookup_frames)
         
 
-        depth, _ = self.models["depth"](features,
-                                            lookup_features)
+        # Pass poses and intrinsics to depth decoder if using cost volume fusion
+        if getattr(self.opt, 'use_cost_volume_fusion', False):
+            # Get camera intrinsics for the current scale
+            intrinsics = inputs[("K", 0)]  # [B, 3, 3] camera intrinsics
+            depth, _ = self.models["depth"](features, lookup_features, relative_poses, intrinsics)
+        else:
+            depth, _ = self.models["depth"](features, lookup_features)
         
         depth =  F.relu(depth)
         outputs.update({("disp", 0): depth})
@@ -720,7 +775,7 @@ class Trainer:
                 
                 # Combine losses
                 if not self.opt.no_loss_dynamic_weight:
-                    ssi_weight = max((1.0-self.g2s_weight()), 0.001)
+                    ssi_weight = max((1.0-self.g2s_weight()), 0)
                 else:
                     ssi_weight = 0.01
                 
@@ -761,7 +816,7 @@ class Trainer:
             g2s_loss = torch.nn.functional.mse_loss(s1, torch.ones_like(s1)) + torch.nn.functional.mse_loss(s2, torch.ones_like(s2))
             
             if not self.opt.no_loss_dynamic_weight:
-                total_loss += self.g2s_weight() * g2s_loss
+                total_loss += self.g2s_weight() * g2s_loss 
             else:
                 total_loss += g2s_loss
             losses["scale"] = 0.5 * torch.mean(s1 + s2)
@@ -823,6 +878,11 @@ class Trainer:
         if scale is not None:
             print_string += " | scale: {}"
             print_data.append(scale)
+            
+        # Add gradient accumulation info
+        if self.gradient_accumulation_steps > 1:
+            print_string += " | eff_batch: {}"
+            print_data.append(self.effective_batch_size)
 
         print(print_string.format(*print_data))
 
@@ -835,6 +895,11 @@ class Trainer:
             writer.add_scalar("{}".format(l), v, self.step)
         for l, v in mono_losses.items():
             writer.add_scalar("mono_{}".format(l), v, self.step)
+            
+        # Log gradient accumulation info
+        if mode == "train":
+            writer.add_scalar("gradient_accumulation_steps", self.gradient_accumulation_steps, self.step)
+            writer.add_scalar("effective_batch_size", self.effective_batch_size, self.step)
 
         # Unnormalization function for ImageNet normalization
         def unnormalize_image(img):
