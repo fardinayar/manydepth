@@ -78,85 +78,6 @@ def get_original_rgb_image(image_or_path: Union[str, np.ndarray]) -> np.ndarray:
     else:
         raise TypeError("image_or_path must be a str path or an np.ndarray")
 
-def setup_models(weights_folder, depth_anything_encoder, height, width, device):
-    """Setup encoder and decoder models - student mode only, no poses
-
-    Returns (encoder, depth_decoder, HEIGHT, WIDTH) where HEIGHT/WIDTH prefer values
-    stored in the encoder state dict under keys 'height' and 'width' if present.
-    """
-    
-    encoder_path = os.path.join(weights_folder, "encoder.pth")
-    decoder_path = os.path.join(weights_folder, "depth.pth")
-    print("-> Loading student models (multi-frame, no poses)")
-
-    if not os.path.exists(encoder_path) or not os.path.exists(decoder_path):
-        raise FileNotFoundError(f"Model weights not found in {weights_folder}")
-
-    print(f"-> Loading weights from {weights_folder}")
-    
-    encoder_dict = torch.load(encoder_path, map_location=device)
-    
-    # Get model dimensions
-    try:
-        HEIGHT, WIDTH = encoder_dict['height'], encoder_dict['width']
-        print(f"Using model dimensions from encoder state: {HEIGHT}x{WIDTH}")
-    except KeyError:
-        print('No "height" or "width" keys found in the encoder state_dict, using provided values!')
-        HEIGHT, WIDTH = height, width
-    
-    # Load ablation parameters from encoder state dict
-    use_cost_volume_fusion = encoder_dict.get('use_cost_volume_fusion', False)
-    cost_volume_depth_bins = encoder_dict.get('cost_volume_depth_bins', 32)
-    cost_volume_depth_min = encoder_dict.get('cost_volume_depth_min', 0.1)
-    cost_volume_depth_max = encoder_dict.get('cost_volume_depth_max', 80.0)
-    num_passes = encoder_dict.get('num_passes', 2)
-    no_temporal_fusion = encoder_dict.get('no_temporal_fusion', False)
-    
-    print(f"Loaded model configuration:")
-    print(f"  Use cost volume fusion: {use_cost_volume_fusion}")
-    print(f"  Num passes: {num_passes}")
-    print(f"  No temporal fusion: {no_temporal_fusion}")
-
-    # Setup models - student mode
-    
-    config = networks.MODEL_CONFIGS[depth_anything_encoder]
-    encoder = networks.ManyDepthAnythingEncoder(encoder_name=depth_anything_encoder)
-    depth_decoder = networks.ManyDepthAnythingDecoder(
-        patch_h=HEIGHT // 14, patch_w=WIDTH // 14, 
-        features=config['features'], 
-        in_channels=config['in_channels'], 
-        out_channels=config['out_channels'],
-        temporal_fusion=not no_temporal_fusion,
-        use_cost_volume_fusion=use_cost_volume_fusion,
-        cost_volume_depth_bins=cost_volume_depth_bins,
-        cost_volume_depth_min=cost_volume_depth_min,
-        cost_volume_depth_max=cost_volume_depth_max,
-        num_passes=num_passes)
-
-    encoder = replace_qkv_with_mergedlinear(encoder, lora_dropout=0.0)
-    depth_decoder = replace_conv_with_loraconv(depth_decoder, lora_dropout=0.0)
-
-    # Load state dicts
-    encoder.load_state_dict(encoder_dict, strict=False)
-    depth_decoder.load_state_dict(torch.load(decoder_path, map_location=device))
-    
-    # Move to device and set to eval mode
-    encoder.eval()
-    depth_decoder.eval()
-    encoder.to(device)
-    depth_decoder.to(device)
-    
-    return encoder, depth_decoder, HEIGHT, WIDTH
-
-@torch.no_grad()
-def predict_depth_student(encoder, depth_decoder, input_color, lookup_frames):
-    """Student mode depth prediction - multi-frame without poses"""
-    
-    features, lookup_features = encoder(input_color, lookup_frames)
-    output, _ = depth_decoder(features, lookup_features)
-    
-    return output
-
 def depth_to_pointcloud(depth_map: np.ndarray,
                         image: np.ndarray,
                         height: int,
@@ -219,6 +140,107 @@ def depth_to_pointcloud(depth_map: np.ndarray,
 
     return pcd
 
+def setup_models(weights_folder, depth_anything_encoder, height, width, device, teacher_mode=False):
+    """Setup encoder and decoder models - supports both teacher and student modes
+
+    Returns (encoder, depth_decoder, HEIGHT, WIDTH) where HEIGHT/WIDTH prefer values
+    stored in the encoder state dict under keys 'height' and 'width' if present.
+    """
+    
+    if teacher_mode:
+        encoder_path = os.path.join(weights_folder, "mono_encoder.pth")
+        decoder_path = os.path.join(weights_folder, "mono_depth.pth")
+        print("-> Loading teacher models (monocular, single-frame)")
+    else:
+        encoder_path = os.path.join(weights_folder, "encoder.pth")
+        decoder_path = os.path.join(weights_folder, "depth.pth")
+        print("-> Loading student models (multi-frame, no poses)")
+    
+    if not os.path.exists(encoder_path) or not os.path.exists(decoder_path):
+        raise FileNotFoundError(f"Model weights not found in {weights_folder}")
+
+    print(f"-> Loading weights from {weights_folder}")
+    
+    encoder_dict = torch.load(encoder_path, map_location=device)
+    
+    # Get model dimensions
+    try:
+        HEIGHT, WIDTH = encoder_dict['height'], encoder_dict['width']
+        print(f"Using model dimensions from encoder state: {HEIGHT}x{WIDTH}")
+    except KeyError:
+        print('No "height" or "width" keys found in the encoder state_dict, using provided values!')
+        HEIGHT, WIDTH = height, width
+    
+    # Setup models
+    if teacher_mode:
+        # Teacher mode: use get_da_encoder_decoder like evaluate_depth_mda.py
+        encoder, depth_decoder = networks.get_da_encoder_decoder(encoder_name=depth_anything_encoder)
+    else:
+        # Load ablation parameters from encoder state dict (only for student mode)
+        use_cost_volume_fusion = encoder_dict.get('use_cost_volume_fusion', False)
+        cost_volume_depth_bins = encoder_dict.get('cost_volume_depth_bins', 32)
+        cost_volume_depth_min = encoder_dict.get('cost_volume_depth_min', 0.1)
+        cost_volume_depth_max = encoder_dict.get('cost_volume_depth_max', 80.0)
+        num_passes = encoder_dict.get('num_passes', 2)
+        no_temporal_fusion = encoder_dict.get('no_temporal_fusion', False)
+        
+        print(f"Loaded model configuration:")
+        print(f"  Use cost volume fusion: {use_cost_volume_fusion}")
+        print(f"  Num passes: {num_passes}")
+        print(f"  No temporal fusion: {no_temporal_fusion}")
+        
+        # Student mode uses ManyDepthAnythingEncoder and ManyDepthAnythingDecoder
+        encoder = networks.ManyDepthAnythingEncoder(encoder_name=depth_anything_encoder)
+        config = networks.MODEL_CONFIGS[depth_anything_encoder]
+        depth_decoder = networks.ManyDepthAnythingDecoder(
+            patch_h=HEIGHT // 14, patch_w=WIDTH // 14, 
+            features=config['features'], 
+            in_channels=config['in_channels'], 
+            out_channels=config['out_channels'],
+            temporal_fusion=not no_temporal_fusion,
+            use_cost_volume_fusion=use_cost_volume_fusion,
+            cost_volume_depth_bins=cost_volume_depth_bins,
+            cost_volume_depth_min=cost_volume_depth_min,
+            cost_volume_depth_max=cost_volume_depth_max,
+            num_passes=num_passes)
+        
+        # Apply LoRA modifications only for student mode
+        encoder = replace_qkv_with_mergedlinear(encoder, lora_dropout=0.0)
+        depth_decoder = replace_conv_with_loraconv(depth_decoder, lora_dropout=0.0)
+
+    # Load state dicts
+    encoder.load_state_dict(encoder_dict, strict=False)
+    depth_decoder.load_state_dict(torch.load(decoder_path, map_location=device))
+    
+    # Move to device and set to eval mode
+    encoder.eval()
+    depth_decoder.eval()
+    encoder.to(device)
+    depth_decoder.to(device)
+    
+    return encoder, depth_decoder, HEIGHT, WIDTH
+
+@torch.no_grad()
+def predict_depth_teacher(encoder, depth_decoder, input_color):
+    """Teacher mode depth prediction - monocular, single-frame
+    
+    Matches the approach in evaluate_depth_mda.py lines 196-198
+    """
+    features = encoder.get_intermediate_layers(input_color, [2, 5, 8, 11], return_class_token=True)
+    patch_h, patch_w = input_color.shape[-2] // 14, input_color.shape[-1] // 14
+    output, _ = depth_decoder(features, patch_h, patch_w)
+    
+    return output
+
+@torch.no_grad()
+def predict_depth_student(encoder, depth_decoder, input_color, lookup_frames):
+    """Student mode depth prediction - multi-frame without poses"""
+    
+    features, lookup_features = encoder(input_color, lookup_frames)
+    output, _ = depth_decoder(features, lookup_features)
+    
+    return output
+
 def infer_depth_disparity_and_pointcloud(
     target_image: Union[str, np.ndarray],
     lookup_frame: Union[str, np.ndarray],
@@ -233,11 +255,13 @@ def infer_depth_disparity_and_pointcloud(
     device: Optional[torch.device] = None,
     output_dir: Optional[str] = None,
     coordinate_system: str = "lidar",
+    teacher_mode: bool = False,
 ) -> Dict[str, Any]:
     """High-level API to run inference and optionally save outputs.
 
     - If fx and fy are provided, a point cloud is generated and optionally saved.
     - Depth and disparity are always computed and optionally saved when output_path is provided.
+    - teacher_mode: if True, runs monocular inference; if False, runs multi-frame inference
 
     Returns a dict with keys: 'disp', 'depth', 'pointcloud' (None if no fx/fy), 'paths' (if saved).
     """
@@ -253,7 +277,7 @@ def infer_depth_disparity_and_pointcloud(
         raise ValueError(f"Weights folder not found: {weights_folder}")
 
     encoder, depth_decoder, H_model, W_model = setup_models(
-        weights_folder, depth_anything_encoder, height or 0, width or 0, device
+        weights_folder, depth_anything_encoder, height or 518, width or 518, device, teacher_mode
     )
 
     HEIGHT, WIDTH = H_model, W_model
@@ -265,14 +289,20 @@ def infer_depth_disparity_and_pointcloud(
             target_color = load_image_from_array(target_image, HEIGHT, WIDTH)
         target_color = target_color.to(device)
 
-        if isinstance(lookup_frame, str):
-            lookup_color = load_image(lookup_frame, HEIGHT, WIDTH)
+        if teacher_mode:
+            # Teacher mode: monocular inference
+            output = predict_depth_teacher(encoder, depth_decoder, target_color)
         else:
-            lookup_color = load_image_from_array(lookup_frame, HEIGHT, WIDTH)
-        lookup_frames = lookup_color.unsqueeze(1).to(device)
-
-        output = predict_depth_student(encoder, depth_decoder, target_color, lookup_frames)
-        output = output.sigmoid()
+            # Student mode: multi-frame inference
+            if isinstance(lookup_frame, str):
+                lookup_color = load_image(lookup_frame, HEIGHT, WIDTH)
+            else:
+                lookup_color = load_image_from_array(lookup_frame, HEIGHT, WIDTH)
+            lookup_frames = lookup_color.unsqueeze(1).to(device)
+            output = predict_depth_student(encoder, depth_decoder, target_color, lookup_frames)
+        
+        # Use .relu() activation to match evaluate_depth_mda.py lines 228, 230
+        output = output.relu()
         pred_disp, pred_depth = disp_to_depth(output, max_depth)
 
         disp_map = pred_disp.cpu().squeeze().numpy()
@@ -326,73 +356,12 @@ def infer_depth_disparity_and_pointcloud(
             "model_input_size": (HEIGHT, WIDTH),
         }
 
-def infer_depths_for_folder(
-    input_folder: str,
-    weights_folder: str,
-    depth_anything_encoder: str = "vits",
-    min_depth: float = 0.1,
-    max_depth: float = 80.0,
-    fx: float = None,
-    fy: float = None,
-    output_dir: Optional[str] = None,
-    device: Optional[torch.device] = None,
-    extensions: Tuple[str, ...] = (".png", ".jpg", ".jpeg", ".bmp", ".webp"),
-    coordinate_system: str = "lidar",
-) -> Dict[str, Dict[str, Any]]:
-    """Process a folder of images, pairing each image with its previous one as lookup.
-
-    - Saves depth/disp for each processed image when output_dir is provided.
-    - Saves point clouds only if fx and fy are provided.
-    - Returns a dict mapping target image path to result dict (same schema as single API).
-    """
-
-    if not os.path.isdir(input_folder):
-        raise ValueError(f"Input folder not found or not a directory: {input_folder}")
-    if not os.path.exists(weights_folder):
-        raise ValueError(f"Weights folder not found: {weights_folder}")
-
-    # List and sort images
-    all_files = [os.path.join(input_folder, f) for f in os.listdir(input_folder)]
-    image_files = sorted([p for p in all_files if os.path.splitext(p)[1].lower() in extensions])
-
-    if len(image_files) < 2:
-        raise ValueError("Need at least two images in the folder to form (target, lookup) pairs")
-
-    if output_dir is not None and not os.path.exists(output_dir):
-        os.makedirs(output_dir, exist_ok=True)
-
-    results: Dict[str, Dict[str, Any]] = {}
-    # Iterate over images, pairing each with its previous one as lookup
-    for idx in range(1, len(image_files)):
-        target_path = image_files[idx]
-        lookup_path = image_files[idx - 1]
-
-        result = infer_depth_disparity_and_pointcloud(
-            target_image=target_path,
-            lookup_frame=lookup_path,
-            weights_folder=weights_folder,
-            depth_anything_encoder=depth_anything_encoder,
-            height=None,
-            width=None,
-            min_depth=min_depth,
-            max_depth=max_depth,
-            fx=fx,
-            fy=fy,
-            device=device,
-            output_dir=output_dir,
-            coordinate_system=coordinate_system,
-        )
-
-        results[target_path] = result
-
-    return results
-
 def main():
-    parser = argparse.ArgumentParser(description='Run inference and save point cloud, depth, and disparity - student mode, multi-frame, no poses')
+    parser = argparse.ArgumentParser(description='Run inference and save point cloud, depth, and disparity - supports both teacher and student modes')
     parser.add_argument('--target_image', type=str, default="kitti_data/2011_09_26/2011_09_26_drive_0001_sync/image_02/data/0000000005.png",
                         help='Path to target image (main image for depth prediction)')
     parser.add_argument('--lookup_frame', type=str, default="kitti_data/2011_09_26/2011_09_26_drive_0001_sync/image_02/data/0000000004.png",
-                        help='Path to lookup frame image for matching')
+                        help='Path to lookup frame image for matching (ignored in teacher mode)')
     parser.add_argument('--input_folder', type=str, default=None,
                         help='Folder containing images; each image is paired with the previous one as lookup')
     parser.add_argument('--output_dir', type=str, default="output_pointclouds",
@@ -408,7 +377,7 @@ def main():
                         help='Input image width (used only if not present in weights)')
     parser.add_argument('--min_depth', type=float, default=0.1,
                         help='Minimum depth for visualization / validity')
-    parser.add_argument('--max_depth', type=float, default=80,
+    parser.add_argument('--max_depth', type=float, default=400,
                         help='Maximum depth for visualization / validity')
     parser.add_argument('--fx', type=float, default=None,
                         help='Camera focal length in pixels along x (unnormalized); if provided, PLY is generated')
@@ -416,51 +385,35 @@ def main():
                         help='Camera focal length in pixels along y (unnormalized); if provided, PLY is generated')
     parser.add_argument('--coordinate_system', type=str, choices=['camera', 'lidar'], default='camera',
                         help='Coordinate frame for saved PLY: camera (Z forward) or lidar (Z up)')
+    parser.add_argument('--teacher_mode', action='store_true',
+                        help='Run in teacher mode (monocular inference) instead of student mode (multi-frame)')
     
     args = parser.parse_args()
 
-    if args.input_folder is not None:
-        results = infer_depths_for_folder(
-            input_folder=args.input_folder,
-            weights_folder=args.weights_folder,
-            depth_anything_encoder=args.depth_anything_encoder,
-            min_depth=args.min_depth,
-            max_depth=args.max_depth,
-            fx=args.fx,
-            fy=args.fy,
-            output_dir=args.output_dir,
-            device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
-            coordinate_system=args.coordinate_system,
-        )
+    result = infer_depth_disparity_and_pointcloud(
+        target_image=args.target_image,
+        lookup_frame=args.lookup_frame,
+        weights_folder=args.weights_folder,
+        depth_anything_encoder=args.depth_anything_encoder,
+        height=args.height,
+        width=args.width,
+        min_depth=args.min_depth,
+        max_depth=args.max_depth,
+        fx=args.fx,
+        fy=args.fy,
+        device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+        output_dir=args.output_dir,
+        coordinate_system=args.coordinate_system,
+        teacher_mode=args.teacher_mode,
+    )
 
-        num_items = len(results)
-        num_ply = sum(1 for r in results.values() if r["paths"]["ply"] is not None)
-        print(f"Processed {num_items} images from folder: {args.input_folder}")
-        print(f"Saved {num_ply} point clouds (fx/fy provided: {'yes' if args.fx is not None and args.fy is not None else 'no'})")
-        print(f"Outputs saved to: {args.output_dir}")
-    else:
-        result = infer_depth_disparity_and_pointcloud(
-            target_image=args.target_image,
-            lookup_frame=args.lookup_frame,
-            weights_folder=args.weights_folder,
-            depth_anything_encoder=args.depth_anything_encoder,
-            height=args.height,
-            width=args.width,
-            min_depth=args.min_depth,
-            max_depth=args.max_depth,
-            fx=args.fx,
-            fy=args.fy,
-            device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
-            output_dir=args.output_dir,
-            coordinate_system=args.coordinate_system,
-        )
-
-        if result["paths"]["depth"]:
-            print(f"Saved depth map to {result['paths']['depth']}")
-        if result["paths"]["disp"]:
-            print(f"Saved disparity map to {result['paths']['disp']}")
-        if result["paths"]["ply"]:
-            print(f"Saved point cloud with {len(result['pointcloud'].points)} points to {result['paths']['ply']}")
+    mode_str = "teacher" if args.teacher_mode else "student"
+    if result["paths"]["depth"]:
+        print(f"Saved {mode_str} depth map to {result['paths']['depth']}")
+    if result["paths"]["disp"]:
+        print(f"Saved {mode_str} disparity map to {result['paths']['disp']}")
+    if result["paths"]["ply"]:
+        print(f"Saved {mode_str} point cloud with {len(result['pointcloud'].points)} points to {result['paths']['ply']}")
 
 if __name__ == "__main__":
     main()

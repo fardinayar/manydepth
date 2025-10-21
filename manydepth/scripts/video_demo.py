@@ -243,11 +243,30 @@ def setup_models(weights_folder, depth_anything_encoder, height, width, device):
     except KeyError:
         print('No "height" or "width" keys found in the encoder state_dict, using provided values!')
         HEIGHT, WIDTH = height, width
+    
+    # Load ablation parameters from encoder state dict
+    use_cost_volume_fusion = encoder_dict.get('use_cost_volume_fusion', False)
+    cost_volume_depth_bins = encoder_dict.get('cost_volume_depth_bins', 32)
+    cost_volume_depth_min = encoder_dict.get('cost_volume_depth_min', 0.1)
+    cost_volume_depth_max = encoder_dict.get('cost_volume_depth_max', 80.0)
+    num_passes = encoder_dict.get('num_passes', 2)
+    no_temporal_fusion = encoder_dict.get('no_temporal_fusion', False)
+    
+    print(f"Loaded model configuration:")
+    print(f"  Use cost volume fusion: {use_cost_volume_fusion}")
+    print(f"  Num passes: {num_passes}")
+    print(f"  No temporal fusion: {no_temporal_fusion}")
 
     # Setup models - student mode
     encoder = networks.ManyDepthAnythingEncoder(encoder_name=depth_anything_encoder)
     depth_decoder = networks.ManyDepthAnythingDecoder(
-        matching_height=HEIGHT // 14, matching_width=WIDTH // 14)
+        patch_h=HEIGHT // 14, patch_w=WIDTH // 14,
+        temporal_fusion=not no_temporal_fusion,
+        use_cost_volume_fusion=use_cost_volume_fusion,
+        cost_volume_depth_bins=cost_volume_depth_bins,
+        cost_volume_depth_min=cost_volume_depth_min,
+        cost_volume_depth_max=cost_volume_depth_max,
+        num_passes=num_passes)
 
     encoder = replace_qkv_with_mergedlinear(encoder, lora_dropout=0.0)
     depth_decoder = replace_conv_with_loraconv(depth_decoder, lora_dropout=0.0)

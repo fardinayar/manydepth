@@ -82,6 +82,8 @@ class ManyDepthAnythingDecoder(nn.Module):
         cost_volume_depth_bins=32,
         cost_volume_depth_min=0.1,
         cost_volume_depth_max=80.0,
+        num_passes=2,
+        num_register_tokens=8,
     ):
         super(ManyDepthAnythingDecoder, self).__init__()
         self.num_ch_enc = in_channels
@@ -91,6 +93,8 @@ class ManyDepthAnythingDecoder(nn.Module):
         self.use_clstoken = use_clstoken
         self.temporal_fusion = temporal_fusion
         self.use_cost_volume_fusion = use_cost_volume_fusion
+        self.num_passes = num_passes
+        self.num_register_tokens = num_register_tokens
         
         self.projects = nn.ModuleList([
             nn.Conv2d(
@@ -145,17 +149,17 @@ class ManyDepthAnythingDecoder(nn.Module):
         if self.use_cost_volume_fusion:
             self.multi_frame_feature_fusion = nn.ModuleList([
                 CostVolumeFeatureFusion(
-                    in_channels, self.patch_h, self.patch_w,
+                    in_channels,
                     num_depth_bins=cost_volume_depth_bins,
                     depth_min=cost_volume_depth_min,
                     depth_max=cost_volume_depth_max,
                     dropout=0.2
                 )
-                for _ in range(1)
+                for _ in range(4)
             ])
         else:
             self.multi_frame_feature_fusion = nn.ModuleList([
-                MultiFrameFeatureFusion(in_channels, self.patch_h, self.patch_w, dropout=0.2, temporal_fusion=self.temporal_fusion)
+                MultiFrameFeatureFusion(in_channels, self.patch_h, self.patch_w, dropout=0.2, temporal_fusion=self.temporal_fusion, num_register_tokens=self.num_register_tokens)
                 for _ in range(1)
             ])
         
@@ -182,8 +186,10 @@ class ManyDepthAnythingDecoder(nn.Module):
         
         if self.use_cost_volume_fusion:
             # Cost volume fusion expects [B, N, C, H, W] for lookup features
-            # Reshape lookup_feats from [B, N*C, H, W] to [B, N, C, H, W]
-            num_frames = lookup_feats.shape[1] // channels
+            # Current lookup_feats is shaped [B*N, C, H, W] - reshape back to [B, N, C, H, W]
+            assert lookup_feats.shape[1] == channels, "Channel mismatch between current and lookup features"
+            assert lookup_feats.shape[0] % batch_size == 0, "Lookup features first dim must be divisible by batch size"
+            num_frames = lookup_feats.shape[0] // batch_size
             lookup_feats_reshaped = lookup_feats.view(batch_size, num_frames, channels, height, width)
             
             # Apply cost volume fusion with intrinsics
@@ -196,9 +202,13 @@ class ManyDepthAnythingDecoder(nn.Module):
             # Reshape lookup_feats
             lookup_feats_flat = lookup_feats.view(batch_size, -1, height * width)
             
-            #concatenate features along channel dim
-            fused_features = torch.cat((current_feats_flat, lookup_feats_flat), 1).permute(0,2,1)
-            output = self.multi_frame_feature_fusion[i](fused_features).permute(0,2,1)
+            # Perform multi-pass fusion based on num_passes
+            output = current_feats_flat
+            for pass_idx in range(self.num_passes):
+                # Concatenate features along channel dim
+                fused_features = torch.cat((output, lookup_feats_flat), 1).permute(0,2,1)
+                output = self.multi_frame_feature_fusion[i](fused_features).permute(0,2,1)
+
             output = output.view(batch_size, channels, height, width)
 
         return output
@@ -220,8 +230,10 @@ class ManyDepthAnythingDecoder(nn.Module):
                 
             x = x.permute(0, 2, 1).reshape((x.shape[0], x.shape[-1], self.patch_h, self.patch_w))
             lookup_feature = lookup_feature.permute(0, 2, 1).reshape((lookup_feature.shape[0], lookup_feature.shape[-1], self.patch_h, self.patch_w))
-            if i > 2:
+            if (not self.use_cost_volume_fusion):# and i == 3:
                 x = self._fuse_features_multi_frame(x, lookup_feature, 0, poses, intrinsics)
+            elif self.use_cost_volume_fusion:
+                x = self._fuse_features_multi_frame(x, lookup_feature, i, poses, intrinsics)
             x = self.projects[i](x)
             x = self.resize_layers[i](x)
             

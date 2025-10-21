@@ -15,3 +15,4 @@ Grounded-SAM-2/
 *.npy
 *.mp4
 *.ply
+splits/eigen_benchmark/gt_depths.npz

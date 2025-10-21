@@ -228,7 +228,7 @@ class MonodepthOptions:
         
         self.parser.add_argument('--fusion_lr_coef',
                                  type=float,
-                                 default=2.0,
+                                 default=4.0,
                                  help='Learning rate multiplier for feature fusion parameters')
         
         self.parser.add_argument("--g2s",
@@ -265,6 +265,18 @@ class MonodepthOptions:
                                  default=80.0,
                                  help='Maximum depth for cost volume')
         # Pose is mandatory for cost volume fusion; keep no option flag
+        
+        # Feature fusion passes
+        self.parser.add_argument('--num_passes',
+                                 type=int,
+                                 default=2,
+                                 help='Number of fusion passes for attention-based feature fusion')
+        
+        # Register tokens for attention-based fusion
+        self.parser.add_argument('--num_register_tokens',
+                                 type=int,
+                                 default=8,
+                                 help='Number of register tokens for attention sink in MultiFrameFeatureFusion')
         
     def parse(self):
         self.options = self.parser.parse_args()

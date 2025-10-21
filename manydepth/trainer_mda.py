@@ -80,9 +80,9 @@ class Trainer:
         self.models["encoder"] = networks.ManyDepthAnythingEncoder(encoder_name=self.opt.depth_anything_encoder)
         if not self.opt.no_lora:
             print("Using LoRA in the encoder")
-            self.models['encoder'] = replace_qkv_with_mergedlinear(self.models["encoder"])
-            lora.mark_only_lora_as_trainable(self.models['encoder'], bias='all')
-        
+            self.models['encoder'] = replace_qkv_with_mergedlinear(self.models["encoder"], lora_dropout=0.2)
+        lora.mark_only_lora_as_trainable(self.models['encoder'])
+
         
         self.models["encoder"].to(self.device)
 
@@ -105,7 +105,9 @@ class Trainer:
             use_cost_volume_fusion=getattr(self.opt, 'use_cost_volume_fusion', False),
             cost_volume_depth_bins=getattr(self.opt, 'cost_volume_depth_bins', 32),
             cost_volume_depth_min=getattr(self.opt, 'cost_volume_depth_min', 0.1),
-            cost_volume_depth_max=getattr(self.opt, 'cost_volume_depth_max', 80.0))
+            cost_volume_depth_max=getattr(self.opt, 'cost_volume_depth_max', 80.0),
+            num_passes=getattr(self.opt, 'num_passes', 2),
+            num_register_tokens=getattr(self.opt, 'num_register_tokens', 8))
 
         depthanything_weights = torch.load(f'checkpoints/depth_anything_v2_{self.opt.depth_anything_encoder}.pth', map_location='cpu')
         depthanything_weights_decoder = {}
@@ -119,13 +121,13 @@ class Trainer:
         
         if not self.opt.no_lora:
             print("Using LoRA in the depth decoder")
-            self.models['depth'] = replace_conv_with_loraconv(self.models["depth"])
-            lora.mark_only_lora_as_trainable(self.models['depth'], bias='all')
-            print("Enable gradient for output convolution")
-            # We need to enable gradient for output convolution to train the depth decoder, beacuse we have changed the activation function from relu to sigmoid
-            for name, param in self.models['depth'].named_parameters():
-                if 'output_conv' in name:
-                    param.requires_grad = True
+            self.models['depth'] = replace_conv_with_loraconv(self.models["depth"], lora_dropout=0.2)
+            lora.mark_only_lora_as_trainable(self.models['depth'])
+        print("Enable gradient for output convolution")
+        # We need to enable gradient for output convolution to train the depth decoder, beacuse we have changed the activation function from relu to sigmoid
+        for name, param in self.models['depth'].named_parameters():
+            if 'output_conv' in name:
+                param.requires_grad = True
             
         for name, p in self.models['depth'].named_parameters():
             if 'multi_frame_feature_fusion' in name:
@@ -216,11 +218,11 @@ class Trainer:
         img_ext = '.png' if self.opt.png else '.jpg'
 
         num_train_samples = len(train_filenames)
-        self.num_total_steps = num_train_samples // self.opt.batch_size * self.opt.num_epochs
+        self.num_total_steps = num_train_samples // self.effective_batch_size * self.opt.num_epochs
         print('Total number of steps: ', self.num_total_steps, "Total number of epochs:", self.opt.num_epochs)
         
         self.model_optimizer = optim.AdamW(self.parameters_to_train, self.opt.learning_rate)
-        self.model_lr_scheduler = optim.lr_scheduler.StepLR(self.model_optimizer, step_size= 2 * ((self.num_total_steps)) // 5, gamma=0.1)
+        self.model_lr_scheduler = optim.lr_scheduler.StepLR(self.model_optimizer, step_size= 2 * ((self.num_total_steps)) // self.opt.num_epochs, gamma=0.1)
 
         self.g2s = self.opt.g2s
 
@@ -230,7 +232,7 @@ class Trainer:
         
         if self.opt.dataset == "gopro":
             num_train_samples = len(train_dataset)
-            self.num_total_steps = num_train_samples // self.opt.batch_size * self.opt.num_epochs
+            self.num_total_steps = num_train_samples // self.effective_batch_size * self.opt.num_epochs
         
         self.train_loader = DataLoader(
             train_dataset, self.opt.batch_size, True,
@@ -240,7 +242,7 @@ class Trainer:
             self.opt.data_path, val_filenames, self.opt.height, self.opt.width,
             frames_to_load, 4, is_train=False, img_ext=img_ext, load_gps=self.g2s)
         self.val_loader = DataLoader(
-            val_dataset, self.opt.batch_size, True,
+            val_dataset, self.opt.batch_size, False,
             num_workers=self.opt.num_workers, pin_memory=True, drop_last=True)
         self.val_iter = iter(self.val_loader)
 
@@ -283,7 +285,7 @@ class Trainer:
         self.save_opts()
 
     def g2s_weight(self):
-        maximum_steps = ((2 * self.num_total_steps)) // 5
+        maximum_steps = ((2 * self.num_total_steps)) // self.opt.num_epochs
         return (self.step / maximum_steps) ** 2 if self.step <= maximum_steps else 1
 
     
@@ -354,11 +356,11 @@ class Trainer:
                     # Store gradient norm for logging
                     losses["grad_norm"] = grad_norm
                     # Log gradient norm for monitoring
-                    if batch_idx % self.opt.log_frequency == 0:
+                    if self.step % self.opt.log_frequency == 0:
                         print(f"Gradient norm (clipped): {grad_norm:.4f}")
                 else:
                     # Calculate gradient norm without clipping for monitoring
-                    if batch_idx % self.opt.log_frequency == 0:
+                    if self.step % self.opt.log_frequency == 0:
                         total_norm = 0
                         for group in self.parameters_to_train:
                             for p in group['params']:
@@ -373,46 +375,46 @@ class Trainer:
                 self.model_optimizer.zero_grad()
                 self.model_lr_scheduler.step()
                 
+                # Increment step counter only when optimizer updates
+                self.step += 1
                 
+                duration = time.time() - before_op_time
 
-            duration = time.time() - before_op_time
+                # log less frequently after the first 2000 steps to save time & disk space
+                log_step = self.step % self.opt.log_frequency == 0
 
-            # log less frequently after the first 2000 steps to save time & disk space
-            log_step = batch_idx % self.opt.log_frequency == 0
+                if log_step:
+                    # Use accumulated losses for logging
+                    avg_loss = accumulated_loss / max(accumulation_count, 1)
+                    avg_mono_loss = accumulated_mono_loss / max(accumulation_count, 1)
+                    avg_scale = accumulated_scale / max(accumulation_count, 1) if self.g2s else None
+                    
+                    if self.g2s:
+                        self.log_time(batch_idx, duration, avg_loss, avg_mono_loss, avg_scale)
+                    else:
+                        self.log_time(batch_idx, duration, avg_loss, avg_mono_loss)
 
-            if log_step:
-                # Use accumulated losses for logging
-                avg_loss = accumulated_loss / max(accumulation_count, 1)
-                avg_mono_loss = accumulated_mono_loss / max(accumulation_count, 1)
-                avg_scale = accumulated_scale / max(accumulation_count, 1) if self.g2s else None
-                
-                if self.g2s:
-                    self.log_time(batch_idx, duration, avg_loss, avg_mono_loss, avg_scale)
-                else:
-                    self.log_time(batch_idx, duration, avg_loss, avg_mono_loss)
+                    if "depth_gt" in inputs:
+                        self.compute_depth_losses(inputs, outputs, losses)
 
-                if "depth_gt" in inputs:
-                    self.compute_depth_losses(inputs, outputs, losses)
+                    # Update losses with averaged values for logging
+                    losses["loss"] = torch.tensor(avg_loss, device=losses["loss"].device)
+                    mono_losses["loss"] = torch.tensor(avg_mono_loss, device=mono_losses["loss"].device)
+                    if self.g2s and avg_scale is not None:
+                        losses["scale"] = torch.tensor(avg_scale, device=losses["scale"].device)
+                    
+                    self.log("train", inputs, outputs, losses, mono_losses)
+                    self.val()
+                    
+                # Reset accumulation variables only after logging
+                if log_step:
+                    accumulated_loss = 0.0
+                    accumulated_mono_loss = 0.0
+                    accumulated_scale = 0.0 if self.g2s else None
+                    accumulation_count = 0
 
-                # Update losses with averaged values for logging
-                losses["loss"] = torch.tensor(avg_loss, device=losses["loss"].device)
-                mono_losses["loss"] = torch.tensor(avg_mono_loss, device=mono_losses["loss"].device)
-                if self.g2s and avg_scale is not None:
-                    losses["scale"] = torch.tensor(avg_scale, device=losses["scale"].device)
-                
-                self.log("train", inputs, outputs, losses, mono_losses)
-                self.val()
-                
-            # Reset accumulation variables
-            accumulated_loss = 0.0
-            accumulated_mono_loss = 0.0
-            accumulated_scale = 0.0 if self.g2s else None
-            accumulation_count = 0
-
-            if self.opt.save_intermediate_models:
-                self.save_model(save_step=True)
-
-            self.step += 1
+                if self.opt.save_intermediate_models:
+                    self.save_model(save_step=True)
 
     def process_batch(self, inputs, is_train=False):
         """Pass a minibatch through the network and generate images and losses
@@ -707,10 +709,12 @@ class Trainer:
             # find minimum losses from [reprojection, identity]
             reprojection_loss_mask = self.compute_loss_masks(reprojection_loss,
                                                              identity_reprojection_loss)
-            
+                        
             
             reprojection_loss = reprojection_loss * reprojection_loss_mask 
             reprojection_loss = reprojection_loss.sum() / (reprojection_loss_mask.sum() + 1e-7)
+            
+
 
 
             # consistency loss:
@@ -969,9 +973,15 @@ class Trainer:
             save_path = os.path.join(save_folder, "{}.pth".format(model_name))
             to_save = model.state_dict()
             if model_name == 'encoder':
-                # save the sizes - these are needed at prediction time
+                # save the sizes and ablation parameters - these are needed at prediction time
                 to_save['height'] = self.opt.height
                 to_save['width'] = self.opt.width
+                to_save['use_cost_volume_fusion'] = getattr(self.opt, 'use_cost_volume_fusion', False)
+                to_save['cost_volume_depth_bins'] = getattr(self.opt, 'cost_volume_depth_bins', 32)
+                to_save['cost_volume_depth_min'] = getattr(self.opt, 'cost_volume_depth_min', 0.1)
+                to_save['cost_volume_depth_max'] = getattr(self.opt, 'cost_volume_depth_max', 80.0)
+                to_save['num_passes'] = getattr(self.opt, 'num_passes', 2)
+                to_save['no_temporal_fusion'] = self.opt.no_temporal_fusion
 
             torch.save(to_save, save_path)
 

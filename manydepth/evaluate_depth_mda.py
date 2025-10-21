@@ -105,6 +105,22 @@ def evaluate(opt):
             print('No "height" or "width" keys found in the encoder state_dict, resorting to '
                   'using command line values!')
             HEIGHT, WIDTH = opt.height, opt.width
+        
+        # Load ablation parameters from encoder state dict
+        use_cost_volume_fusion = encoder_dict.get('use_cost_volume_fusion', getattr(opt, 'use_cost_volume_fusion', False))
+        cost_volume_depth_bins = encoder_dict.get('cost_volume_depth_bins', getattr(opt, 'cost_volume_depth_bins', 32))
+        cost_volume_depth_min = encoder_dict.get('cost_volume_depth_min', getattr(opt, 'cost_volume_depth_min', 0.1))
+        cost_volume_depth_max = encoder_dict.get('cost_volume_depth_max', getattr(opt, 'cost_volume_depth_max', 80.0))
+        num_passes = encoder_dict.get('num_passes', getattr(opt, 'num_passes', 2))
+        no_temporal_fusion = encoder_dict.get('no_temporal_fusion', getattr(opt, 'no_temporal_fusion', False))
+        
+        print(f"Loaded model configuration:")
+        print(f"  Height x Width: {HEIGHT} x {WIDTH}")
+        print(f"  Use cost volume fusion: {use_cost_volume_fusion}")
+        print(f"  Cost volume depth bins: {cost_volume_depth_bins}")
+        print(f"  Cost volume depth range: [{cost_volume_depth_min}, {cost_volume_depth_max}]")
+        print(f"  Num passes: {num_passes}")
+        print(f"  No temporal fusion: {no_temporal_fusion}")
 
         if opt.eval_split == 'cityscapes':
             dataset = datasets.CityscapesEvalDataset(opt.data_path, filenames,
@@ -145,11 +161,13 @@ def evaluate(opt):
             encoder = networks.ManyDepthAnythingEncoder(encoder_name=opt.depth_anything_encoder)
             config = networks.MODEL_CONFIGS[opt.depth_anything_encoder]
             depth_decoder = networks.ManyDepthAnythingDecoder(
-                patch_h=opt.height // 14, patch_w=opt.width //14, features=config['features'], in_channels=config['in_channels'], out_channels=config['out_channels'], temporal_fusion=not opt.no_temporal_fusion,
-                use_cost_volume_fusion=getattr(opt, 'use_cost_volume_fusion', False),
-                cost_volume_depth_bins=getattr(opt, 'cost_volume_depth_bins', 32),
-                cost_volume_depth_min=getattr(opt, 'cost_volume_depth_min', 0.1),
-                cost_volume_depth_max=getattr(opt, 'cost_volume_depth_max', 80.0))
+                patch_h=opt.height // 14, patch_w=opt.width //14, features=config['features'], in_channels=config['in_channels'], out_channels=config['out_channels'], temporal_fusion=not no_temporal_fusion,
+                use_cost_volume_fusion=use_cost_volume_fusion,
+                cost_volume_depth_bins=cost_volume_depth_bins,
+                cost_volume_depth_min=cost_volume_depth_min,
+                cost_volume_depth_max=cost_volume_depth_max,
+                num_register_tokens=getattr(opt, 'num_register_tokens', 8),
+                num_passes=num_passes)
             
             if not opt.no_lora:
                 encoder = replace_qkv_with_mergedlinear(encoder,lora_dropout=0.0)
@@ -190,7 +208,7 @@ def evaluate(opt):
                     patch_h, patch_w = input_color.shape[-2] // 14, input_color.shape[-1] // 14
                     
                     # Handle poses and intrinsics for cost volume fusion (pose required)
-                    if getattr(opt, 'use_cost_volume_fusion', False):
+                    if use_cost_volume_fusion:
                         # Compute poses for evaluation
                         pose_inputs = [pose_enc(torch.cat([input_color, lookup_frames[:, 0]], 1))]
                         axisangle, translation = pose_dec(pose_inputs)
@@ -349,8 +367,9 @@ def evaluate(opt):
         
     if opt.save_pred_disps:
         print("saving errors")
-        if opt.zero_cost_volume:
-            tag = "mono"
+
+        if opt.eval_teacher:
+            tag = "teacher"
         else:
             tag = "multi"
         output_path = os.path.join(
