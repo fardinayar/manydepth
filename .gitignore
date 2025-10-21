@@ -16,3 +16,4 @@ Grounded-SAM-2/
 *.mp4
 *.ply
 splits/eigen_benchmark/gt_depths.npz
+splits/eigen_benchmark/gt_depths.npz
