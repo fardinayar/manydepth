@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -6,13 +7,65 @@ import numpy as np
 
 
 class MultiFrameFeatureFusion(nn.Module):
-    def __init__(self, input_dim, matching_height, matching_width, 
-                 num_heads=4, dropout=0.1, drop_path=0.0,
-                 neighborhood_size=(3, 15),  # (height, width) for non-square neighborhoods
-                 temporal_fusion=True,
-                 num_register_tokens=8):  # Add register tokens for attention sink
+    """
+    Multi-frame attention block for fusing *current* and *lookup/previous*
+    frame features on a flattened H×W grid.
+
+    This module:
+        - treats the current frame features as **queries** (`x1`)
+        - optionally attends over both previous and current frame features
+          (`x2`, `x1`) for temporal fusion
+        - restricts attention to a configurable **spatial neighborhood**
+        - adds a learnable **relative positional bias** per head
+        - supports per-scale **LoRA adapters** for lightweight fine-tuning
+        - can append learnable **register tokens** that act as attention sinks.
+
+    Args:
+        input_dim: Channel dimension of each frame feature map.
+        matching_height: Spatial height of the flattened feature grid (H).
+        matching_width: Spatial width of the flattened feature grid (W).
+        num_heads: Number of attention heads.
+        dropout: Dropout probability applied to attention weights and FFN.
+        drop_path: Stochastic depth probability for residual branches.
+        neighborhood_size:
+            - `(h, w)` tuple → rectangular neighborhood.
+            - `int`          → square neighborhood, `h = w`.
+            - `None`         → global attention (no spatial restriction).
+        temporal_fusion: If `True`, keys/values come from both previous and
+            current frame; otherwise standard self-attention on current frame.
+        num_register_tokens: Number of extra learnable register tokens.
+        num_scales: Number of pyramid scales supported by separate LoRA heads.
+        lora_rank: Rank of LoRA adapters. `0` or `None` disables LoRA.
+        lora_alpha: LoRA scaling factor.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        matching_height: int,
+        matching_width: int,
+        num_heads: int = 8,
+        dropout: float = 0.1,
+        drop_path: float = 0.0,
+        neighborhood_size=(3, 15),
+        temporal_fusion: bool = True,
+        num_register_tokens: int = 8,
+                 num_scales: int = 4,
+                 lora_rank: int = 64,
+        lora_alpha: float = 1,
+    ):
         super().__init__()
-        assert isinstance(neighborhood_size, tuple)
+
+        # Allow tuple[int, int], int (square), or None for global attention.
+        if not (
+            neighborhood_size is None
+            or isinstance(neighborhood_size, int)
+            or isinstance(neighborhood_size, tuple)
+        ):
+            raise TypeError(
+                f"neighborhood_size must be tuple[int, int] | int | None, "
+                f"got {type(neighborhood_size)}"
+            )
         self.input_dim = input_dim
         self.matching_height = matching_height
         self.matching_width = matching_width
@@ -21,14 +74,26 @@ class MultiFrameFeatureFusion(nn.Module):
         self.neighborhood_size = neighborhood_size  # (height, width) for non-square neighborhoods, None for global attention
         self.drop_path = drop_path
         self.num_register_tokens = num_register_tokens
+        self.num_scales = int(num_scales)
 
-        # Use PyTorch's built-in MultiheadAttention
-        self.multihead_attention = nn.MultiheadAttention(
-            embed_dim=input_dim,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True  # Use batch_first=True for easier handling
+        # LoRA config (optional)
+        self.lora_rank = int(lora_rank) if (lora_rank is not None and int(lora_rank) > 0) else None
+        self.lora_alpha = float(lora_alpha) if (lora_alpha is not None) else None
+
+        # ---------------- Attention projections (custom MHA with relative bias) ----------------
+        self.q_proj = nn.Linear(input_dim, input_dim)
+        self.k_proj = nn.Linear(input_dim, input_dim)
+        self.v_proj = nn.Linear(input_dim, input_dim)
+        self.out_proj = nn.Linear(input_dim, input_dim)
+        self.attn_dropout = nn.Dropout(dropout)
+
+        # ---------------- Positional encodings (temporal only) ----------------
+        # Temporal: two learnable embeddings for "lookup/previous" and "current" frame.
+        # Broadcast over all spatial locations: [2, 1, 1, C] -> [B, N, C] via broadcasting.
+        self.temporal_pos_encoding = nn.Parameter(
+            torch.zeros(2, 1, 1, self.input_dim)
         )
+        nn.init.normal_(self.temporal_pos_encoding, mean=0.0, std=0.02)
         
         # Register tokens: learnable tokens that act as attention sinks
         # Initialize with small random values
@@ -37,19 +102,55 @@ class MultiFrameFeatureFusion(nn.Module):
         else:
             self.register_tokens = None
         
+        # ---------------- LoRA adapters (per-scale, optional) ----------------
+        # We keep base model weights shared. For each scale, maintain separate low-rank adapters
+        # that add learned deltas before attention and for each FFN layer.
+        if self.lora_rank is not None:
+            # Define lightweight adapter module inline
+            class _LoRAAdapter(nn.Module):
+                def __init__(self, in_dim: int, out_dim: int, rank: int, alpha: float):
+                    super().__init__()
+                    self.down = nn.Linear(in_dim, rank, bias=False)
+                    self.up = nn.Linear(rank, out_dim, bias=False)
+                    self.scaling = (alpha / float(rank)) if (alpha is not None) else (1.0 / float(rank))
 
-        
+                    # Init following LoRA convention: down with kaiming, up with zeros so starts as no-op
+                    nn.init.kaiming_uniform_(self.down.weight, a=np.sqrt(5))
+                    nn.init.zeros_(self.up.weight)
+
+                def forward(self, x: torch.Tensor) -> torch.Tensor:
+                    return self.up(self.down(x)) * self.scaling
+
+            # Pre-attention LoRA (dim -> dim)
+            self.lora_pre_attn = nn.ModuleList([
+                _LoRAAdapter(input_dim, input_dim, self.lora_rank, self.lora_alpha)
+                for _ in range(self.num_scales)
+            ])
+
+            # FFN per-layer LoRA
+            hidden_dim = input_dim * 2
+            self.lora_ffn1 = nn.ModuleList([
+                _LoRAAdapter(input_dim, hidden_dim, self.lora_rank, self.lora_alpha)
+                for _ in range(self.num_scales)
+            ])
+            self.lora_ffn2 = nn.ModuleList([
+                _LoRAAdapter(hidden_dim, input_dim, self.lora_rank, self.lora_alpha)
+                for _ in range(self.num_scales)
+            ])
+        else:
+            self.lora_pre_attn = None
+            self.lora_ffn1 = None
+            self.lora_ffn2 = None
+
         # Pre-LN: normalize before attention and before feed-forward
         self.attn_norm = nn.LayerNorm(input_dim)
         #self.attn_norm_prev = nn.LayerNorm(input_dim)
         self.ffn_norm = nn.LayerNorm(input_dim)
-        
-        self.feed_forward = nn.Sequential(
-            nn.Linear(input_dim, input_dim * 2),
-                nn.GELU(),
-                nn.Linear(input_dim * 2, input_dim),
-            nn.Dropout(dropout)
-        )
+        # Explicit FFN layers to allow per-layer LoRA injection
+        self.ffn_fc1 = nn.Linear(input_dim, input_dim * 2)
+        self.ffn_act = nn.GELU()
+        self.ffn_fc2 = nn.Linear(input_dim * 2, input_dim)
+        self.ffn_dropout = nn.Dropout(dropout)
         
         # DropPath modules for stochastic depth
         self.drop_path_attn = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
@@ -65,8 +166,180 @@ class MultiFrameFeatureFusion(nn.Module):
             self.register_buffer("attn_mask", _mask, persistent=False)
         else:
             self.attn_mask = None
-        
 
+        # ---------------- Relative positional bias (spatial, query-centric) ----------------
+        # For each head, learn a bias as a function of relative (dh, dw) within the
+        # neighborhood. Each query location treats itself as (0,0); neighbors are
+        # indexed by their offset.
+
+        if isinstance(self.neighborhood_size, int):
+            neighborhood_height = neighborhood_width = self.neighborhood_size
+        elif self.neighborhood_size is None:
+            # Global attention: allow full height/width as neighborhood for bias
+            neighborhood_height, neighborhood_width = self.matching_height, self.matching_width
+        else:
+            neighborhood_height, neighborhood_width = self.neighborhood_size
+
+        # Clamp neighborhood to valid extents
+        self.neighborhood_height = min(neighborhood_height, self.matching_height)
+        self.neighborhood_width = min(neighborhood_width, self.matching_width)
+
+        self._build_relative_position_indices(
+            self.matching_height,
+            self.matching_width,
+            self.neighborhood_height,
+            self.neighborhood_width,
+        )
+
+        # Learnable table of relative biases per head and per (dh, dw)
+        num_rel_h = 2 * self.neighborhood_height - 1
+        num_rel_w = 2 * self.neighborhood_width - 1
+        self.relative_position_bias_table = nn.Parameter(
+            torch.zeros(self.num_heads, num_rel_h, num_rel_w)
+        )
+        nn.init.trunc_normal_(self.relative_position_bias_table, std=0.02)
+        
+    # ----------------------------------------------------------------------
+    # Positional encoding helpers (sine-cosine for potential reuse)
+    # ----------------------------------------------------------------------
+    @staticmethod
+    def _build_1d_sincos_position_embedding(length: int, dim: int) -> torch.Tensor:
+        """Standard 1D sine–cosine positional encoding.
+
+        Args:
+            length: Sequence length (e.g. H or W).
+            dim: Embedding dimension.
+
+        Returns:
+            Tensor of shape ``[length, dim]``.
+        """
+        position = torch.arange(length, dtype=torch.float32).unsqueeze(1)  # [L, 1]
+        div_term = torch.exp(
+            torch.arange(0, dim, 2, dtype=torch.float32)
+            * (-math.log(10000.0) / max(dim, 1))
+        )  # [dim/2]
+        pe = torch.zeros(length, dim, dtype=torch.float32)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        return pe
+
+    def _build_2d_sincos_position_embedding(
+        self,
+        height: int,
+        width: int,
+        dim: int,
+    ) -> torch.Tensor:
+        """
+        2D sine-cosine positional encoding over an HxW grid.
+
+        Kept for potential reuse elsewhere, but MultiFrameFeatureFusion
+        now uses a relative positional bias instead of absolute encodings.
+
+        Returns:
+            Tensor of shape ``[1, H*W, dim]``.
+        """
+        # Split channels between vertical and horizontal components
+        dim_h = dim // 2
+        dim_w = dim - dim_h
+
+        pe_h = self._build_1d_sincos_position_embedding(height, dim_h)  # [H, dim_h]
+        pe_w = self._build_1d_sincos_position_embedding(width, dim_w)   # [W, dim_w]
+
+        # Combine to 2D grid
+        # [H, 1, dim_h] + [1, W, dim_w] -> [H, W, dim]
+        pe_h = pe_h[:, None, :].expand(height, width, dim_h)
+        pe_w = pe_w[None, :, :].expand(height, width, dim_w)
+        pe_2d = torch.cat([pe_h, pe_w], dim=-1)  # [H, W, dim]
+        pe_2d = pe_2d.reshape(1, height * width, dim)  # [1, H*W, dim]
+        return pe_2d
+
+    # ----------------------------------------------------------------------
+    # Relative positional bias helpers
+    # ----------------------------------------------------------------------
+    def _build_relative_position_indices(
+        self,
+        height: int,
+        width: int,
+        neighborhood_height: int,
+        neighborhood_width: int,
+    ) -> None:
+        """
+        Precompute relative index maps for all query/key spatial positions.
+
+        For a query at (h_q, w_q) and key at (h_k, w_k), we compute:
+            dh = h_k - h_q
+            dw = w_k - w_q
+        Then clamp dh, dw into [-neighborhood_height+1, neighborhood_height-1]
+        and [-neighborhood_width+1, neighborhood_width-1], and map them to
+        table indices in [0, 2*H-2] and [0, 2*W-2].
+
+        These indices are shared across all heads and batches.
+        """
+        total_positions = height * width
+        rel_pos_h = torch.zeros(total_positions, total_positions, dtype=torch.long)
+        rel_pos_w = torch.zeros(total_positions, total_positions, dtype=torch.long)
+
+        max_dh = neighborhood_height - 1
+        max_dw = neighborhood_width - 1
+
+        for h_q in range(height):
+            for w_q in range(width):
+                q_idx = h_q * width + w_q
+                for h_k in range(height):
+                    for w_k in range(width):
+                        k_idx = h_k * width + w_k
+                        dh = h_k - h_q
+                        dw = w_k - w_q
+                        # Clamp to the allowed neighborhood range for the bias
+                        dh = max(-max_dh, min(max_dh, dh))
+                        dw = max(-max_dw, min(max_dw, dw))
+                        rel_pos_h[q_idx, k_idx] = dh + max_dh
+                        rel_pos_w[q_idx, k_idx] = dw + max_dw
+
+        self.register_buffer("rel_pos_h_idx", rel_pos_h, persistent=False)
+        self.register_buffer("rel_pos_w_idx", rel_pos_w, persistent=False)
+
+    def _get_relative_position_bias(
+        self,
+        num_keys_spatial: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """
+        Build the relative positional bias tensor for the current attention.
+
+        Args:
+            num_keys_spatial:
+                Number of spatial key positions **before** temporal duplication
+                or register tokens. This is ``N`` when ``temporal_fusion`` is
+                ``False``, and ``2N`` when it is ``True``.
+
+        Returns:
+            bias:
+                Tensor of shape
+                ``[1, num_heads, N_queries, num_keys_spatial]``.
+        """
+        # Base bias over the H*W spatial grid: [num_heads, N, N]
+        bias_spatial = self.relative_position_bias_table[
+            :, self.rel_pos_h_idx, self.rel_pos_w_idx
+        ]  # [num_heads, N, N]
+
+        # Queries are always exactly N spatial tokens (no registers as queries)
+        # Keys may be N (no temporal fusion) or 2N (prev + curr).
+        if num_keys_spatial == bias_spatial.shape[-1]:
+            bias = bias_spatial
+        elif num_keys_spatial == 2 * bias_spatial.shape[-1]:
+            # Temporal fusion: duplicate bias for prev and current halves
+            bias = torch.cat([bias_spatial, bias_spatial], dim=-1)
+        else:
+            raise ValueError(
+                f"Unexpected num_keys_spatial={num_keys_spatial}, "
+                f"expected N={bias_spatial.shape[-1]} or 2N."
+            )
+
+        # Add batch dimension and ensure correct device/dtype
+        bias = bias.unsqueeze(0)  # [1, num_heads, N, num_keys_spatial]
+        return bias.to(device=device, dtype=dtype)
 
     def create_neighborhood_mask(self, height, width, neighborhood_size):
         """
@@ -79,7 +352,10 @@ class MultiFrameFeatureFusion(nn.Module):
                               or single int for backward compatibility (creates square neighborhood)
             
         Returns:
-            mask: [height*width, height*width] boolean mask where True means MASKED (not attend)
+            mask:
+                Boolean tensor of shape ``[height*width, height*width]`` where
+                ``True`` means *masked* (cannot attend) and ``False`` means
+                the position is allowed.
         """
         if neighborhood_size is None:
             return None
@@ -114,41 +390,84 @@ class MultiFrameFeatureFusion(nn.Module):
                         mask[query_idx, neighbor_idx] = False        
         return mask
 
-    def forward(self, input):
+    def forward(self, input, scale_index: int = None):
         """
-        input: (B, N, input_dim*2) where N = matching_height * matching_width
-        x1 and x2 are expected to be of shape (B, N, input_dim)
-        Only x1 gets updated, attending to both x1 and x2
-        """
-        x1, x2 = input[:, :, :self.input_dim], input[:, :, self.input_dim:]
-        b, n, _ = x1.shape
+        Forward pass of the fusion block.
 
+        Args:
+            input:
+                Concatenated current and lookup features of shape
+                ``[B, N, 2 * input_dim]`` where
+                ``N = matching_height * matching_width``.
+                The first ``input_dim`` channels correspond to the **current**
+                frame (`x1`), and the remaining ``input_dim`` channels to the
+                **lookup / previous** frame (`x2`).
+            scale_index:
+                Optional index in ``[0, num_scales)`` used to select which
+                LoRA adapters to apply. If ``None``, index ``0`` is used.
+
+        Returns:
+            Tensor of shape ``[B, N, input_dim]`` with updated current-frame
+            features.
+        """
+        # Alias to avoid shadowing Python's built-in ``input`` in tooling.
+        x_all = input
+        x1 = x_all[:, :, : self.input_dim]
+        x2 = x_all[:, :, self.input_dim :]
+        
+        b, n, _ = x1.shape
         
         # Verify spatial dimensions
         assert n == self.matching_height * self.matching_width, f"Expected N={self.matching_height * self.matching_width}, got N={n}"
-        
-        
-        # Pre-LN Attention
-        q = self.attn_norm(x1)
+
+        # Optionally apply scale-specific LoRA adapter before attention
+        if self.lora_pre_attn is not None:
+            idx = 0 if (scale_index is None) else int(scale_index)
+            if not (0 <= idx < self.num_scales):
+                raise ValueError(f"scale_index {idx} out of range [0,{self.num_scales-1}]")
+            x1 = x1 + self.lora_pre_attn[idx](x1)
+
+        # Pre-LN Attention with temporal encodings
         if self.temporal_fusion:
-            k_prev = self.attn_norm(x2)
-            v_prev = self.attn_norm(x2)
-            #k = self.attn_norm(x1)
-            #v = self.attn_norm(x1)
-            k = k_prev#torch.cat((k_prev, k), 1)
-            v = v_prev#torch.cat((v_prev, v), 1)
-            # attn_mask = (
-            #     torch.cat((self.attn_mask, self.attn_mask), 1)
-            #     if self.attn_mask is not None
-            #     else None
-            # )
-            attn_mask = self.attn_mask
+            # Temporal embeddings: index 0 -> lookup/previous, 1 -> current
+            t_prev = self.temporal_pos_encoding[0].to(dtype=x1.dtype, device=x1.device)
+            t_curr = self.temporal_pos_encoding[1].to(dtype=x1.dtype, device=x1.device)
+
+            q = self.attn_norm(x1 + t_curr)
+
+            # Previous-frame keys/values
+            k_prev = self.attn_norm(x2 + t_prev)
+            v_prev = self.attn_norm(x2 + t_prev)
+
+            # Current-frame keys/values (self-attention component)
+            k_curr = self.attn_norm(x1 + t_curr)
+            v_curr = self.attn_norm(x1 + t_curr)
+
+            # Concatenate temporal and current features along sequence dim
+            k = torch.cat((k_prev, k_curr), dim=1)
+            v = torch.cat((v_prev, v_curr), dim=1)
+
+            # Extend the spatial neighborhood mask to cover both temporal and
+            # current features. Each query keeps the same neighborhood pattern
+            # for both halves of the key sequence.
+            attn_mask = (
+                torch.cat((self.attn_mask, self.attn_mask), dim=1)
+                if self.attn_mask is not None
+                else None
+            )
         else:
+            q = self.attn_norm(x1)
             k = self.attn_norm(x1)
             v = self.attn_norm(x1)
             attn_mask = self.attn_mask
 
         # Concatenate register tokens to keys and values
+        rel_pos_bias = self._get_relative_position_bias(
+            num_keys_spatial=k.shape[1],
+            device=q.device,
+            dtype=q.dtype,
+        )
+
         if self.register_tokens is not None:
             register_tokens_expanded = self.register_tokens.expand(b, -1, -1)  # [B, num_reg, C]
             k = torch.cat([k, register_tokens_expanded], dim=1)  # [B, N+num_reg, C]
@@ -162,20 +481,90 @@ class MultiFrameFeatureFusion(nn.Module):
                 register_mask = torch.zeros(num_queries, self.num_register_tokens, 
                                            dtype=attn_mask.dtype, device=attn_mask.device)
                 attn_mask = torch.cat([attn_mask, register_mask], dim=1)
+            # Extend relative positional bias with zeros for register tokens
+            zeros_reg_bias = torch.zeros(
+                1,
+                self.num_heads,
+                n,
+                self.num_register_tokens,
+                dtype=rel_pos_bias.dtype,
+                device=rel_pos_bias.device,
+            )
+            rel_pos_bias = torch.cat([rel_pos_bias, zeros_reg_bias], dim=-1)
 
-        attn_output, _ = self.multihead_attention(
-            query=q,                  # [B, N, input_dim]
-            key=k,          # [B, N+num_reg, input_dim] (or 2*N+num_reg with temporal)
-            value=v,             # [B, N+num_reg, input_dim]
-            attn_mask=attn_mask,      # [N, N+num_reg] or None
-            need_weights=False
-        )
-        # Note: register tokens are automatically handled - they only affect attention computation
-        # The output shape is [B, N, input_dim] (queries determine output length)
+        # Convert boolean attn_mask (N, N_k) to additive mask [1,1,N,N_k]
+        if attn_mask is not None:
+            # Keep mask as bool for clarity: True = masked, False = allowed.
+            attn_mask_bool = attn_mask.to(device=q.device, dtype=torch.bool)
+            attn_mask_float = torch.zeros(
+                1,
+                1,
+                attn_mask_bool.shape[0],
+                attn_mask_bool.shape[1],
+                device=q.device,
+                dtype=q.dtype,
+            )
+            # Large negative where mask is True so those entries are removed
+            # by the softmax.
+            attn_mask_float = attn_mask_float.masked_fill(
+                attn_mask_bool.unsqueeze(0).unsqueeze(1),
+                float("-inf"),
+            )
+        else:
+            attn_mask_float = None
+
+        # ---------------- Custom multi-head attention with relative bias ----------------
+        head_dim = self.input_dim // self.num_heads
+        if head_dim * self.num_heads != self.input_dim:
+            raise ValueError("input_dim must be divisible by num_heads.")
+
+        # Project to Q, K, V
+        q_proj = self.q_proj(q)  # [B, N, C]
+        k_proj = self.k_proj(k)  # [B, Nk, C]
+        v_proj = self.v_proj(v)  # [B, Nk, C]
+
+        # Reshape to [B, num_heads, N, head_dim]
+        q_proj = q_proj.view(b, n, self.num_heads, head_dim).transpose(1, 2)
+        k_proj = k_proj.view(b, k.shape[1], self.num_heads, head_dim).transpose(1, 2)
+        v_proj = v_proj.view(b, k.shape[1], self.num_heads, head_dim).transpose(1, 2)
+
+        # Scaled dot-product attention scores
+        attn_scores = torch.matmul(q_proj, k_proj.transpose(-2, -1))  # [B, H, N, Nk]
+        attn_scores = attn_scores / math.sqrt(head_dim)
+
+        # Add relative positional bias (broadcast over batch)
+        attn_scores = attn_scores + rel_pos_bias
+
+        # Add attention mask if present
+        if attn_mask_float is not None:
+            attn_scores = attn_scores + attn_mask_float
+
+        attn_weights = F.softmax(attn_scores, dim=-1)
+        attn_weights = self.attn_dropout(attn_weights)
+
+        # Attention output
+        attn_output = torch.matmul(attn_weights, v_proj)  # [B, H, N, head_dim]
+        attn_output = attn_output.transpose(1, 2).contiguous().view(b, n, self.input_dim)
+        attn_output = self.out_proj(attn_output)
+
+        # Residual connection
         x = x1 + self.drop_path_attn(attn_output)
         
-        # Pre-LN Feed-forward
-        x1_final = x + self.drop_path_ffn(self.feed_forward(self.ffn_norm(x)))
+        # Pre-LN Feed-forward with per-layer LoRA
+        y = self.ffn_norm(x)
+        y1 = self.ffn_fc1(y)
+        if self.lora_ffn1 is not None:
+            idx = 0 if (scale_index is None) else int(scale_index)
+            if not (0 <= idx < self.num_scales):
+                raise ValueError(f"scale_index {idx} out of range [0,{self.num_scales-1}]")
+            y1 = y1 + self.lora_ffn1[idx](y)
+        y1 = self.ffn_act(y1)
+        y2 = self.ffn_fc2(y1)
+        if self.lora_ffn2 is not None:
+            idx = 0 if (scale_index is None) else int(scale_index)
+            y2 = y2 + self.lora_ffn2[idx](y1)
+        y2 = self.ffn_dropout(y2)
+        x1_final = x + self.drop_path_ffn(y2)
         
         return x1_final
 

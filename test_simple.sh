@@ -1,7 +1,7 @@
 DATA_PERCENTS=(1 5 10 20 50)
 
 for PERCENT in "${DATA_PERCENTS[@]}"; do
-     CUDA_VISIBLE_DEVICES=1 python manydepth/train.py \
+     CUDA_VISIBLE_DEVICES=0 python manydepth/train.py \
         --data_path kitti_data/ \
         --png \
         --g2s \

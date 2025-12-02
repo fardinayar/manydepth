@@ -14,6 +14,7 @@ import time
 import random
 import math
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
@@ -80,7 +81,7 @@ class Trainer:
         self.models["encoder"] = networks.ManyDepthAnythingEncoder(encoder_name=self.opt.depth_anything_encoder)
         if not self.opt.no_lora:
             print("Using LoRA in the encoder")
-            self.models['encoder'] = replace_qkv_with_mergedlinear(self.models["encoder"], lora_dropout=0.2)
+            self.models['encoder'] = replace_qkv_with_mergedlinear(self.models["encoder"], lora_dropout=0.4)
         lora.mark_only_lora_as_trainable(self.models['encoder'])
 
         
@@ -121,7 +122,7 @@ class Trainer:
         
         if not self.opt.no_lora:
             print("Using LoRA in the depth decoder")
-            self.models['depth'] = replace_conv_with_loraconv(self.models["depth"], lora_dropout=0.2)
+            self.models['depth'] = replace_conv_with_loraconv(self.models["depth"], lora_dropout=0.4)
             lora.mark_only_lora_as_trainable(self.models['depth'])
         print("Enable gradient for output convolution")
         # We need to enable gradient for output convolution to train the depth decoder, beacuse we have changed the activation function from relu to sigmoid
@@ -224,6 +225,16 @@ class Trainer:
         self.model_optimizer = optim.AdamW(self.parameters_to_train, self.opt.learning_rate)
         self.model_lr_scheduler = optim.lr_scheduler.StepLR(self.model_optimizer, step_size= 2 * ((self.num_total_steps)) // self.opt.num_epochs, gamma=0.1)
 
+        # Warmup configuration
+        self.warmup_steps = self.opt.warmup_steps
+        # Store base learning rates for each param group for warmup
+        self.base_lrs = [group['lr'] for group in self.model_optimizer.param_groups]
+        if self.warmup_steps > 0:
+            print(f"Using learning rate warmup for {self.warmup_steps} steps")
+            # Start with very small learning rate
+            for param_group in self.model_optimizer.param_groups:
+                param_group['lr'] = param_group['lr'] * 1e-6
+        
         self.g2s = self.opt.g2s
 
         train_dataset = self.dataset(
@@ -288,6 +299,14 @@ class Trainer:
         maximum_steps = ((2 * self.num_total_steps)) // self.opt.num_epochs
         return (self.step / maximum_steps) ** 2 if self.step <= maximum_steps else 1
 
+    def get_warmup_factor(self):
+        """Calculate warmup factor for learning rate
+        Returns a factor between 0 and 1 based on current step
+        """
+        if self.warmup_steps <= 0 or self.step >= self.warmup_steps:
+            return 1.0
+        return float(self.step) / float(self.warmup_steps)
+
     
 
     def set_train(self):
@@ -349,8 +368,14 @@ class Trainer:
             if (batch_idx + 1) % self.gradient_accumulation_steps == 0:
                 # Apply gradient clipping if enabled (max_grad_norm > 0)
                 if self.opt.max_grad_norm > 0:
+                    params = [
+                        p
+                        for group in self.model_optimizer.param_groups
+                        for p in group['params']
+                        if p.requires_grad
+                    ]
                     grad_norm = torch.nn.utils.clip_grad_norm_(
-                        [p for group in self.parameters_to_train for p in group['params']], 
+                        params,
                         self.opt.max_grad_norm
                     )
                     # Store gradient norm for logging
@@ -373,10 +398,19 @@ class Trainer:
                 
                 self.model_optimizer.step()
                 self.model_optimizer.zero_grad()
-                self.model_lr_scheduler.step()
                 
                 # Increment step counter only when optimizer updates
                 self.step += 1
+                
+                # Apply warmup or regular scheduler
+                if self.warmup_steps > 0 and self.step <= self.warmup_steps:
+                    # During warmup: linearly increase LR from near-zero to base LR
+                    warmup_factor = self.get_warmup_factor()
+                    for i, param_group in enumerate(self.model_optimizer.param_groups):
+                        param_group['lr'] = self.base_lrs[i] * warmup_factor
+                else:
+                    # After warmup: use the regular scheduler
+                    self.model_lr_scheduler.step()
                 
                 duration = time.time() - before_op_time
 
@@ -707,13 +741,59 @@ class Trainer:
                     identity_reprojection_loss += torch.randn(identity_reprojection_loss.shape).to(self.device) * 0.00001
 
             # find minimum losses from [reprojection, identity]
-            reprojection_loss_mask = self.compute_loss_masks(reprojection_loss,
-                                                             identity_reprojection_loss)
+            reprojection_loss_mask = self.compute_loss_masks(
+                reprojection_loss,
+                identity_reprojection_loss,
+            )
+
+            # ------------------------------------------------------------------
+            # Optionally ignore the highest-loss pixels (e.g. top 20%) among the
+            # already valid pixels, and visualize which pixels were ignored.
+            # ------------------------------------------------------------------
+            top_percent = 0.20  # ignore top 30% highest-loss pixels per frame
+
+            valid = reprojection_loss_mask > 0
+            ignored_high_loss_mask = torch.zeros_like(
+                reprojection_loss_mask, device=reprojection_loss.device
+            )
+
+            if top_percent > 0.0:
+                # Compute percentile threshold per frame (batch element)
+                # reprojection_loss shape: [B, 1, H, W]
+                B = reprojection_loss.shape[0]
+                percentile = 1.0 - top_percent
+                
+                for b in range(B):
+                    # Get valid pixels for this frame only
+                    frame_loss = reprojection_loss[b, 0]  # [H, W]
+                    frame_valid = valid[b, 0]  # [H, W]
+                    frame_valid_vals = frame_loss[frame_valid].detach()
+                    
+                    if frame_valid_vals.numel() > 0:
+                        # Compute kthvalue threshold for this frame
+                        n = frame_valid_vals.numel()
+                        k = max(1, min(int(percentile * n) + 1, n))  # 1-indexed, clamp to [1, n]
                         
-            
-            reprojection_loss = reprojection_loss * reprojection_loss_mask 
-            reprojection_loss = reprojection_loss.sum() / (reprojection_loss_mask.sum() + 1e-7)
-            
+                        # Get the k-th smallest value (this is our threshold for this frame)
+                        threshold, _ = torch.kthvalue(frame_valid_vals, k)
+                        
+                        # Mark high-loss pixels for this frame
+                        frame_high = (frame_loss >= threshold) & frame_valid
+                        ignored_high_loss_mask[b, 0][frame_high] = 1.0
+
+                # Remove high-loss pixels from the effective mask
+                reprojection_loss_mask = reprojection_loss_mask * (
+                    1.0 - ignored_high_loss_mask
+                )
+
+            # Store visualization of ignored high-loss pixels (per-scale)
+            outputs[("high_loss_mask", scale)] = ignored_high_loss_mask.detach()
+
+            # Apply (possibly refined) mask to reprojection loss
+            reprojection_loss = reprojection_loss * reprojection_loss_mask
+            reprojection_loss = reprojection_loss.sum() / (
+                reprojection_loss_mask.sum() + 1e-7
+            )
 
 
 
@@ -760,7 +840,7 @@ class Trainer:
 
                 depth_var = torch.min(var_multi, var_mono)  # [B, 1, n_patches]
 
-                valid_mask = (depth_var > 0.01).squeeze(1)  # [B, 1, n_patches]
+                valid_mask = (depth_var > 0.1).squeeze(1)  # [B, 1, n_patches]
 
 
                 masked_patch_ssi_loss = patch_ssi_loss * valid_mask
@@ -779,7 +859,7 @@ class Trainer:
                 
                 # Combine losses
                 if not self.opt.no_loss_dynamic_weight:
-                    ssi_weight = max((1.0-self.g2s_weight()), 0)
+                    ssi_weight = 0.001
                 else:
                     ssi_weight = 0.01
                 
@@ -882,11 +962,27 @@ class Trainer:
         if scale is not None:
             print_string += " | scale: {}"
             print_data.append(scale)
+        
+        # Add g2s weight if g2s is enabled
+        if self.g2s:
+            g2s_w = self.g2s_weight()
+            print_string += " | g2s_weight: {:.5f}"
+            print_data.append(g2s_w)
             
         # Add gradient accumulation info
         if self.gradient_accumulation_steps > 1:
             print_string += " | eff_batch: {}"
             print_data.append(self.effective_batch_size)
+        
+        # Add learning rate info (especially useful during warmup)
+        current_lr = self.model_optimizer.param_groups[0]['lr']
+        print_string += " | lr: {:.2e}"
+        print_data.append(current_lr)
+        
+        # Add warmup status
+        if self.warmup_steps > 0 and self.step <= self.warmup_steps:
+            print_string += " | warmup: {}/{}"
+            print_data.extend([self.step, self.warmup_steps])
 
         print(print_string.format(*print_data))
 
@@ -943,6 +1039,13 @@ class Trainer:
                 writer.add_image(
                     "ssi_loss_{}/{}".format(s, j),
                     ssi_loss_img, self.step)
+
+            # Log high loss mask visualization
+            if ("high_loss_mask", s) in outputs:
+                high_loss_mask_img = colormap(outputs[("high_loss_mask", s)][j, 0])
+                writer.add_image(
+                    "high_loss_mask_{}/{}".format(s, j),
+                    high_loss_mask_img, self.step)
 
         
 

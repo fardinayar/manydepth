@@ -16,22 +16,19 @@ def replace_qkv_with_mergedlinear(model, r=4, lora_alpha=4, lora_dropout=0.0):
     - The modified model
     """
     for name, module in model.named_children():
-        if isinstance(module, nn.Linear) and module.out_features == module.in_features * 3 and 'qkv' in name.lower():
+        if isinstance(module, nn.Linear) and 'fc' in name.lower():
             # This is likely a qkv linear layer
             in_features = module.in_features
             out_features = module.out_features
             bias = module.bias is not None
             
             # Create a new MergedLinear layer
-            new_layer = lora.MergedLinear(
-                in_features,
-                out_features,
+            new_layer = lora.Linear(
+                in_features=in_features,
+                out_features=out_features,
                 r=r,
                 lora_alpha=lora_alpha,
-                lora_dropout=lora_dropout,
-                enable_lora=[True, False, True],  # Enable LoRA for q and v
-                bias=bias,
-                merge_weights=True,
+                lora_dropout=lora_dropout
             )
             
             # Copy the weights and bias from the original layer
@@ -42,6 +39,7 @@ def replace_qkv_with_mergedlinear(model, r=4, lora_alpha=4, lora_dropout=0.0):
             
             # Replace the old layer with the new one
             setattr(model, name, new_layer)
+            print(f"Replaced {name} with LoRA layer")
         else:
             # Recursively apply to child modules
             replace_qkv_with_mergedlinear(module, r, lora_alpha, lora_dropout)

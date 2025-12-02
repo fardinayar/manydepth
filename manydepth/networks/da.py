@@ -159,7 +159,7 @@ class ManyDepthAnythingDecoder(nn.Module):
             ])
         else:
             self.multi_frame_feature_fusion = nn.ModuleList([
-                MultiFrameFeatureFusion(in_channels, self.patch_h, self.patch_w, dropout=0.2, temporal_fusion=self.temporal_fusion, num_register_tokens=self.num_register_tokens)
+                MultiFrameFeatureFusion(in_channels, self.patch_h, self.patch_w, dropout=0.2, drop_path=0.2, temporal_fusion=self.temporal_fusion, num_register_tokens=self.num_register_tokens)
                 for _ in range(1)
             ])
         
@@ -207,7 +207,7 @@ class ManyDepthAnythingDecoder(nn.Module):
             for pass_idx in range(self.num_passes):
                 # Concatenate features along channel dim
                 fused_features = torch.cat((output, lookup_feats_flat), 1).permute(0,2,1)
-                output = self.multi_frame_feature_fusion[i](fused_features).permute(0,2,1)
+                output = self.multi_frame_feature_fusion[0](fused_features, i).permute(0,2,1)
 
             output = output.view(batch_size, channels, height, width)
 
@@ -230,8 +230,8 @@ class ManyDepthAnythingDecoder(nn.Module):
                 
             x = x.permute(0, 2, 1).reshape((x.shape[0], x.shape[-1], self.patch_h, self.patch_w))
             lookup_feature = lookup_feature.permute(0, 2, 1).reshape((lookup_feature.shape[0], lookup_feature.shape[-1], self.patch_h, self.patch_w))
-            if (not self.use_cost_volume_fusion):# and i == 3:
-                x = self._fuse_features_multi_frame(x, lookup_feature, 0, poses, intrinsics)
+            if (not self.use_cost_volume_fusion):
+                x = self._fuse_features_multi_frame(x, lookup_feature, i, poses, intrinsics)
             elif self.use_cost_volume_fusion:
                 x = self._fuse_features_multi_frame(x, lookup_feature, i, poses, intrinsics)
             x = self.projects[i](x)

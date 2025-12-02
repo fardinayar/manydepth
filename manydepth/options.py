@@ -95,7 +95,11 @@ class MonodepthOptions:
         self.parser.add_argument("--max_grad_norm",
                                  type=float,
                                  help="maximum gradient norm for clipping (0 to disable)",
-                                 default=20.0)
+                                 default=5)
+        self.parser.add_argument("--warmup_steps",
+                                 type=int,
+                                 help="number of warmup steps for learning rate (0 to disable)",
+                                 default=0)
 
         # ABLATION options
         self.parser.add_argument("--avg_reprojection",
@@ -262,7 +266,7 @@ class MonodepthOptions:
                                  help='Minimum depth for cost volume')
         self.parser.add_argument('--cost_volume_depth_max',
                                  type=float,
-                                 default=80.0,
+                                 default=100.0,
                                  help='Maximum depth for cost volume')
         # Pose is mandatory for cost volume fusion; keep no option flag
         

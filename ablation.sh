@@ -5,7 +5,7 @@
 # of the ManyDepth model architecture and training procedure.
 
 # Set common parameters
-DATA_PATH="kitti_data/"
+DATA_PATH="/mnt/e/cityscapes/"
 LOG_BASE_DIR="outs/ablation_studies2"
 
 # Create base log directory
@@ -36,7 +36,7 @@ CUDA_VISIBLE_DEVICES=1 python manydepth/train.py\
     --png \
     --g2s \
 
-# 1.2 ManyDepth without LoRA
+1.2 ManyDepth without LoRA
 echo "1.2 Training ManyDepth without LoRA..."
 CUDA_VISIBLE_DEVICES=1 python manydepth/train.py\
     --data_path "$DATA_PATH" \
@@ -57,10 +57,10 @@ CUDA_VISIBLE_DEVICES=1 python manydepth/train.py\
     --g2s \
     --no_temporal_fusion \
 
-# 3. CONSISTENCY LOSS ABLATION
+# # 3. CONSISTENCY LOSS ABLATION
 echo "3. Running Consistency Loss Ablation..."
 
-# 3.1 No consistency loss
+# # 3.1 No consistency loss
 echo "3.1 Training without consistency loss..."
 CUDA_VISIBLE_DEVICES=1 python manydepth/train.py\
     --data_path "$DATA_PATH" \
@@ -69,10 +69,10 @@ CUDA_VISIBLE_DEVICES=1 python manydepth/train.py\
     --g2s \
     --no_consistency_loss \
 
-# 4. DYNAMIC LOSS WEIGHT ABLATION
+# # 4. DYNAMIC LOSS WEIGHT ABLATION
 echo "4. Running Dynamic Loss Weight Ablation..."
 
-# 4.1 No dynamic loss weight
+# # 4.1 No dynamic loss weight
 echo "4.1 Training without dynamic loss weight..."
 CUDA_VISIBLE_DEVICES=1  python manydepth/train.py\
     --data_path "$DATA_PATH" \
