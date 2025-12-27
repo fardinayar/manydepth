@@ -125,7 +125,7 @@ class Trainer:
             self.models['depth'] = replace_conv_with_loraconv(self.models["depth"], lora_dropout=0.4)
             lora.mark_only_lora_as_trainable(self.models['depth'])
         print("Enable gradient for output convolution")
-        # We need to enable gradient for output convolution to train the depth decoder, beacuse we have changed the activation function from relu to sigmoid
+        # We need to enable gradient for output convolution to train the depth decoder, beacuse we have changed the activation function  from relu to sigmoid
         for name, param in self.models['depth'].named_parameters():
             if 'output_conv' in name:
                 param.requires_grad = True
@@ -297,7 +297,7 @@ class Trainer:
 
     def g2s_weight(self):
         maximum_steps = ((2 * self.num_total_steps)) // self.opt.num_epochs
-        return (self.step / maximum_steps) ** 2 if self.step <= maximum_steps else 1
+        return (self.step / maximum_steps) if self.step <= maximum_steps else 1
 
     def get_warmup_factor(self):
         """Calculate warmup factor for learning rate
@@ -747,47 +747,54 @@ class Trainer:
             )
 
             # ------------------------------------------------------------------
-            # Optionally ignore the highest-loss pixels (e.g. top 20%) among the
+            # Optionally ignore the highest-loss and lowest-loss pixels among the
             # already valid pixels, and visualize which pixels were ignored.
             # ------------------------------------------------------------------
-            top_percent = 0.20  # ignore top 30% highest-loss pixels per frame
+            top_percent = 0.30  # ignore top 40% highest-loss pixels over the full batch
+            bottom_percent = 0.00  # ignore bottom 10% lowest-loss pixels over the full batch
 
             valid = reprojection_loss_mask > 0
             ignored_high_loss_mask = torch.zeros_like(
                 reprojection_loss_mask, device=reprojection_loss.device
             )
+            ignored_low_loss_mask = torch.zeros_like(
+                reprojection_loss_mask, device=reprojection_loss.device
+            )
 
-            if top_percent > 0.0:
-                # Compute percentile threshold per frame (batch element)
-                # reprojection_loss shape: [B, 1, H, W]
-                B = reprojection_loss.shape[0]
-                percentile = 1.0 - top_percent
-                
-                for b in range(B):
-                    # Get valid pixels for this frame only
-                    frame_loss = reprojection_loss[b, 0]  # [H, W]
-                    frame_valid = valid[b, 0]  # [H, W]
-                    frame_valid_vals = frame_loss[frame_valid].detach()
-                    
-                    if frame_valid_vals.numel() > 0:
-                        # Compute kthvalue threshold for this frame
-                        n = frame_valid_vals.numel()
-                        k = max(1, min(int(percentile * n) + 1, n))  # 1-indexed, clamp to [1, n]
-                        
-                        # Get the k-th smallest value (this is our threshold for this frame)
-                        threshold, _ = torch.kthvalue(frame_valid_vals, k)
-                        
-                        # Mark high-loss pixels for this frame
-                        frame_high = (frame_loss >= threshold) & frame_valid
-                        ignored_high_loss_mask[b, 0][frame_high] = 1.0
+            # Collect ALL valid pixels from the whole batch
+            valid_vals = reprojection_loss[valid].detach().view(-1)
 
-                # Remove high-loss pixels from the effective mask
-                reprojection_loss_mask = reprojection_loss_mask * (
-                    1.0 - ignored_high_loss_mask
-                )
+            if valid_vals.numel() > 0:
+                n = valid_vals.numel()
 
-            # Store visualization of ignored high-loss pixels (per-scale)
+                # Mask high-loss pixels
+                if top_percent > 0.0:
+                    high_percentile = 1.0 - top_percent
+                    # kthvalue is 1-indexed; pick the (percentile*n)-th smallest as threshold
+                    k_high = max(1, min(int(high_percentile * n) + 1, n))
+                    high_threshold, _ = torch.kthvalue(valid_vals, k_high)
+
+                    # Mark high-loss pixels across the whole batch using the same threshold
+                    high = (reprojection_loss >= high_threshold) & valid
+                    ignored_high_loss_mask[high] = 1.0
+
+                # Mask low-loss pixels
+                if bottom_percent > 0.0:
+                    low_percentile = bottom_percent
+                    k_low = max(1, min(int(low_percentile * n) + 1, n))
+                    low_threshold, _ = torch.kthvalue(valid_vals, k_low)
+
+                    # Mark low-loss pixels across the whole batch using the same threshold
+                    low = (reprojection_loss <= low_threshold) & valid
+                    ignored_low_loss_mask[low] = 1.0
+
+                # Remove both high and low loss pixels from the effective mask
+                reprojection_loss_mask = reprojection_loss_mask * (1.0 - ignored_high_loss_mask) * (1.0 - ignored_low_loss_mask)
+
+            # Store visualization of ignored pixels (per-scale)
             outputs[("high_loss_mask", scale)] = ignored_high_loss_mask.detach()
+            outputs[("low_loss_mask", scale)] = ignored_low_loss_mask.detach()
+
 
             # Apply (possibly refined) mask to reprojection loss
             reprojection_loss = reprojection_loss * reprojection_loss_mask
@@ -840,7 +847,7 @@ class Trainer:
 
                 depth_var = torch.min(var_multi, var_mono)  # [B, 1, n_patches]
 
-                valid_mask = (depth_var > 0.1).squeeze(1)  # [B, 1, n_patches]
+                valid_mask = (depth_var > 0.1).squeeze(1)  # [B, n_patches]
 
 
                 masked_patch_ssi_loss = patch_ssi_loss * valid_mask
@@ -859,7 +866,7 @@ class Trainer:
                 
                 # Combine losses
                 if not self.opt.no_loss_dynamic_weight:
-                    ssi_weight = 0.001
+                    ssi_weight = (1-self.g2s_weight())
                 else:
                     ssi_weight = 0.01
                 
@@ -891,10 +898,10 @@ class Trainer:
             #TRANSLATIONS
             t12 = torch.norm(outputs[("translation", 0, -1)][:, 0].squeeze(), dim=1)
             t23 = torch.norm(outputs[("translation", 0, 1)][:, 0].squeeze(), dim=1)
-            
-            
-            s1 = inputs["gps12"].float() / t12 
-            s2 = inputs["gps23"].float() / t23 
+
+
+            s1 = inputs["gps12"].float() / (t12 + 1e-7)
+            s2 = inputs["gps23"].float() / (t23 + 1e-7) 
             
             #g2s_loss = torch.nn.functional.huber_loss(s1, torch.ones_like(s1), delta=0.1) + torch.nn.functional.huber_loss(s2, torch.ones_like(s2), delta=0.1)
             g2s_loss = torch.nn.functional.mse_loss(s1, torch.ones_like(s1)) + torch.nn.functional.mse_loss(s2, torch.ones_like(s2))
@@ -1046,6 +1053,13 @@ class Trainer:
                 writer.add_image(
                     "high_loss_mask_{}/{}".format(s, j),
                     high_loss_mask_img, self.step)
+
+            # Log low loss mask visualization
+            if ("low_loss_mask", s) in outputs:
+                low_loss_mask_img = colormap(outputs[("low_loss_mask", s)][j, 0])
+                writer.add_image(
+                    "low_loss_mask_{}/{}".format(s, j),
+                    low_loss_mask_img, self.step)
 
         
 

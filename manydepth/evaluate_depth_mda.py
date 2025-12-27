@@ -5,12 +5,12 @@
 # available in the LICENSE file.
 
 import os
+import cv2
 
 from networks.replace_with_lora import replace_qkv_with_mergedlinear, replace_conv_with_loraconv
 os.environ["MKL_NUM_THREADS"] = "1"  # noqa F402
 os.environ["NUMEXPR_NUM_THREADS"] = "1"  # noqa F402
 os.environ["OMP_NUM_THREADS"] = "1"  # noqa F402
-import cv2
 import numpy as np
 from copy import deepcopy
 import torch

@@ -232,7 +232,7 @@ class MonodepthOptions:
         
         self.parser.add_argument('--fusion_lr_coef',
                                  type=float,
-                                 default=4.0,
+                                 default=16.0,
                                  help='Learning rate multiplier for feature fusion parameters')
         
         self.parser.add_argument("--g2s",
@@ -273,7 +273,7 @@ class MonodepthOptions:
         # Feature fusion passes
         self.parser.add_argument('--num_passes',
                                  type=int,
-                                 default=2,
+                                 default=1,
                                  help='Number of fusion passes for attention-based feature fusion')
         
         # Register tokens for attention-based fusion
