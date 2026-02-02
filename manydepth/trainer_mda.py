@@ -297,7 +297,7 @@ class Trainer:
 
     def g2s_weight(self):
         maximum_steps = ((2 * self.num_total_steps)) // self.opt.num_epochs
-        return (self.step / maximum_steps) if self.step <= maximum_steps else 1
+        return (self.step / maximum_steps) ** 2 if self.step <= maximum_steps else 1
 
     def get_warmup_factor(self):
         """Calculate warmup factor for learning rate
@@ -847,7 +847,7 @@ class Trainer:
 
                 depth_var = torch.min(var_multi, var_mono)  # [B, 1, n_patches]
 
-                valid_mask = (depth_var > 0.1).squeeze(1)  # [B, n_patches]
+                valid_mask = (depth_var > 0.001).squeeze(1)  # [B, n_patches]
 
 
                 masked_patch_ssi_loss = patch_ssi_loss * valid_mask
@@ -866,7 +866,7 @@ class Trainer:
                 
                 # Combine losses
                 if not self.opt.no_loss_dynamic_weight:
-                    ssi_weight = (1-self.g2s_weight())
+                    ssi_weight = (1-self.g2s_weight()) / 10
                 else:
                     ssi_weight = 0.01
                 

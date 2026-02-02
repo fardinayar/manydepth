@@ -69,7 +69,7 @@ class MonodepthOptions:
         self.parser.add_argument("--max_depth",
                                  type=float,
                                  help="maximum depth",
-                                 default=400.0)
+                                 default=1000.0)
         self.parser.add_argument("--frame_ids",
                                  nargs="+",
                                  type=int,
@@ -95,7 +95,7 @@ class MonodepthOptions:
         self.parser.add_argument("--max_grad_norm",
                                  type=float,
                                  help="maximum gradient norm for clipping (0 to disable)",
-                                 default=5)
+                                 default=1)
         self.parser.add_argument("--warmup_steps",
                                  type=int,
                                  help="number of warmup steps for learning rate (0 to disable)",
@@ -232,7 +232,7 @@ class MonodepthOptions:
         
         self.parser.add_argument('--fusion_lr_coef',
                                  type=float,
-                                 default=16.0,
+                                 default=4.0,
                                  help='Learning rate multiplier for feature fusion parameters')
         
         self.parser.add_argument("--g2s",
@@ -273,7 +273,7 @@ class MonodepthOptions:
         # Feature fusion passes
         self.parser.add_argument('--num_passes',
                                  type=int,
-                                 default=1,
+                                 default=2,
                                  help='Number of fusion passes for attention-based feature fusion')
         
         # Register tokens for attention-based fusion

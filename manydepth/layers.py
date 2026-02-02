@@ -17,7 +17,7 @@ def disp_to_depth(disp, max_depth):
     section of the paper.
     """
     min_disp = 1 / max_depth
-    scaled_disp = min_disp + disp #* (max_disp - min_disp)
+    scaled_disp = min_disp + disp
     depth = 1 / scaled_disp
     return scaled_disp, depth
 
