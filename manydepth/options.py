@@ -69,7 +69,7 @@ class MonodepthOptions:
         self.parser.add_argument("--max_depth",
                                  type=float,
                                  help="maximum depth",
-                                 default=1000.0)
+                                 default=300.0)
         self.parser.add_argument("--frame_ids",
                                  nargs="+",
                                  type=int,
@@ -99,7 +99,7 @@ class MonodepthOptions:
         self.parser.add_argument("--warmup_steps",
                                  type=int,
                                  help="number of warmup steps for learning rate (0 to disable)",
-                                 default=0)
+                                 default=1000)
 
         # ABLATION options
         self.parser.add_argument("--avg_reprojection",
@@ -279,7 +279,7 @@ class MonodepthOptions:
         # Register tokens for attention-based fusion
         self.parser.add_argument('--num_register_tokens',
                                  type=int,
-                                 default=8,
+                                 default=4,
                                  help='Number of register tokens for attention sink in MultiFrameFeatureFusion')
         
     def parse(self):

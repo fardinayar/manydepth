@@ -296,7 +296,7 @@ class Trainer:
         self.save_opts()
 
     def g2s_weight(self):
-        maximum_steps = ((2 * self.num_total_steps)) // self.opt.num_epochs
+        maximum_steps = ((4 * self.num_total_steps)) // self.opt.num_epochs
         return (self.step / maximum_steps) ** 2 if self.step <= maximum_steps else 1
 
     def get_warmup_factor(self):
@@ -751,7 +751,7 @@ class Trainer:
             # already valid pixels, and visualize which pixels were ignored.
             # ------------------------------------------------------------------
             top_percent = 0.30  # ignore top 40% highest-loss pixels over the full batch
-            bottom_percent = 0.00  # ignore bottom 10% lowest-loss pixels over the full batch
+            bottom_percent = 0.0  # ignore bottom 10% lowest-loss pixels over the full batch
 
             valid = reprojection_loss_mask > 0
             ignored_high_loss_mask = torch.zeros_like(

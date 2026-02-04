@@ -50,7 +50,7 @@ class MultiFrameFeatureFusion(nn.Module):
         temporal_fusion: bool = True,
         num_register_tokens: int = 0,
                  num_scales: int = 4,
-                 lora_rank: int = 64,
+                 lora_rank: int = 32,
         lora_alpha: float = 4,
     ):
         super().__init__()
