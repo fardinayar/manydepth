@@ -6,7 +6,7 @@
 
 """
 Dataclass-based config for training and evaluation.
-Supports load/save from YAML/JSON and backward compatibility with saved opt.json.
+Supports load/save from YAML. Saved run config is config.yaml only.
 YAML configs can inherit a base via 'extends: base.yaml' (path relative to the config file).
 """
 
@@ -14,7 +14,14 @@ import json
 import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+def get_config_schema() -> Tuple[tuple, Dict[str, type]]:
+    """Return (field_names, name -> type) for TrainConfig. Used for CLI parsing."""
+    from typing import get_type_hints
+    hints = get_type_hints(TrainConfig)
+    names = tuple(TrainConfig.__dataclass_fields__)
+    return names, hints
 
 file_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -94,16 +101,13 @@ class TrainConfig:
     warmup_steps: int
 
     # ABLATION
-    avg_reprojection: bool
-    disable_automasking: bool
     weights_init: str
     num_matching_frames: int
-    disable_motion_masking: bool
-    no_matching_augmentation: bool
     no_temporal_fusion: bool
     no_lora: bool
     no_consistency_loss: bool
     no_loss_dynamic_weight: bool
+    ignore_high_low_loss_pixels: bool
 
     # SYSTEM
     no_cuda: bool
@@ -139,11 +143,6 @@ class TrainConfig:
     pose_from_scratch: bool
     gradient_accumulation_steps: int
 
-    # Cost volume fusion
-    use_cost_volume_fusion: bool
-    cost_volume_depth_bins: int
-    cost_volume_depth_min: float
-    cost_volume_depth_max: float
     num_passes: int
     num_register_tokens: int
 
@@ -159,7 +158,6 @@ class TrainConfig:
     fusion_lora_alpha: float
     fusion_dropout: float
     fusion_drop_path: float
-    cost_volume_fusion_dropout: float
 
     # Ablation: scheduler
     scheduler_gamma: float
@@ -220,7 +218,28 @@ class TrainConfig:
             data = json.load(f)
         return cls.from_dict(data)
 
+    @classmethod
+    def from_saved_run_dir(cls, folder: Union[str, Path]) -> "TrainConfig":
+        """Load config from a run dir: config.yaml only (in folder or its parent)."""
+        folder = Path(folder)
+        yaml_path = folder / "config.yaml"
+        if yaml_path.is_file():
+            return cls.from_yaml(yaml_path)
+        parent = folder.parent / "config.yaml"
+        if parent.is_file():
+            return cls.from_yaml(parent)
+        raise FileNotFoundError("No config.yaml in {} or its parent".format(folder))
+
     def to_json(self, path: Union[str, Path]) -> None:
         """Save config to JSON."""
         with open(path, "w") as f:
             json.dump(self.to_dict(), f, indent=2)
+
+    def to_yaml(self, path: Union[str, Path]) -> None: 
+        """Save config to YAML (used for saved run config)."""
+        try:
+            import yaml
+        except ImportError:
+            raise ImportError("PyYAML is required for YAML config. pip install PyYAML")
+        with open(path, "w") as f:
+            yaml.dump(self.to_dict(), f, default_flow_style=False, sort_keys=False)

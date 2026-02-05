@@ -19,7 +19,7 @@ from torch.utils.data import DataLoader
 from utils import readlines
 from options import MonodepthOptions
 import datasets, networks
-from layers import transformation_from_parameters, disp_to_depth
+from layers import disp_to_depth
 import tqdm
 
 cv2.setNumThreads(0)  # This speeds up evaluation 5x on our unix systems (OpenCV 3.3.1)
@@ -106,11 +106,7 @@ def evaluate(opt):
                   'using command line values!')
             HEIGHT, WIDTH = opt.height, opt.width
         
-        # Params come from parsed opt (saved config is auto-loaded from run's opt.json and overridable by -c/CLI)
-        use_cost_volume_fusion = encoder_dict.get('use_cost_volume_fusion', opt.use_cost_volume_fusion)
-        cost_volume_depth_bins = encoder_dict.get('cost_volume_depth_bins', opt.cost_volume_depth_bins)
-        cost_volume_depth_min = encoder_dict.get('cost_volume_depth_min', opt.cost_volume_depth_min)
-        cost_volume_depth_max = encoder_dict.get('cost_volume_depth_max', opt.cost_volume_depth_max)
+        # Params come from parsed opt (saved config is auto-loaded from run's config.yaml and overridable by -c/CLI)
         num_passes = encoder_dict.get('num_passes', opt.num_passes)
         no_temporal_fusion = encoder_dict.get('no_temporal_fusion', opt.no_temporal_fusion)
         num_register_tokens = opt.num_register_tokens
@@ -120,13 +116,9 @@ def evaluate(opt):
         fusion_lora_alpha = opt.fusion_lora_alpha
         fusion_dropout = opt.fusion_dropout
         fusion_drop_path = opt.fusion_drop_path
-        cost_volume_fusion_dropout = opt.cost_volume_fusion_dropout
-        
+
         print(f"Loaded model configuration:")
         print(f"  Height x Width: {HEIGHT} x {WIDTH}")
-        print(f"  Use cost volume fusion: {use_cost_volume_fusion}")
-        print(f"  Cost volume depth bins: {cost_volume_depth_bins}")
-        print(f"  Cost volume depth range: [{cost_volume_depth_min}, {cost_volume_depth_max}]")
         print(f"  Num passes: {num_passes}")
         print(f"  No temporal fusion: {no_temporal_fusion}")
 
@@ -172,10 +164,6 @@ def evaluate(opt):
                 patch_h=opt.height // 14, patch_w=opt.width // 14,
                 features=config['features'], in_channels=config['in_channels'], out_channels=config['out_channels'],
                 temporal_fusion=not no_temporal_fusion,
-                use_cost_volume_fusion=use_cost_volume_fusion,
-                cost_volume_depth_bins=cost_volume_depth_bins,
-                cost_volume_depth_min=cost_volume_depth_min,
-                cost_volume_depth_max=cost_volume_depth_max,
                 num_register_tokens=num_register_tokens,
                 num_passes=num_passes,
                 fusion_neighborhood_size=fusion_neighborhood_size,
@@ -184,7 +172,6 @@ def evaluate(opt):
                 fusion_lora_alpha=fusion_lora_alpha,
                 fusion_dropout=fusion_dropout,
                 fusion_drop_path=fusion_drop_path,
-                cost_volume_fusion_dropout=cost_volume_fusion_dropout,
             )
             if not opt.no_lora:
                 encoder = replace_qkv_with_mergedlinear(
@@ -226,26 +213,7 @@ def evaluate(opt):
                         lookup_frames = lookup_frames.cuda()
 
                     features, lookup_features = encoder(input_color, lookup_frames)
-                    patch_h, patch_w = input_color.shape[-2] // 14, input_color.shape[-1] // 14
-                    
-                    # Handle poses and intrinsics for cost volume fusion (pose required)
-                    if use_cost_volume_fusion:
-                        # Compute poses for evaluation
-                        pose_inputs = [pose_enc(torch.cat([input_color, lookup_frames[:, 0]], 1))]
-                        axisangle, translation = pose_dec(pose_inputs)
-                        pose = transformation_from_parameters(axisangle[:, 0], translation[:, 0], invert=True)
-                        
-                        # Stack poses for all lookup frames (simplified - using same pose for all)
-                        poses = pose.unsqueeze(1).expand(-1, lookup_frames.shape[1], -1, -1)
-                        
-                        # Get camera intrinsics for evaluation
-                        intrinsics = data[("K", 0)]  # [B, 3x3 or 4x4] camera intrinsics
-                        if torch.cuda.is_available():
-                            intrinsics = intrinsics.cuda()
-                        
-                        output, _ = depth_decoder(features, lookup_features, poses, intrinsics)
-                    else:
-                        output, _ = depth_decoder(features, lookup_features)
+                    output, _ = depth_decoder(features, lookup_features)
                 if opt.eval_teacher:
                     output = output.relu()
                 else:

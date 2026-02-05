@@ -94,10 +94,6 @@ class Trainer:
         if self.opt.no_temporal_fusion:
             print("Disabling temporal fusion in the depth decoder")
         
-        if self.opt.use_cost_volume_fusion:
-            print("Using cost volume feature fusion (pose required)")
-            print(f"Cost volume depth bins: {self.opt.cost_volume_depth_bins}")
-            print(f"Cost volume depth range: [{self.opt.cost_volume_depth_min}, {self.opt.cost_volume_depth_max}]")
         self.models["depth"] = networks.ManyDepthAnythingDecoder(
             in_channels=model_config['in_channels'],
             out_channels=model_config['out_channels'],
@@ -105,10 +101,6 @@ class Trainer:
             patch_h=self.opt.height // 14,
             patch_w=self.opt.width // 14,
             temporal_fusion=not self.opt.no_temporal_fusion,
-            use_cost_volume_fusion=self.opt.use_cost_volume_fusion,
-            cost_volume_depth_bins=self.opt.cost_volume_depth_bins,
-            cost_volume_depth_min=self.opt.cost_volume_depth_min,
-            cost_volume_depth_max=self.opt.cost_volume_depth_max,
             num_passes=self.opt.num_passes,
             num_register_tokens=self.opt.num_register_tokens,
             fusion_neighborhood_size=self.opt.fusion_neighborhood_size,
@@ -117,7 +109,6 @@ class Trainer:
             fusion_lora_alpha=self.opt.fusion_lora_alpha,
             fusion_dropout=self.opt.fusion_dropout,
             fusion_drop_path=self.opt.fusion_drop_path,
-            cost_volume_fusion_dropout=self.opt.cost_volume_fusion_dropout,
         )
 
         depth_anything_path = os.path.join(
@@ -495,7 +486,7 @@ class Trainer:
         # apply static frame and zero cost volume augmentation
         batch_size = len(lookup_frames)
         augmentation_mask = torch.zeros([batch_size, 1, 1, 1]).to(self.device).float()
-        if is_train and not self.opt.no_matching_augmentation:
+        if is_train:
             for batch_idx in range(batch_size):
                 rand_num = random.random()
                 # static camera augmentation -> overwrite lookup frames with current frame
@@ -540,13 +531,7 @@ class Trainer:
             features, lookup_features = self.models["encoder"](inputs["color_aug", 0, 0], lookup_frames)
         
 
-        # Pass poses and intrinsics to depth decoder if using cost volume fusion
-        if self.opt.use_cost_volume_fusion:
-            # Get camera intrinsics for the current scale
-            intrinsics = inputs[("K", 0)]  # [B, 3, 3] camera intrinsics
-            depth, _ = self.models["depth"](features, lookup_features, relative_poses, intrinsics)
-        else:
-            depth, _ = self.models["depth"](features, lookup_features)
+        depth, _ = self.models["depth"](features, lookup_features)
         
         depth =  F.relu(depth)
         outputs.update({("disp", 0): depth})
@@ -677,9 +662,8 @@ class Trainer:
                     outputs[("sample", frame_id, scale)],
                     padding_mode="border", align_corners=True)
 
-                if not self.opt.disable_automasking:
-                    outputs[("color_identity", frame_id, scale)] = \
-                        inputs[("color", frame_id, source_scale)]
+                outputs[("color_identity", frame_id, scale)] = \
+                    inputs[("color", frame_id, source_scale)]
 
     def compute_reprojection_loss(self, pred, target):
         """Computes reprojection loss between a batch of predicted and target images
@@ -731,34 +715,19 @@ class Trainer:
                 reprojection_losses.append(self.compute_reprojection_loss(pred, target))
             reprojection_losses = torch.cat(reprojection_losses, 1)
 
-            if not self.opt.disable_automasking:
-                identity_reprojection_losses = []
-                for frame_id in self.opt.frame_ids[1:]:
-                    pred = inputs[("color", frame_id, source_scale)]
-                    identity_reprojection_losses.append(
-                        self.compute_reprojection_loss(pred, target))
+            identity_reprojection_losses = []
+            for frame_id in self.opt.frame_ids[1:]:
+                pred = inputs[("color", frame_id, source_scale)]
+                identity_reprojection_losses.append(
+                    self.compute_reprojection_loss(pred, target))
+            identity_reprojection_losses = torch.cat(identity_reprojection_losses, 1)
+            identity_reprojection_loss, _ = torch.min(identity_reprojection_losses, dim=1,
+                                                      keepdim=True)
 
-                identity_reprojection_losses = torch.cat(identity_reprojection_losses, 1)
+            reprojection_loss, _ = torch.min(reprojection_losses, dim=1, keepdim=True)
 
-                if self.opt.avg_reprojection:
-                    identity_reprojection_loss = identity_reprojection_losses.mean(1, keepdim=True)
-                else:
-                    # differently to Monodepth2, compute mins as we go
-                    identity_reprojection_loss, _ = torch.min(identity_reprojection_losses, dim=1,
-                                                              keepdim=True)
-            else:
-                identity_reprojection_loss = None
-
-            if self.opt.avg_reprojection:
-                reprojection_loss = reprojection_losses.mean(1, keepdim=True)
-            else:
-                # differently to Monodepth2, compute mins as we go
-                reprojection_loss, _ = torch.min(reprojection_losses, dim=1, keepdim=True)
-
-            if not self.opt.disable_automasking:
-                # add random numbers to break ties
-                if identity_reprojection_loss is not None:
-                    identity_reprojection_loss += torch.randn(identity_reprojection_loss.shape).to(self.device) * 0.00001
+            # add random numbers to break ties
+            identity_reprojection_loss += torch.randn(identity_reprojection_loss.shape).to(self.device) * 0.00001
 
             # find minimum losses from [reprojection, identity]
             reprojection_loss_mask = self.compute_loss_masks(
@@ -770,50 +739,58 @@ class Trainer:
             # Optionally ignore the highest-loss and lowest-loss pixels among the
             # already valid pixels, and visualize which pixels were ignored.
             # ------------------------------------------------------------------
-            top_percent = 0.30  # ignore top 40% highest-loss pixels over the full batch
-            bottom_percent = 0.0  # ignore bottom 10% lowest-loss pixels over the full batch
+            if self.opt.ignore_high_low_loss_pixels:
+                top_percent = 0.30  # ignore top 30% highest-loss pixels over the full batch
+                bottom_percent = 0.0  # ignore bottom 0% lowest-loss pixels over the full batch
 
-            valid = reprojection_loss_mask > 0
-            ignored_high_loss_mask = torch.zeros_like(
-                reprojection_loss_mask, device=reprojection_loss.device
-            )
-            ignored_low_loss_mask = torch.zeros_like(
-                reprojection_loss_mask, device=reprojection_loss.device
-            )
+                valid = reprojection_loss_mask > 0
+                ignored_high_loss_mask = torch.zeros_like(
+                    reprojection_loss_mask, device=reprojection_loss.device
+                )
+                ignored_low_loss_mask = torch.zeros_like(
+                    reprojection_loss_mask, device=reprojection_loss.device
+                )
 
-            # Collect ALL valid pixels from the whole batch
-            valid_vals = reprojection_loss[valid].detach().view(-1)
+                # Collect ALL valid pixels from the whole batch
+                valid_vals = reprojection_loss[valid].detach().view(-1)
 
-            if valid_vals.numel() > 0:
-                n = valid_vals.numel()
+                if valid_vals.numel() > 0:
+                    n = valid_vals.numel()
 
-                # Mask high-loss pixels
-                if top_percent > 0.0:
-                    high_percentile = 1.0 - top_percent
-                    # kthvalue is 1-indexed; pick the (percentile*n)-th smallest as threshold
-                    k_high = max(1, min(int(high_percentile * n) + 1, n))
-                    high_threshold, _ = torch.kthvalue(valid_vals, k_high)
+                    # Mask high-loss pixels
+                    if top_percent > 0.0:
+                        high_percentile = 1.0 - top_percent
+                        # kthvalue is 1-indexed; pick the (percentile*n)-th smallest as threshold
+                        k_high = max(1, min(int(high_percentile * n) + 1, n))
+                        high_threshold, _ = torch.kthvalue(valid_vals, k_high)
 
-                    # Mark high-loss pixels across the whole batch using the same threshold
-                    high = (reprojection_loss >= high_threshold) & valid
-                    ignored_high_loss_mask[high] = 1.0
+                        # Mark high-loss pixels across the whole batch using the same threshold
+                        high = (reprojection_loss >= high_threshold) & valid
+                        ignored_high_loss_mask[high] = 1.0
 
-                # Mask low-loss pixels
-                if bottom_percent > 0.0:
-                    low_percentile = bottom_percent
-                    k_low = max(1, min(int(low_percentile * n) + 1, n))
-                    low_threshold, _ = torch.kthvalue(valid_vals, k_low)
+                    # Mask low-loss pixels
+                    if bottom_percent > 0.0:
+                        low_percentile = bottom_percent
+                        k_low = max(1, min(int(low_percentile * n) + 1, n))
+                        low_threshold, _ = torch.kthvalue(valid_vals, k_low)
 
-                    # Mark low-loss pixels across the whole batch using the same threshold
-                    low = (reprojection_loss <= low_threshold) & valid
-                    ignored_low_loss_mask[low] = 1.0
+                        # Mark low-loss pixels across the whole batch using the same threshold
+                        low = (reprojection_loss <= low_threshold) & valid
+                        ignored_low_loss_mask[low] = 1.0
 
-                # Remove both high and low loss pixels from the effective mask
-                reprojection_loss_mask = reprojection_loss_mask * (1.0 - ignored_high_loss_mask) * (1.0 - ignored_low_loss_mask)
+                    # Remove both high and low loss pixels from the effective mask
+                    reprojection_loss_mask = reprojection_loss_mask * (1.0 - ignored_high_loss_mask) * (1.0 - ignored_low_loss_mask)
 
-            # Store visualization of ignored pixels (per-scale)
-            outputs[("high_loss_mask", scale)] = ignored_high_loss_mask.detach()
-            outputs[("low_loss_mask", scale)] = ignored_low_loss_mask.detach()
+                # Store visualization of ignored pixels (per-scale)
+                outputs[("high_loss_mask", scale)] = ignored_high_loss_mask.detach()
+                outputs[("low_loss_mask", scale)] = ignored_low_loss_mask.detach()
+            else:
+                outputs[("high_loss_mask", scale)] = torch.zeros_like(
+                    reprojection_loss_mask, device=reprojection_loss.device
+                ).detach()
+                outputs[("low_loss_mask", scale)] = torch.zeros_like(
+                    reprojection_loss_mask, device=reprojection_loss.device
+                ).detach()
 
 
             # Apply (possibly refined) mask to reprojection loss
@@ -833,7 +810,7 @@ class Trainer:
                 mono_depth = outputs[("mono_depth", 0, scale)].detach()
                 
                 # Define patch size
-                patch_size = 16
+                patch_size = 8
 
                 # Unfold into patches
                 b, c, h, w = multi_depth.shape
@@ -1083,16 +1060,16 @@ class Trainer:
         
 
     def save_opts(self):
-        """Save config to run output dir and to models/ so we know what we ran with.
+        """Save config to run output dir and to models/ as YAML (config.yaml).
         """
+        import yaml
         models_dir = os.path.join(self.log_path, "models")
         if not os.path.exists(models_dir):
             os.makedirs(models_dir)
         to_save = self.opt.to_dict() if hasattr(self.opt, 'to_dict') else self.opt.__dict__.copy()
-        # Save in models/ (next to weights) and at run root for easy find
         for dest_dir in (models_dir, self.log_path):
-            with open(os.path.join(dest_dir, 'opt.json'), 'w') as f:
-                json.dump(to_save, f, indent=2)
+            with open(os.path.join(dest_dir, 'config.yaml'), 'w') as f:
+                yaml.dump(to_save, f, default_flow_style=False, sort_keys=False)
 
     def save_model(self, save_step=False):
         """Save model weights to disk
@@ -1113,10 +1090,6 @@ class Trainer:
                 # save the sizes and ablation parameters - these are needed at prediction time
                 to_save['height'] = self.opt.height
                 to_save['width'] = self.opt.width
-                to_save['use_cost_volume_fusion'] = self.opt.use_cost_volume_fusion
-                to_save['cost_volume_depth_bins'] = self.opt.cost_volume_depth_bins
-                to_save['cost_volume_depth_min'] = self.opt.cost_volume_depth_min
-                to_save['cost_volume_depth_max'] = self.opt.cost_volume_depth_max
                 to_save['num_passes'] = self.opt.num_passes
                 to_save['no_temporal_fusion'] = self.opt.no_temporal_fusion
 

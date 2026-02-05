@@ -30,15 +30,23 @@ Then a single `-c configs/ablation_no_lora.yaml` gives you the full base plus th
 ## Ablation configs
 
 - **`base.yaml`** – full default set; use as the common base for experiments.
-- **`ablation_*.yaml`** – use `extends: base.yaml` and only the options that change (e.g. `no_lora`, `model_name`).
+- **`ablation_*.yaml`** – each extends `base.yaml` and overrides only the relevant flag(s) and `model_name`. No need to write a full config per ablation.
+
+| Config | Override | model_name |
+|--------|----------|------------|
+| `ablation_no_lora.yaml` | no_lora: true | mdp_no_lora |
+| `ablation_no_temporal_fusion.yaml` | no_temporal_fusion: true | mdp_no_temporal_fusion |
+| `ablation_no_consistency_loss.yaml` | no_consistency_loss: true | mdp_no_consistency_loss |
+| `ablation_no_loss_dynamic_weight.yaml` | no_loss_dynamic_weight: true | mdp_no_loss_dynamic_weight |
+| `ablation_no_ignore_high_low_loss.yaml` | ignore_high_low_loss_pixels: false | mdp_no_ignore_high_low_loss |
 
 ### Using one config file
 
 ```bash
-# Full base + overrides from ablation file (base inherited via extends in YAML)
+# Any ablation: base inherited via extends, only the flag and model_name differ
 python manydepth/train.py -c configs/ablation_no_lora.yaml --log_dir outs/ablation_no_lora
-
-# Or use base directly and override via CLI
+python manydepth/train.py -c configs/ablation_no_temporal_fusion.yaml --log_dir outs/no_temporal_fusion
+# Or base + CLI overrides
 python manydepth/train.py -c configs/base.yaml --log_dir outs/exp1 --no_lora
 ```
 
@@ -59,6 +67,6 @@ python manydepth/train.py -c configs/base.yaml --data_path "$DATA_PATH" --log_di
 # No LoRA ablation (base + ablation file + CLI)
 python manydepth/train.py -c configs/base.yaml -c configs/ablation_no_lora.yaml --data_path "$DATA_PATH" --log_dir "$LOG_BASE_DIR/baseline_no_lora" --png --g2s
 
-# No temporal fusion (CLI only)
-python manydepth/train.py -c configs/base.yaml --data_path "$DATA_PATH" --log_dir "$LOG_BASE_DIR/no_temporal_fusion" --png --g2s --no_temporal_fusion
+# No temporal fusion (ablation config)
+python manydepth/train.py -c configs/ablation_no_temporal_fusion.yaml --data_path "$DATA_PATH" --log_dir "$LOG_BASE_DIR/no_temporal_fusion" --png --g2s
 ```
