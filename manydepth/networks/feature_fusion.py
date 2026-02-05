@@ -135,7 +135,6 @@ class MultiFrameFeatureFusion(nn.Module):
 
         # Pre-LN: normalize before attention and before feed-forward
         self.attn_norm = nn.LayerNorm(input_dim)
-        #self.attn_norm_prev = nn.LayerNorm(input_dim)
         self.ffn_norm = nn.LayerNorm(input_dim)
         # Explicit FFN layers to allow per-layer LoRA injection
         self.ffn_fc1 = nn.Linear(input_dim, input_dim * 2)

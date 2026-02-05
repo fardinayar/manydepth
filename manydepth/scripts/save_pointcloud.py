@@ -19,6 +19,7 @@ import sys
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 from networks.replace_with_lora import replace_qkv_with_mergedlinear, replace_conv_with_loraconv
+from config import TrainConfig
 import networks
 from layers import disp_to_depth
 
@@ -104,37 +105,71 @@ def setup_models(weights_folder, depth_anything_encoder, height, width, device):
         print('No "height" or "width" keys found in the encoder state_dict, using provided values!')
         HEIGHT, WIDTH = height, width
     
-    # Load ablation parameters from encoder state dict
-    use_cost_volume_fusion = encoder_dict.get('use_cost_volume_fusion', False)
-    cost_volume_depth_bins = encoder_dict.get('cost_volume_depth_bins', 32)
-    cost_volume_depth_min = encoder_dict.get('cost_volume_depth_min', 0.1)
-    cost_volume_depth_max = encoder_dict.get('cost_volume_depth_max', 80.0)
-    num_passes = encoder_dict.get('num_passes', 2)
-    no_temporal_fusion = encoder_dict.get('no_temporal_fusion', False)
-    
+    # Load ablation parameters from opt.json if present, else encoder state dict
+    opt_json_path = os.path.join(weights_folder, "opt.json")
+    if not os.path.isfile(opt_json_path):
+        opt_json_path = os.path.join(os.path.dirname(weights_folder), "opt.json")
+    if os.path.isfile(opt_json_path):
+        saved_cfg = TrainConfig.from_json(opt_json_path)
+        use_cost_volume_fusion = saved_cfg.use_cost_volume_fusion
+        cost_volume_depth_bins = saved_cfg.cost_volume_depth_bins
+        cost_volume_depth_min = saved_cfg.cost_volume_depth_min
+        cost_volume_depth_max = saved_cfg.cost_volume_depth_max
+        num_passes = saved_cfg.num_passes
+        no_temporal_fusion = saved_cfg.no_temporal_fusion
+        num_register_tokens = saved_cfg.num_register_tokens
+        fusion_neighborhood_size = saved_cfg.fusion_neighborhood_size
+        fusion_num_scales = saved_cfg.fusion_num_scales
+        fusion_lora_rank = saved_cfg.fusion_lora_rank
+        fusion_lora_alpha = saved_cfg.fusion_lora_alpha
+        fusion_dropout = saved_cfg.fusion_dropout
+        fusion_drop_path = saved_cfg.fusion_drop_path
+        cost_volume_fusion_dropout = saved_cfg.cost_volume_fusion_dropout
+        lora_rank, lora_alpha = saved_cfg.lora_rank, saved_cfg.lora_alpha
+    else:
+        use_cost_volume_fusion = encoder_dict.get('use_cost_volume_fusion', False)
+        cost_volume_depth_bins = encoder_dict.get('cost_volume_depth_bins', 32)
+        cost_volume_depth_min = encoder_dict.get('cost_volume_depth_min', 0.1)
+        cost_volume_depth_max = encoder_dict.get('cost_volume_depth_max', 80.0)
+        num_passes = encoder_dict.get('num_passes', 2)
+        no_temporal_fusion = encoder_dict.get('no_temporal_fusion', False)
+        num_register_tokens = 4
+        fusion_neighborhood_size = (3, 15)
+        fusion_num_scales = 4
+        fusion_lora_rank = 32
+        fusion_lora_alpha = 4.0
+        fusion_dropout = 0.0
+        fusion_drop_path = 0.0
+        cost_volume_fusion_dropout = 0.2
+        lora_rank, lora_alpha = 4, 4.0
     print(f"Loaded model configuration:")
     print(f"  Use cost volume fusion: {use_cost_volume_fusion}")
     print(f"  Num passes: {num_passes}")
     print(f"  No temporal fusion: {no_temporal_fusion}")
-
-    # Setup models - student mode
-    
     config = networks.MODEL_CONFIGS[depth_anything_encoder]
     encoder = networks.ManyDepthAnythingEncoder(encoder_name=depth_anything_encoder)
     depth_decoder = networks.ManyDepthAnythingDecoder(
-        patch_h=HEIGHT // 14, patch_w=WIDTH // 14, 
-        features=config['features'], 
-        in_channels=config['in_channels'], 
+        patch_h=HEIGHT // 14, patch_w=WIDTH // 14,
+        features=config['features'],
+        in_channels=config['in_channels'],
         out_channels=config['out_channels'],
         temporal_fusion=not no_temporal_fusion,
         use_cost_volume_fusion=use_cost_volume_fusion,
         cost_volume_depth_bins=cost_volume_depth_bins,
         cost_volume_depth_min=cost_volume_depth_min,
         cost_volume_depth_max=cost_volume_depth_max,
-        num_passes=num_passes)
-
-    encoder = replace_qkv_with_mergedlinear(encoder, lora_dropout=0.0)
-    depth_decoder = replace_conv_with_loraconv(depth_decoder, lora_dropout=0.0)
+        num_passes=num_passes,
+        num_register_tokens=num_register_tokens,
+        fusion_neighborhood_size=fusion_neighborhood_size,
+        fusion_num_scales=fusion_num_scales,
+        fusion_lora_rank=fusion_lora_rank,
+        fusion_lora_alpha=fusion_lora_alpha,
+        fusion_dropout=fusion_dropout,
+        fusion_drop_path=fusion_drop_path,
+        cost_volume_fusion_dropout=cost_volume_fusion_dropout,
+    )
+    encoder = replace_qkv_with_mergedlinear(encoder, r=lora_rank, lora_alpha=lora_alpha, lora_dropout=0.0)
+    depth_decoder = replace_conv_with_loraconv(depth_decoder, r=lora_rank, lora_alpha=lora_alpha, lora_dropout=0.0)
 
     # Load state dicts
     encoder.load_state_dict(encoder_dict, strict=False)

@@ -1,0 +1,8 @@
+# Ablation: train without LoRA (encoder and decoder use full parameters).
+# Base config is inherited in-file via 'extends'; override only what changes.
+#
+# Run: python manydepth/train.py -c configs/ablation_no_lora.yaml --log_dir outs/ablation_no_lora
+#
+extends: base.yaml
+no_lora: true
+model_name: "mdp_no_lora"

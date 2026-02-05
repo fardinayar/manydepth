@@ -69,11 +69,11 @@ class ManyDepthAnythingEncoder(nn.Module):
 
 class ManyDepthAnythingDecoder(nn.Module):
     def __init__(
-        self, 
-        in_channels=384, 
-        features=64, 
-        use_bn=False, 
-        out_channels=[48, 96, 192, 384], 
+        self,
+        in_channels=384,
+        features=64,
+        use_bn=False,
+        out_channels=[48, 96, 192, 384],
         use_clstoken=False,
         patch_h=518//14,
         patch_w=518//14,
@@ -84,6 +84,13 @@ class ManyDepthAnythingDecoder(nn.Module):
         cost_volume_depth_max=80.0,
         num_passes=2,
         num_register_tokens=8,
+        fusion_neighborhood_size=(3, 15),
+        fusion_num_scales=4,
+        fusion_lora_rank=32,
+        fusion_lora_alpha=4.0,
+        fusion_dropout=0.0,
+        fusion_drop_path=0.0,
+        cost_volume_fusion_dropout=0.2,
     ):
         super(ManyDepthAnythingDecoder, self).__init__()
         self.num_ch_enc = in_channels
@@ -153,13 +160,23 @@ class ManyDepthAnythingDecoder(nn.Module):
                     num_depth_bins=cost_volume_depth_bins,
                     depth_min=cost_volume_depth_min,
                     depth_max=cost_volume_depth_max,
-                    dropout=0.2
+                    dropout=cost_volume_fusion_dropout,
                 )
                 for _ in range(4)
             ])
         else:
             self.multi_frame_feature_fusion = nn.ModuleList([
-                MultiFrameFeatureFusion(in_channels, self.patch_h, self.patch_w, dropout=0.0, drop_path=0.0, temporal_fusion=self.temporal_fusion, num_register_tokens=self.num_register_tokens)
+                MultiFrameFeatureFusion(
+                    in_channels, self.patch_h, self.patch_w,
+                    dropout=fusion_dropout,
+                    drop_path=fusion_drop_path,
+                    neighborhood_size=fusion_neighborhood_size,
+                    temporal_fusion=self.temporal_fusion,
+                    num_register_tokens=self.num_register_tokens,
+                    num_scales=fusion_num_scales,
+                    lora_rank=fusion_lora_rank,
+                    lora_alpha=fusion_lora_alpha,
+                )
                 for _ in range(1)
             ])
         

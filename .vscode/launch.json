@@ -11,7 +11,7 @@
             "program": "${file}",
             "console": "integratedTerminal",
             "args": ["--data_path", "kitti_data", "--log_dir", "outs", "--model_name", "mda", "--use_depthanything_pose", "--png"]
-            //"args": ["--data_path", "../monodepth2/depth/kitti_data/", "--load_weights_folder", "outs/mda/models/weights_4", "--eval_mono"]
+            //"args": ["--data_path", "../monodepth2/depth/kitti_data/", "--load_weights_folder", "outs/mda/models/weights_4"]
         }
     ]
 }

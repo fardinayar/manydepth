@@ -59,7 +59,7 @@ class Trainer:
         self.num_pose_frames = 2
         
         # Gradient accumulation parameters
-        self.gradient_accumulation_steps = getattr(self.opt, 'gradient_accumulation_steps', 1)
+        self.gradient_accumulation_steps = self.opt.gradient_accumulation_steps
         self.effective_batch_size = self.opt.batch_size * self.gradient_accumulation_steps
         print(f"Gradient accumulation steps: {self.gradient_accumulation_steps}")
         print(f"Effective batch size: {self.effective_batch_size}")
@@ -81,7 +81,9 @@ class Trainer:
         self.models["encoder"] = networks.ManyDepthAnythingEncoder(encoder_name=self.opt.depth_anything_encoder)
         if not self.opt.no_lora:
             print("Using LoRA in the encoder")
-            self.models['encoder'] = replace_qkv_with_mergedlinear(self.models["encoder"], lora_dropout=0.4)
+            self.models['encoder'] = replace_qkv_with_mergedlinear(
+                self.models["encoder"], r=self.opt.lora_rank, lora_alpha=self.opt.lora_alpha, lora_dropout=self.opt.lora_dropout
+            )
         lora.mark_only_lora_as_trainable(self.models['encoder'])
 
         
@@ -92,10 +94,10 @@ class Trainer:
         if self.opt.no_temporal_fusion:
             print("Disabling temporal fusion in the depth decoder")
         
-        if getattr(self.opt, 'use_cost_volume_fusion', False):
+        if self.opt.use_cost_volume_fusion:
             print("Using cost volume feature fusion (pose required)")
-            print(f"Cost volume depth bins: {getattr(self.opt, 'cost_volume_depth_bins', 32)}")
-            print(f"Cost volume depth range: [{getattr(self.opt, 'cost_volume_depth_min', 0.1)}, {getattr(self.opt, 'cost_volume_depth_max', 80.0)}]")
+            print(f"Cost volume depth bins: {self.opt.cost_volume_depth_bins}")
+            print(f"Cost volume depth range: [{self.opt.cost_volume_depth_min}, {self.opt.cost_volume_depth_max}]")
         self.models["depth"] = networks.ManyDepthAnythingDecoder(
             in_channels=model_config['in_channels'],
             out_channels=model_config['out_channels'],
@@ -103,14 +105,26 @@ class Trainer:
             patch_h=self.opt.height // 14,
             patch_w=self.opt.width // 14,
             temporal_fusion=not self.opt.no_temporal_fusion,
-            use_cost_volume_fusion=getattr(self.opt, 'use_cost_volume_fusion', False),
-            cost_volume_depth_bins=getattr(self.opt, 'cost_volume_depth_bins', 32),
-            cost_volume_depth_min=getattr(self.opt, 'cost_volume_depth_min', 0.1),
-            cost_volume_depth_max=getattr(self.opt, 'cost_volume_depth_max', 80.0),
-            num_passes=getattr(self.opt, 'num_passes', 2),
-            num_register_tokens=getattr(self.opt, 'num_register_tokens', 8))
+            use_cost_volume_fusion=self.opt.use_cost_volume_fusion,
+            cost_volume_depth_bins=self.opt.cost_volume_depth_bins,
+            cost_volume_depth_min=self.opt.cost_volume_depth_min,
+            cost_volume_depth_max=self.opt.cost_volume_depth_max,
+            num_passes=self.opt.num_passes,
+            num_register_tokens=self.opt.num_register_tokens,
+            fusion_neighborhood_size=self.opt.fusion_neighborhood_size,
+            fusion_num_scales=self.opt.fusion_num_scales,
+            fusion_lora_rank=self.opt.fusion_lora_rank,
+            fusion_lora_alpha=self.opt.fusion_lora_alpha,
+            fusion_dropout=self.opt.fusion_dropout,
+            fusion_drop_path=self.opt.fusion_drop_path,
+            cost_volume_fusion_dropout=self.opt.cost_volume_fusion_dropout,
+        )
 
-        depthanything_weights = torch.load(f'checkpoints/depth_anything_v2_{self.opt.depth_anything_encoder}.pth', map_location='cpu')
+        depth_anything_path = os.path.join(
+            self.opt.depth_anything_checkpoint_dir,
+            f'depth_anything_v2_{self.opt.depth_anything_encoder}.pth'
+        )
+        depthanything_weights = torch.load(depth_anything_path, map_location='cpu')
         depthanything_weights_decoder = {}
         for key, value in depthanything_weights.items():
             if "depth_head" in key:
@@ -122,7 +136,9 @@ class Trainer:
         
         if not self.opt.no_lora:
             print("Using LoRA in the depth decoder")
-            self.models['depth'] = replace_conv_with_loraconv(self.models["depth"], lora_dropout=0.4)
+            self.models['depth'] = replace_conv_with_loraconv(
+                self.models["depth"], r=self.opt.lora_rank, lora_alpha=self.opt.lora_alpha, lora_dropout=self.opt.lora_dropout
+            )
             lora.mark_only_lora_as_trainable(self.models['depth'])
         print("Enable gradient for output convolution")
         # We need to enable gradient for output convolution to train the depth decoder, beacuse we have changed the activation function  from relu to sigmoid
@@ -167,7 +183,7 @@ class Trainer:
         
 
         self.models["pose_encoder"] = \
-            networks.ResnetEncoder(18, self.opt.weights_init == "pretrained",
+            networks.ResnetEncoder(self.opt.pose_encoder_num_layers, self.opt.weights_init == "pretrained",
                                     num_input_images=self.num_pose_frames)
         self.models["pose"] = \
             networks.PoseDecoder(self.models["pose_encoder"].num_ch_enc,
@@ -223,7 +239,11 @@ class Trainer:
         print('Total number of steps: ', self.num_total_steps, "Total number of epochs:", self.opt.num_epochs)
         
         self.model_optimizer = optim.AdamW(self.parameters_to_train, self.opt.learning_rate)
-        self.model_lr_scheduler = optim.lr_scheduler.StepLR(self.model_optimizer, step_size= 2 * ((self.num_total_steps)) // self.opt.num_epochs, gamma=0.1)
+        steps_per_epoch = self.num_total_steps // self.opt.num_epochs
+        step_size = steps_per_epoch * self.opt.scheduler_step_epochs
+        self.model_lr_scheduler = optim.lr_scheduler.StepLR(
+            self.model_optimizer, step_size=step_size, gamma=self.opt.scheduler_gamma
+        )
 
         # Warmup configuration
         self.warmup_steps = self.opt.warmup_steps
@@ -332,8 +352,8 @@ class Trainer:
             self.run_epoch()
             if (self.epoch + 1) % self.opt.save_frequency == 0:
                 self.save_model()
-            
-            
+        self.save_opts()  # save final config at end of run
+
     def run_epoch(self):
         """Run a single epoch of training and validation
         """
@@ -521,7 +541,7 @@ class Trainer:
         
 
         # Pass poses and intrinsics to depth decoder if using cost volume fusion
-        if getattr(self.opt, 'use_cost_volume_fusion', False):
+        if self.opt.use_cost_volume_fusion:
             # Get camera intrinsics for the current scale
             intrinsics = inputs[("K", 0)]  # [B, 3, 3] camera intrinsics
             depth, _ = self.models["depth"](features, lookup_features, relative_poses, intrinsics)
@@ -903,7 +923,6 @@ class Trainer:
             s1 = inputs["gps12"].float() / (t12 + 1e-7)
             s2 = inputs["gps23"].float() / (t23 + 1e-7) 
             
-            #g2s_loss = torch.nn.functional.huber_loss(s1, torch.ones_like(s1), delta=0.1) + torch.nn.functional.huber_loss(s2, torch.ones_like(s2), delta=0.1)
             g2s_loss = torch.nn.functional.mse_loss(s1, torch.ones_like(s1)) + torch.nn.functional.mse_loss(s2, torch.ones_like(s2))
             
             if not self.opt.no_loss_dynamic_weight:
@@ -1064,15 +1083,16 @@ class Trainer:
         
 
     def save_opts(self):
-        """Save options to disk so we know what we ran this experiment with
+        """Save config to run output dir and to models/ so we know what we ran with.
         """
         models_dir = os.path.join(self.log_path, "models")
         if not os.path.exists(models_dir):
             os.makedirs(models_dir)
-        to_save = self.opt.__dict__.copy()
-
-        with open(os.path.join(models_dir, 'opt.json'), 'w') as f:
-            json.dump(to_save, f, indent=2)
+        to_save = self.opt.to_dict() if hasattr(self.opt, 'to_dict') else self.opt.__dict__.copy()
+        # Save in models/ (next to weights) and at run root for easy find
+        for dest_dir in (models_dir, self.log_path):
+            with open(os.path.join(dest_dir, 'opt.json'), 'w') as f:
+                json.dump(to_save, f, indent=2)
 
     def save_model(self, save_step=False):
         """Save model weights to disk
@@ -1093,11 +1113,11 @@ class Trainer:
                 # save the sizes and ablation parameters - these are needed at prediction time
                 to_save['height'] = self.opt.height
                 to_save['width'] = self.opt.width
-                to_save['use_cost_volume_fusion'] = getattr(self.opt, 'use_cost_volume_fusion', False)
-                to_save['cost_volume_depth_bins'] = getattr(self.opt, 'cost_volume_depth_bins', 32)
-                to_save['cost_volume_depth_min'] = getattr(self.opt, 'cost_volume_depth_min', 0.1)
-                to_save['cost_volume_depth_max'] = getattr(self.opt, 'cost_volume_depth_max', 80.0)
-                to_save['num_passes'] = getattr(self.opt, 'num_passes', 2)
+                to_save['use_cost_volume_fusion'] = self.opt.use_cost_volume_fusion
+                to_save['cost_volume_depth_bins'] = self.opt.cost_volume_depth_bins
+                to_save['cost_volume_depth_min'] = self.opt.cost_volume_depth_min
+                to_save['cost_volume_depth_max'] = self.opt.cost_volume_depth_max
+                to_save['num_passes'] = self.opt.num_passes
                 to_save['no_temporal_fusion'] = self.opt.no_temporal_fusion
 
             torch.save(to_save, save_path)

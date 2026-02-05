@@ -1,0 +1,102 @@
+# Base training config for ManyDepth.
+# Use with: python manydepth/train.py -c configs/base.yaml
+# Override any key from the CLI, e.g.: python manydepth/train.py -c configs/base.yaml --learning_rate 2e-4
+
+# PATHS
+data_path: "kitti_data"
+log_dir: "~/tmp"
+model_name: "mdp"
+
+# TRAINING
+split: "eigen_zhou"
+dataset: "kitti"
+png: false
+height: 182
+width: 630
+disparity_smoothness: 0.0
+scales: [0]
+max_depth: 300.0
+frame_ids: [0, -1, 1]
+
+# OPTIMIZATION
+batch_size: 12
+learning_rate: 0.0001
+num_epochs: 5
+pytorch_random_seed: null
+max_grad_norm: 1.0
+warmup_steps: 1000
+
+# ABLATION FLAGS
+avg_reprojection: false
+disable_automasking: false
+weights_init: "pretrained"
+num_matching_frames: 1
+disable_motion_masking: false
+no_matching_augmentation: false
+no_temporal_fusion: false
+no_lora: false
+no_consistency_loss: false
+no_loss_dynamic_weight: false
+
+# SYSTEM
+no_cuda: false
+num_workers: 12
+
+# LOADING
+load_weights_folder: null
+mono_weights_folder: null
+models_to_load: [encoder, depth, pose_encoder, pose]
+
+# LOGGING
+log_frequency: 50
+save_frequency: 1
+save_intermediate_models: false
+
+# EVALUATION
+disable_median_scaling: false
+pred_depth_scale_factor: 1.0
+ext_disp_to_eval: null
+eval_split: eigen
+save_pred_disps: false
+no_eval: false
+eval_eigen_to_benchmark: false
+eval_teacher: false
+
+# DEPTH_ANYTHING
+depth_anything_encoder: "vits"
+depth_anything_checkpoint_dir: "checkpoints"
+encoder_lr_coef: 1.0
+fusion_lr_coef: 4.0
+g2s: false
+data_percent: 100.0
+pose_from_scratch: false
+gradient_accumulation_steps: 1
+
+# Cost volume fusion
+use_cost_volume_fusion: false
+cost_volume_depth_bins: 96
+cost_volume_depth_min: 0.1
+cost_volume_depth_max: 100.0
+num_passes: 2
+num_register_tokens: 4
+
+# Ablation: LoRA (encoder/decoder)
+lora_rank: 4
+lora_alpha: 4.0
+lora_dropout: 0.4
+
+# Ablation: feature fusion
+fusion_neighborhood_size: [3, 15]
+fusion_num_scales: 4
+fusion_lora_rank: 32
+fusion_lora_alpha: 4.0
+fusion_dropout: 0.0
+fusion_drop_path: 0.0
+cost_volume_fusion_dropout: 0.2
+
+# Ablation: scheduler
+scheduler_gamma: 0.1
+scheduler_step_epochs: 2
+
+# Ablation: pose encoder
+pose_encoder_num_layers: 18
