@@ -13,3 +13,4 @@ dependencies:
     - tensorboardX
     - scikit-image
     - tqdm
+    - PyYAML

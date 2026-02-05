@@ -59,7 +59,7 @@ class Trainer:
         self.num_pose_frames = 2
         
         # Gradient accumulation parameters
-        self.gradient_accumulation_steps = getattr(self.opt, 'gradient_accumulation_steps', 1)
+        self.gradient_accumulation_steps = self.opt.gradient_accumulation_steps
         self.effective_batch_size = self.opt.batch_size * self.gradient_accumulation_steps
         print(f"Gradient accumulation steps: {self.gradient_accumulation_steps}")
         print(f"Effective batch size: {self.effective_batch_size}")
@@ -81,7 +81,9 @@ class Trainer:
         self.models["encoder"] = networks.ManyDepthAnythingEncoder(encoder_name=self.opt.depth_anything_encoder)
         if not self.opt.no_lora:
             print("Using LoRA in the encoder")
-            self.models['encoder'] = replace_qkv_with_mergedlinear(self.models["encoder"], lora_dropout=0.4)
+            self.models['encoder'] = replace_qkv_with_mergedlinear(
+                self.models["encoder"], r=self.opt.lora_rank, lora_alpha=self.opt.lora_alpha, lora_dropout=self.opt.lora_dropout
+            )
         lora.mark_only_lora_as_trainable(self.models['encoder'])
 
         
@@ -92,10 +94,6 @@ class Trainer:
         if self.opt.no_temporal_fusion:
             print("Disabling temporal fusion in the depth decoder")
         
-        if getattr(self.opt, 'use_cost_volume_fusion', False):
-            print("Using cost volume feature fusion (pose required)")
-            print(f"Cost volume depth bins: {getattr(self.opt, 'cost_volume_depth_bins', 32)}")
-            print(f"Cost volume depth range: [{getattr(self.opt, 'cost_volume_depth_min', 0.1)}, {getattr(self.opt, 'cost_volume_depth_max', 80.0)}]")
         self.models["depth"] = networks.ManyDepthAnythingDecoder(
             in_channels=model_config['in_channels'],
             out_channels=model_config['out_channels'],
@@ -103,14 +101,21 @@ class Trainer:
             patch_h=self.opt.height // 14,
             patch_w=self.opt.width // 14,
             temporal_fusion=not self.opt.no_temporal_fusion,
-            use_cost_volume_fusion=getattr(self.opt, 'use_cost_volume_fusion', False),
-            cost_volume_depth_bins=getattr(self.opt, 'cost_volume_depth_bins', 32),
-            cost_volume_depth_min=getattr(self.opt, 'cost_volume_depth_min', 0.1),
-            cost_volume_depth_max=getattr(self.opt, 'cost_volume_depth_max', 80.0),
-            num_passes=getattr(self.opt, 'num_passes', 2),
-            num_register_tokens=getattr(self.opt, 'num_register_tokens', 8))
+            num_passes=self.opt.num_passes,
+            num_register_tokens=self.opt.num_register_tokens,
+            fusion_neighborhood_size=self.opt.fusion_neighborhood_size,
+            fusion_num_scales=self.opt.fusion_num_scales,
+            fusion_lora_rank=self.opt.fusion_lora_rank,
+            fusion_lora_alpha=self.opt.fusion_lora_alpha,
+            fusion_dropout=self.opt.fusion_dropout,
+            fusion_drop_path=self.opt.fusion_drop_path,
+        )
 
-        depthanything_weights = torch.load(f'checkpoints/depth_anything_v2_{self.opt.depth_anything_encoder}.pth', map_location='cpu')
+        depth_anything_path = os.path.join(
+            self.opt.depth_anything_checkpoint_dir,
+            f'depth_anything_v2_{self.opt.depth_anything_encoder}.pth'
+        )
+        depthanything_weights = torch.load(depth_anything_path, map_location='cpu')
         depthanything_weights_decoder = {}
         for key, value in depthanything_weights.items():
             if "depth_head" in key:
@@ -122,7 +127,9 @@ class Trainer:
         
         if not self.opt.no_lora:
             print("Using LoRA in the depth decoder")
-            self.models['depth'] = replace_conv_with_loraconv(self.models["depth"], lora_dropout=0.4)
+            self.models['depth'] = replace_conv_with_loraconv(
+                self.models["depth"], r=self.opt.lora_rank, lora_alpha=self.opt.lora_alpha, lora_dropout=self.opt.lora_dropout
+            )
             lora.mark_only_lora_as_trainable(self.models['depth'])
         print("Enable gradient for output convolution")
         # We need to enable gradient for output convolution to train the depth decoder, beacuse we have changed the activation function  from relu to sigmoid
@@ -167,7 +174,7 @@ class Trainer:
         
 
         self.models["pose_encoder"] = \
-            networks.ResnetEncoder(18, self.opt.weights_init == "pretrained",
+            networks.ResnetEncoder(self.opt.pose_encoder_num_layers, self.opt.weights_init == "pretrained",
                                     num_input_images=self.num_pose_frames)
         self.models["pose"] = \
             networks.PoseDecoder(self.models["pose_encoder"].num_ch_enc,
@@ -223,7 +230,11 @@ class Trainer:
         print('Total number of steps: ', self.num_total_steps, "Total number of epochs:", self.opt.num_epochs)
         
         self.model_optimizer = optim.AdamW(self.parameters_to_train, self.opt.learning_rate)
-        self.model_lr_scheduler = optim.lr_scheduler.StepLR(self.model_optimizer, step_size= 2 * ((self.num_total_steps)) // self.opt.num_epochs, gamma=0.1)
+        steps_per_epoch = self.num_total_steps // self.opt.num_epochs
+        step_size = steps_per_epoch * self.opt.scheduler_step_epochs
+        self.model_lr_scheduler = optim.lr_scheduler.StepLR(
+            self.model_optimizer, step_size=step_size, gamma=self.opt.scheduler_gamma
+        )
 
         # Warmup configuration
         self.warmup_steps = self.opt.warmup_steps
@@ -332,8 +343,8 @@ class Trainer:
             self.run_epoch()
             if (self.epoch + 1) % self.opt.save_frequency == 0:
                 self.save_model()
-            
-            
+        self.save_opts()  # save final config at end of run
+
     def run_epoch(self):
         """Run a single epoch of training and validation
         """
@@ -475,7 +486,7 @@ class Trainer:
         # apply static frame and zero cost volume augmentation
         batch_size = len(lookup_frames)
         augmentation_mask = torch.zeros([batch_size, 1, 1, 1]).to(self.device).float()
-        if is_train and not self.opt.no_matching_augmentation:
+        if is_train:
             for batch_idx in range(batch_size):
                 rand_num = random.random()
                 # static camera augmentation -> overwrite lookup frames with current frame
@@ -520,13 +531,7 @@ class Trainer:
             features, lookup_features = self.models["encoder"](inputs["color_aug", 0, 0], lookup_frames)
         
 
-        # Pass poses and intrinsics to depth decoder if using cost volume fusion
-        if getattr(self.opt, 'use_cost_volume_fusion', False):
-            # Get camera intrinsics for the current scale
-            intrinsics = inputs[("K", 0)]  # [B, 3, 3] camera intrinsics
-            depth, _ = self.models["depth"](features, lookup_features, relative_poses, intrinsics)
-        else:
-            depth, _ = self.models["depth"](features, lookup_features)
+        depth, _ = self.models["depth"](features, lookup_features)
         
         depth =  F.relu(depth)
         outputs.update({("disp", 0): depth})
@@ -657,9 +662,8 @@ class Trainer:
                     outputs[("sample", frame_id, scale)],
                     padding_mode="border", align_corners=True)
 
-                if not self.opt.disable_automasking:
-                    outputs[("color_identity", frame_id, scale)] = \
-                        inputs[("color", frame_id, source_scale)]
+                outputs[("color_identity", frame_id, scale)] = \
+                    inputs[("color", frame_id, source_scale)]
 
     def compute_reprojection_loss(self, pred, target):
         """Computes reprojection loss between a batch of predicted and target images
@@ -711,34 +715,19 @@ class Trainer:
                 reprojection_losses.append(self.compute_reprojection_loss(pred, target))
             reprojection_losses = torch.cat(reprojection_losses, 1)
 
-            if not self.opt.disable_automasking:
-                identity_reprojection_losses = []
-                for frame_id in self.opt.frame_ids[1:]:
-                    pred = inputs[("color", frame_id, source_scale)]
-                    identity_reprojection_losses.append(
-                        self.compute_reprojection_loss(pred, target))
+            identity_reprojection_losses = []
+            for frame_id in self.opt.frame_ids[1:]:
+                pred = inputs[("color", frame_id, source_scale)]
+                identity_reprojection_losses.append(
+                    self.compute_reprojection_loss(pred, target))
+            identity_reprojection_losses = torch.cat(identity_reprojection_losses, 1)
+            identity_reprojection_loss, _ = torch.min(identity_reprojection_losses, dim=1,
+                                                      keepdim=True)
 
-                identity_reprojection_losses = torch.cat(identity_reprojection_losses, 1)
+            reprojection_loss, _ = torch.min(reprojection_losses, dim=1, keepdim=True)
 
-                if self.opt.avg_reprojection:
-                    identity_reprojection_loss = identity_reprojection_losses.mean(1, keepdim=True)
-                else:
-                    # differently to Monodepth2, compute mins as we go
-                    identity_reprojection_loss, _ = torch.min(identity_reprojection_losses, dim=1,
-                                                              keepdim=True)
-            else:
-                identity_reprojection_loss = None
-
-            if self.opt.avg_reprojection:
-                reprojection_loss = reprojection_losses.mean(1, keepdim=True)
-            else:
-                # differently to Monodepth2, compute mins as we go
-                reprojection_loss, _ = torch.min(reprojection_losses, dim=1, keepdim=True)
-
-            if not self.opt.disable_automasking:
-                # add random numbers to break ties
-                if identity_reprojection_loss is not None:
-                    identity_reprojection_loss += torch.randn(identity_reprojection_loss.shape).to(self.device) * 0.00001
+            # add random numbers to break ties
+            identity_reprojection_loss += torch.randn(identity_reprojection_loss.shape).to(self.device) * 0.00001
 
             # find minimum losses from [reprojection, identity]
             reprojection_loss_mask = self.compute_loss_masks(
@@ -750,50 +739,58 @@ class Trainer:
             # Optionally ignore the highest-loss and lowest-loss pixels among the
             # already valid pixels, and visualize which pixels were ignored.
             # ------------------------------------------------------------------
-            top_percent = 0.30  # ignore top 40% highest-loss pixels over the full batch
-            bottom_percent = 0.0  # ignore bottom 10% lowest-loss pixels over the full batch
+            if self.opt.ignore_high_low_loss_pixels:
+                top_percent = 0.30  # ignore top 30% highest-loss pixels over the full batch
+                bottom_percent = 0.0  # ignore bottom 0% lowest-loss pixels over the full batch
 
-            valid = reprojection_loss_mask > 0
-            ignored_high_loss_mask = torch.zeros_like(
-                reprojection_loss_mask, device=reprojection_loss.device
-            )
-            ignored_low_loss_mask = torch.zeros_like(
-                reprojection_loss_mask, device=reprojection_loss.device
-            )
+                valid = reprojection_loss_mask > 0
+                ignored_high_loss_mask = torch.zeros_like(
+                    reprojection_loss_mask, device=reprojection_loss.device
+                )
+                ignored_low_loss_mask = torch.zeros_like(
+                    reprojection_loss_mask, device=reprojection_loss.device
+                )
 
-            # Collect ALL valid pixels from the whole batch
-            valid_vals = reprojection_loss[valid].detach().view(-1)
+                # Collect ALL valid pixels from the whole batch
+                valid_vals = reprojection_loss[valid].detach().view(-1)
 
-            if valid_vals.numel() > 0:
-                n = valid_vals.numel()
+                if valid_vals.numel() > 0:
+                    n = valid_vals.numel()
 
-                # Mask high-loss pixels
-                if top_percent > 0.0:
-                    high_percentile = 1.0 - top_percent
-                    # kthvalue is 1-indexed; pick the (percentile*n)-th smallest as threshold
-                    k_high = max(1, min(int(high_percentile * n) + 1, n))
-                    high_threshold, _ = torch.kthvalue(valid_vals, k_high)
+                    # Mask high-loss pixels
+                    if top_percent > 0.0:
+                        high_percentile = 1.0 - top_percent
+                        # kthvalue is 1-indexed; pick the (percentile*n)-th smallest as threshold
+                        k_high = max(1, min(int(high_percentile * n) + 1, n))
+                        high_threshold, _ = torch.kthvalue(valid_vals, k_high)
 
-                    # Mark high-loss pixels across the whole batch using the same threshold
-                    high = (reprojection_loss >= high_threshold) & valid
-                    ignored_high_loss_mask[high] = 1.0
+                        # Mark high-loss pixels across the whole batch using the same threshold
+                        high = (reprojection_loss >= high_threshold) & valid
+                        ignored_high_loss_mask[high] = 1.0
 
-                # Mask low-loss pixels
-                if bottom_percent > 0.0:
-                    low_percentile = bottom_percent
-                    k_low = max(1, min(int(low_percentile * n) + 1, n))
-                    low_threshold, _ = torch.kthvalue(valid_vals, k_low)
+                    # Mask low-loss pixels
+                    if bottom_percent > 0.0:
+                        low_percentile = bottom_percent
+                        k_low = max(1, min(int(low_percentile * n) + 1, n))
+                        low_threshold, _ = torch.kthvalue(valid_vals, k_low)
 
-                    # Mark low-loss pixels across the whole batch using the same threshold
-                    low = (reprojection_loss <= low_threshold) & valid
-                    ignored_low_loss_mask[low] = 1.0
+                        # Mark low-loss pixels across the whole batch using the same threshold
+                        low = (reprojection_loss <= low_threshold) & valid
+                        ignored_low_loss_mask[low] = 1.0
 
-                # Remove both high and low loss pixels from the effective mask
-                reprojection_loss_mask = reprojection_loss_mask * (1.0 - ignored_high_loss_mask) * (1.0 - ignored_low_loss_mask)
+                    # Remove both high and low loss pixels from the effective mask
+                    reprojection_loss_mask = reprojection_loss_mask * (1.0 - ignored_high_loss_mask) * (1.0 - ignored_low_loss_mask)
 
-            # Store visualization of ignored pixels (per-scale)
-            outputs[("high_loss_mask", scale)] = ignored_high_loss_mask.detach()
-            outputs[("low_loss_mask", scale)] = ignored_low_loss_mask.detach()
+                # Store visualization of ignored pixels (per-scale)
+                outputs[("high_loss_mask", scale)] = ignored_high_loss_mask.detach()
+                outputs[("low_loss_mask", scale)] = ignored_low_loss_mask.detach()
+            else:
+                outputs[("high_loss_mask", scale)] = torch.zeros_like(
+                    reprojection_loss_mask, device=reprojection_loss.device
+                ).detach()
+                outputs[("low_loss_mask", scale)] = torch.zeros_like(
+                    reprojection_loss_mask, device=reprojection_loss.device
+                ).detach()
 
 
             # Apply (possibly refined) mask to reprojection loss
@@ -813,7 +810,7 @@ class Trainer:
                 mono_depth = outputs[("mono_depth", 0, scale)].detach()
                 
                 # Define patch size
-                patch_size = 16
+                patch_size = 8
 
                 # Unfold into patches
                 b, c, h, w = multi_depth.shape
@@ -903,7 +900,6 @@ class Trainer:
             s1 = inputs["gps12"].float() / (t12 + 1e-7)
             s2 = inputs["gps23"].float() / (t23 + 1e-7) 
             
-            #g2s_loss = torch.nn.functional.huber_loss(s1, torch.ones_like(s1), delta=0.1) + torch.nn.functional.huber_loss(s2, torch.ones_like(s2), delta=0.1)
             g2s_loss = torch.nn.functional.mse_loss(s1, torch.ones_like(s1)) + torch.nn.functional.mse_loss(s2, torch.ones_like(s2))
             
             if not self.opt.no_loss_dynamic_weight:
@@ -1064,15 +1060,16 @@ class Trainer:
         
 
     def save_opts(self):
-        """Save options to disk so we know what we ran this experiment with
+        """Save config to run output dir and to models/ as YAML (config.yaml).
         """
+        import yaml
         models_dir = os.path.join(self.log_path, "models")
         if not os.path.exists(models_dir):
             os.makedirs(models_dir)
-        to_save = self.opt.__dict__.copy()
-
-        with open(os.path.join(models_dir, 'opt.json'), 'w') as f:
-            json.dump(to_save, f, indent=2)
+        to_save = self.opt.to_dict() if hasattr(self.opt, 'to_dict') else self.opt.__dict__.copy()
+        for dest_dir in (models_dir, self.log_path):
+            with open(os.path.join(dest_dir, 'config.yaml'), 'w') as f:
+                yaml.dump(to_save, f, default_flow_style=False, sort_keys=False)
 
     def save_model(self, save_step=False):
         """Save model weights to disk
@@ -1093,11 +1090,7 @@ class Trainer:
                 # save the sizes and ablation parameters - these are needed at prediction time
                 to_save['height'] = self.opt.height
                 to_save['width'] = self.opt.width
-                to_save['use_cost_volume_fusion'] = getattr(self.opt, 'use_cost_volume_fusion', False)
-                to_save['cost_volume_depth_bins'] = getattr(self.opt, 'cost_volume_depth_bins', 32)
-                to_save['cost_volume_depth_min'] = getattr(self.opt, 'cost_volume_depth_min', 0.1)
-                to_save['cost_volume_depth_max'] = getattr(self.opt, 'cost_volume_depth_max', 80.0)
-                to_save['num_passes'] = getattr(self.opt, 'num_passes', 2)
+                to_save['num_passes'] = self.opt.num_passes
                 to_save['no_temporal_fusion'] = self.opt.no_temporal_fusion
 
             torch.save(to_save, save_path)

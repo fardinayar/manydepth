@@ -1,0 +1,94 @@
+# Base training config for ManyDepth.
+# Use with: python manydepth/train.py -c configs/base.yaml
+# Override any key from the CLI, e.g.: python manydepth/train.py -c configs/base.yaml --learning_rate 2e-4
+
+# PATHS
+data_path: "kitti_data"           # Path to the training data root (KITTI, etc.)
+log_dir: "outs"                  # Directory for run logs and saved models
+model_name: "mdp"                 # Subfolder name under log_dir for this run
+
+# TRAINING
+split: "eigen_zhou"               # Train/val split: eigen_zhou, eigen_full, odom, benchmark, cityscapes_preprocessed
+dataset: "kitti"                  # Dataset: kitti, kitti_odom, cityscapes_preprocessed, gopro
+png: false                        # If true, load images from PNG instead of JPEG (KITTI raw)
+height: 182                       # Input image height (must be multiple of 14)
+width: 630                        # Input image width (must be multiple of 14)
+disparity_smoothness: 0.0         # Weight for disparity smoothness loss
+scales: [0]                       # Scales used in the loss (e.g. [0] or [0,1,2])
+max_depth: 300.0                  # Maximum depth value (meters)
+frame_ids: [0, -1, 1]             # Frame indices to load (0=ref, -1=prev, 1=next)
+
+# OPTIMIZATION
+batch_size: 12                    # Training batch size
+learning_rate: 0.0001             # Learning rate
+num_epochs: 5                     # Number of training epochs
+pytorch_random_seed: null         # Random seed for reproducibility (null = no fix)
+max_grad_norm: 1.0                # Gradient clipping max norm (0 to disable)
+warmup_steps: 1000                # LR warmup steps (0 to disable)
+
+# ABLATION FLAGS
+weights_init: "pretrained"        # Encoder/decoder init: pretrained or scratch
+num_matching_frames: 1            # Number of previous frames for cost volume
+no_temporal_fusion: false         # Disable temporal fusion in the depth decoder
+no_lora: false                    # Disable LoRA in encoder and decoder (use full params)
+no_consistency_loss: false        # Disable consistency loss
+no_loss_dynamic_weight: false     # Disable dynamic weighting of the loss
+ignore_high_low_loss_pixels: true  # Ignore top/bottom loss percentiles (ablation: set false to disable)
+
+# SYSTEM
+no_cuda: false                    # Disable CUDA (CPU only)
+num_workers: 12                   # DataLoader workers
+
+# LOADING
+load_weights_folder: null        # Path to folder to resume from (encoder/depth/pose weights)
+mono_weights_folder: null        # Path to monocular pretrained weights (optional)
+models_to_load: [encoder, depth, pose_encoder, pose]  # Which checkpoints to load when resuming
+
+# LOGGING
+log_frequency: 50                  # Batches between tensorboard logs
+save_frequency: 1                 # Epochs between full model saves
+save_intermediate_models: false   # Save a checkpoint at every log step
+
+# EVALUATION
+disable_median_scaling: false     # Disable median scaling when evaluating depth
+pred_depth_scale_factor: 1.0     # Multiply predictions by this before eval
+ext_disp_to_eval: null            # Optional path to .npy disparities to evaluate (skip model)
+eval_split: eigen                 # Eval split: eigen, eigen_benchmark, benchmark, odom_9, odom_10, cityscapes
+save_pred_disps: false            # Save predicted disparities to disk
+no_eval: false                    # Skip evaluation during/after training
+eval_eigen_to_benchmark: false    # Assume eigen .npy results but evaluate on benchmark protocol
+eval_teacher: false               # Evaluate the teacher (mono) network instead of multi-frame
+
+# DEPTH_ANYTHING
+depth_anything_encoder: "vits"    # Encoder size: vits, vitb, vitl, vitg
+depth_anything_checkpoint_dir: "checkpoints"  # Dir containing depth_anything_v2_<encoder>.pth
+encoder_lr_coef: 1.0              # Learning rate multiplier for the encoder
+fusion_lr_coef: 4.0               # Learning rate multiplier for feature fusion parameters
+g2s: false                        # Use g2s (gradient-to-scale) loss
+data_percent: 100.0               # Percent of training data to use (1–100)
+pose_from_scratch: false          # Initialize pose encoder/decoder randomly (no pretrain)
+gradient_accumulation_steps: 1    # Gradient accumulation steps (effective batch = batch_size * this)
+
+# Multi-frame fusion (attention-based)
+num_passes: 2                     # Number of fusion passes
+num_register_tokens: 4            # Register tokens for attention sink in MultiFrameFeatureFusion
+
+# Ablation: LoRA (encoder/decoder)
+lora_rank: 4                      # LoRA rank for encoder and decoder
+lora_alpha: 4.0                   # LoRA alpha (scaling)
+lora_dropout: 0.4                 # LoRA dropout (training only)
+
+# Ablation: feature fusion
+fusion_neighborhood_size: [3, 15] # Attention neighborhood (height, width); empty list = global
+fusion_num_scales: 4              # Number of scales in fusion block
+fusion_lora_rank: 32              # LoRA rank in fusion block
+fusion_lora_alpha: 4.0            # LoRA alpha in fusion block
+fusion_dropout: 0.0               # Dropout in fusion block
+fusion_drop_path: 0.0              # Stochastic depth in fusion block
+
+# Ablation: scheduler
+scheduler_gamma: 0.1              # LR decay factor (step scheduler)
+scheduler_step_epochs: 2         # Step LR every N epochs
+
+# Ablation: pose encoder
+pose_encoder_num_layers: 18      # ResNet layers for pose encoder (e.g. 18, 50)

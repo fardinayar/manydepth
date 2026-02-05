@@ -5,283 +5,163 @@
 # available in the LICENSE file.
 
 import os
-import argparse
+import sys
+from typing import Any, Dict, List, Tuple, Union, get_origin, get_args
 
-file_dir = os.path.dirname(__file__)  # the directory that options.py resides in
+try:
+    import yaml
+except ImportError:
+    yaml = None
+
+from config import TrainConfig, load_yaml_with_extends, get_config_schema
+
+# CLI options we consume ourselves (not TrainConfig keys)
+_CLI_SPECIAL = frozenset({"config", "c", "load_weights_folder"})
+
+
+def _collect_config_from_argv(argv: list) -> Tuple[list, str]:
+    """Collect -c/--config paths and --load_weights_folder from argv. Returns (config_paths, load_weights_folder)."""
+    config_paths = []
+    load_weights_folder = None
+    i = 0
+    while i < len(argv):
+        if argv[i] in ("-c", "--config") and i + 1 < len(argv):
+            config_paths.append(argv[i + 1])
+            i += 2
+            continue
+        if argv[i] == "--load_weights_folder" and i + 1 < len(argv):
+            load_weights_folder = os.path.expanduser(argv[i + 1])
+            i += 2
+            continue
+        i += 1
+    return config_paths, load_weights_folder
+
+
+def _parse_cli_overrides(argv: list) -> dict:
+    """
+    Parse argv for --key [value] overrides. No defaults.
+    Uses TrainConfig schema: bool = flag (--key means True), list = multiple values, optional = allow null.
+    """
+    _, type_hints = get_config_schema()
+    valid_keys = set(type_hints)
+    overrides = {}
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if not arg.startswith("--") or len(arg) == 2:
+            i += 1
+            continue
+        key = arg[2:].replace("-", "_")
+        if key in _CLI_SPECIAL or key not in valid_keys:
+            i += 1
+            continue
+        typ = type_hints[key]
+        origin = get_origin(typ)
+        args_ = get_args(typ)
+
+        if typ is bool:
+            overrides[key] = True
+            i += 1
+            continue
+        if origin is list:
+            # List[int], List[str], etc.: consume values until next --
+            vals = []
+            i += 1
+            while i < len(argv) and not argv[i].startswith("--"):
+                vals.append(argv[i])
+                i += 1
+            if args_:
+                elem_type = args_[0]
+                if elem_type is int:
+                    overrides[key] = [int(x) for x in vals]
+                elif elem_type is float:
+                    overrides[key] = [float(x) for x in vals]
+                else:
+                    overrides[key] = vals
+            else:
+                overrides[key] = vals
+            continue
+        # Single value
+        i += 1
+        if i >= len(argv):
+            continue
+        raw = argv[i]
+        i += 1
+        if raw.lower() in ("null", "none") and (origin is type(Union) and type(None) in (args_ or ())):
+            overrides[key] = None
+            continue
+        if typ is int:
+            overrides[key] = int(raw)
+        elif typ is float:
+            overrides[key] = float(raw)
+        elif typ is str:
+            overrides[key] = raw
+        elif origin is type(Union) and args_:
+            non_none = [a for a in args_ if a is not type(None)]
+            if non_none and non_none[0] is int:
+                overrides[key] = int(raw)
+            elif non_none and non_none[0] is float:
+                overrides[key] = float(raw)
+            elif non_none and non_none[0] is str:
+                overrides[key] = raw
+            else:
+                overrides[key] = raw
+        else:
+            overrides[key] = raw
+    return overrides
+
+
+def _build_merged_config(
+    config_paths: list,
+    load_weights_folder: str,
+    cli_overrides: dict,
+) -> dict:
+    """
+    Merge config from: saved config (if load_weights_folder: config.yaml) -> YAML from each -c (with extends) -> CLI.
+    No defaults; user must provide a complete config via YAML (and optional extends) or saved run.
+    """
+    config = {}
+    if load_weights_folder:
+        try:
+            cfg = TrainConfig.from_saved_run_dir(load_weights_folder)
+            config.update(cfg.to_dict())
+        except Exception:
+            pass
+    for path in config_paths:
+        if os.path.isfile(path) and yaml is not None:
+            try:
+                data, _ = load_yaml_with_extends(path)
+                config.update(data)
+            except Exception:
+                pass
+    config.update(cli_overrides)
+    return config
 
 
 class MonodepthOptions:
-    def __init__(self):
-        self.parser = argparse.ArgumentParser(description="ManyDepth options")
+    """Parse options from YAML (with optional extends) and CLI. No built-in defaults."""
 
-        # PATHS
-        self.parser.add_argument("--data_path",
-                                 type=str,
-                                 help="path to the training data",
-                                 default=os.path.join(file_dir, "kitti_data"))
-        self.parser.add_argument("--log_dir",
-                                 type=str,
-                                 help="log directory",
-                                 default=os.path.join(os.path.expanduser("~"), "tmp"))
-
-        # TRAINING options
-        self.parser.add_argument("--model_name",
-                                 type=str,
-                                 help="the name of the folder to save the model in",
-                                 default="mdp")
-        self.parser.add_argument("--split",
-                                 type=str,
-                                 help="which training split to use",
-                                 choices=["eigen_zhou", "eigen_full", "odom", "benchmark",
-                                          "cityscapes_preprocessed"],
-                                 default="eigen_zhou")
-        self.parser.add_argument("--num_layers",
-                                 type=int,
-                                 help="number of resnet layers",
-                                 default=18,
-                                 choices=[18, 34, 50, 101, 152])
-        self.parser.add_argument("--dataset",
-                                 type=str,
-                                 help="dataset to train on",
-                                 default="kitti",
-                                 choices=["kitti", "kitti_odom", "kitti_depth", "kitti_test",
-                                          "cityscapes_preprocessed", "gopro"])
-        self.parser.add_argument("--png",
-                                 help="if set, trains from raw KITTI png files (instead of jpgs)",
-                                 action="store_true")
-        self.parser.add_argument("--height",
-                                 type=int,
-                                 help="input image height",
-                                 default=182)
-        self.parser.add_argument("--width",
-                                 type=int,
-                                 help="input image width",
-                                 default=630)
-        self.parser.add_argument("--disparity_smoothness",
-                                 type=float,
-                                 help="disparity smoothness weight",
-                                 default=0.0)
-        self.parser.add_argument("--scales",
-                                 nargs="+",
-                                 type=int,
-                                 help="scales used in the loss",
-                                 default=[0])
-        self.parser.add_argument("--max_depth",
-                                 type=float,
-                                 help="maximum depth",
-                                 default=300.0)
-        self.parser.add_argument("--frame_ids",
-                                 nargs="+",
-                                 type=int,
-                                 help="frames to load",
-                                 default=[0, -1, 1])
-
-        # OPTIMIZATION options
-        self.parser.add_argument("--batch_size",
-                                 type=int,
-                                 help="batch size",
-                                 default=12)
-        self.parser.add_argument("--learning_rate",
-                                 type=float,
-                                 help="learning rate",
-                                 default=1e-4)
-        self.parser.add_argument("--num_epochs",
-                                 type=int,
-                                 help="number of epochs",
-                                 default=5)
-        self.parser.add_argument("--pytorch_random_seed",
-                                 default=None,
-                                 type=int)
-        self.parser.add_argument("--max_grad_norm",
-                                 type=float,
-                                 help="maximum gradient norm for clipping (0 to disable)",
-                                 default=1)
-        self.parser.add_argument("--warmup_steps",
-                                 type=int,
-                                 help="number of warmup steps for learning rate (0 to disable)",
-                                 default=1000)
-
-        # ABLATION options
-        self.parser.add_argument("--avg_reprojection",
-                                 help="if set, uses average reprojection loss",
-                                 action="store_true")
-        self.parser.add_argument("--disable_automasking",
-                                 help="if set, doesn't do auto-masking",
-                                 action="store_true")
-        self.parser.add_argument("--weights_init",
-                                 type=str,
-                                 help="pretrained or scratch",
-                                 default="pretrained",
-                                 choices=["pretrained", "scratch"])
-        self.parser.add_argument('--num_matching_frames',
-                                 help='Sets how many previous frames to load to build the cost'
-                                      'volume',
-                                 type=int,
-                                 default=1)
-        self.parser.add_argument("--disable_motion_masking",
-                                 help="If set, will not apply consistency loss in regions where"
-                                      "the cost volume is deemed untrustworthy",
-                                 action="store_true")
-        self.parser.add_argument("--no_matching_augmentation",
-                                 action='store_true',
-                                 help="If set, will not apply static camera augmentation or "
-                                      "zero cost volume augmentation during training")
-        self.parser.add_argument("--no_temporal_fusion",
-                                 action='store_true',
-                                 help="If set, will not use temporal fusion in the depth decoder")
-        self.parser.add_argument("--no_lora",
-                                 action='store_true',
-                                 help="If set, will not use LoRA in the depth decoder and encoder")
-        self.parser.add_argument("--no_consistency_loss",
-                                 action='store_true',
-                                 help="If set, will not use consistency loss in the depth decoder")
-        self.parser.add_argument("--no_loss_dynamic_weight",
-                                 action='store_true',
-                                 help="If set, will not use dynamic weight for the loss")
-        
-
-        # SYSTEM options
-        self.parser.add_argument("--no_cuda",
-                                 help="if set disables CUDA",
-                                 action="store_true")
-        self.parser.add_argument("--num_workers",
-                                 type=int,
-                                 help="number of dataloader workers",
-                                 default=12)
-
-        # LOADING options
-        self.parser.add_argument("--load_weights_folder",
-                                 type=str,
-                                 help="name of model to load")
-        self.parser.add_argument("--mono_weights_folder",
-                                 type=str)
-        self.parser.add_argument("--models_to_load",
-                                 nargs="+",
-                                 type=str,
-                                 help="models to load",
-                                 default=["encoder", "depth", "pose_encoder", "pose"])
-
-        # LOGGING options
-        self.parser.add_argument("--log_frequency",
-                                 type=int,
-                                 help="number of batches between each tensorboard log",
-                                 default=50)
-        self.parser.add_argument("--save_frequency",
-                                 type=int,
-                                 help="number of epochs between each save",
-                                 default=1)
-        self.parser.add_argument("--save_intermediate_models",
-                                 help="if set, save the model each time we log to tensorboard",
-                                 action='store_true')
-
-        # EVALUATION options
-        self.parser.add_argument("--eval_mono",
-                                 help="if set evaluates in mono mode",
-                                 action="store_true")
-        self.parser.add_argument("--disable_median_scaling",
-                                 help="if set disables median scaling in evaluation",
-                                 action="store_true")
-        self.parser.add_argument("--pred_depth_scale_factor",
-                                 help="if set multiplies predictions by this number",
-                                 type=float,
-                                 default=1)
-        self.parser.add_argument("--ext_disp_to_eval",
-                                 type=str,
-                                 help="optional path to a .npy disparities file to evaluate")
-        self.parser.add_argument("--eval_split",
-                                 type=str,
-                                 default="eigen",
-                                 choices=["eigen", "eigen_benchmark", "benchmark", "odom_9",
-                                          "odom_10", "cityscapes"],
-                                 help="which split to run eval on")
-        self.parser.add_argument("--save_pred_disps",
-                                 help="if set saves predicted disparities",
-                                 action="store_true")
-        self.parser.add_argument("--no_eval",
-                                 help="if set disables evaluation",
-                                 action="store_true")
-        self.parser.add_argument("--eval_eigen_to_benchmark",
-                                 help="if set assume we are loading eigen results from npy but "
-                                      "we want to evaluate using the new benchmark.",
-                                 action="store_true")
-        self.parser.add_argument("--eval_out_dir",
-                                 help="if set will output the disparities to this folder",
-                                 type=str)
-
-        self.parser.add_argument('--static_camera',
-                                 action='store_true',
-                                 help='If set, during evaluation the current frame will also be'
-                                      'used as the lookup frame, to simulate a static camera')
-        self.parser.add_argument('--eval_teacher',
-                                 action='store_true',
-                                 help='If set, the teacher network will be evaluated')
-        
-        # DEPTH_ANYTHING options
-        self.parser.add_argument('--depth_anything_encoder',
-                                 type=str,
-                                 choices=["vits", "vitb", "vitl", "vitg"],
-                                 default="vits")
-        
-        self.parser.add_argument('--depth_anything_checkpoint',
-                                 type=str,
-                                 default='checkpoints')
-        
-        self.parser.add_argument('--encoder_lr_coef',
-                                 type=float,
-                                 default=1.0)
-        
-        self.parser.add_argument('--fusion_lr_coef',
-                                 type=float,
-                                 default=4.0,
-                                 help='Learning rate multiplier for feature fusion parameters')
-        
-        self.parser.add_argument("--g2s",
-                         help="use g2s loss",
-                         action="store_true")
-        
-        self.parser.add_argument('--data_percent',
-                                 type=float,
-                                 default=100.0)
-        
-        self.parser.add_argument('--pose_from_scratch',
-                                 action='store_true',
-                                 help='If set, the pose encoder and decoder will be initialized randomly')
-        
-        self.parser.add_argument('--gradient_accumulation_steps',
-                                 type=int,
-                                 default=1,
-                                 help='Number of gradient accumulation steps')
-        
-        # Cost Volume Feature Fusion options
-        self.parser.add_argument('--use_cost_volume_fusion',
-                                 help='Use cost volume feature fusion instead of attention-based fusion',
-                                 action='store_true')
-        self.parser.add_argument('--cost_volume_depth_bins',
-                                 type=int,
-                                 default=96,
-                                 help='Number of depth bins for cost volume')
-        self.parser.add_argument('--cost_volume_depth_min',
-                                 type=float,
-                                 default=0.1,
-                                 help='Minimum depth for cost volume')
-        self.parser.add_argument('--cost_volume_depth_max',
-                                 type=float,
-                                 default=100.0,
-                                 help='Maximum depth for cost volume')
-        # Pose is mandatory for cost volume fusion; keep no option flag
-        
-        # Feature fusion passes
-        self.parser.add_argument('--num_passes',
-                                 type=int,
-                                 default=2,
-                                 help='Number of fusion passes for attention-based feature fusion')
-        
-        # Register tokens for attention-based fusion
-        self.parser.add_argument('--num_register_tokens',
-                                 type=int,
-                                 default=4,
-                                 help='Number of register tokens for attention sink in MultiFrameFeatureFusion')
-        
-    def parse(self):
-        self.options = self.parser.parse_args()
-        return self.options
+    def parse(self) -> TrainConfig:
+        if "--help" in sys.argv or "-h" in sys.argv:
+            print("Usage: provide config via -c/--config <file.yaml> (use 'extends: base.yaml' for a full template).")
+            print("Override with --key value. Example: -c configs/base.yaml --log_dir outs/run1")
+            sys.exit(0)
+        config_paths, load_weights_folder = _collect_config_from_argv(sys.argv)
+        cli_overrides = _parse_cli_overrides(sys.argv)
+        merged = _build_merged_config(config_paths, load_weights_folder, cli_overrides)
+        if not merged:
+            raise ValueError(
+                "No config provided. Use -c/--config <file.yaml> (with optional 'extends: base.yaml' in the file) "
+                "and/or --load_weights_folder <run_dir> to load a saved run's config."
+            )
+        # Normalize list/tuple fields for from_dict
+        if merged.get("fusion_neighborhood_size") is not None:
+            ne = merged["fusion_neighborhood_size"]
+            if isinstance(ne, (list, tuple)):
+                if len(ne) == 0:
+                    merged["fusion_neighborhood_size"] = None
+                elif len(ne) == 1:
+                    merged["fusion_neighborhood_size"] = (int(ne[0]), int(ne[0]))
+                else:
+                    merged["fusion_neighborhood_size"] = tuple(int(x) for x in ne)
+        return TrainConfig.from_dict(merged)

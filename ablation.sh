@@ -36,7 +36,7 @@ CUDA_VISIBLE_DEVICES=1 python manydepth/train.py\
     --png \
     --g2s \
 
-1.2 ManyDepth without LoRA
+# 1.2 ManyDepth without LoRA
 echo "1.2 Training ManyDepth without LoRA..."
 CUDA_VISIBLE_DEVICES=1 python manydepth/train.py\
     --data_path "$DATA_PATH" \

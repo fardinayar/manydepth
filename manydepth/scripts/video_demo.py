@@ -20,17 +20,8 @@ import json
 import sys
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
-from networks.replace_with_lora import replace_qkv_with_mergedlinear, replace_conv_with_loraconv
-import networks
-from layers import disp_to_depth, BackprojectDepth
-
-def load_image(image_path, height, width):
-    """Load and preprocess an image"""
-    image = Image.open(image_path).convert('RGB')
-    image = image.resize((width, height), Image.LANCZOS)
-    image = np.array(image).astype(np.float32) / 255.0
-    image = torch.from_numpy(image).permute(2, 0, 1).unsqueeze(0)
-    return image
+from layers import disp_to_depth
+from utils_scripts import load_image, setup_models, predict_depth_student
 
 def colorize_depth(depth, min_depth=0.1, max_depth=80):
     """Convert depth map to colorized visualization"""
@@ -221,76 +212,6 @@ def overlay_masks_with_distance(image, masks, labels, depth_map, alpha=0.3):
                        font, font_scale, (255, 255, 255), thickness)
     
     return overlay
-
-def setup_models(weights_folder, depth_anything_encoder, height, width, device):
-    """Setup encoder and decoder models - student mode only, no poses"""
-    
-    encoder_path = os.path.join(weights_folder, "encoder.pth")
-    decoder_path = os.path.join(weights_folder, "depth.pth")
-    print("-> Loading student models (multi-frame, no poses)")
-
-    if not os.path.exists(encoder_path) or not os.path.exists(decoder_path):
-        raise FileNotFoundError(f"Model weights not found in {weights_folder}")
-
-    print(f"-> Loading weights from {weights_folder}")
-    
-    encoder_dict = torch.load(encoder_path, map_location=device)
-    
-    # Get model dimensions
-    try:
-        HEIGHT, WIDTH = encoder_dict['height'], encoder_dict['width']
-        print(f"Using model dimensions: {HEIGHT}x{WIDTH}")
-    except KeyError:
-        print('No "height" or "width" keys found in the encoder state_dict, using provided values!')
-        HEIGHT, WIDTH = height, width
-    
-    # Load ablation parameters from encoder state dict
-    use_cost_volume_fusion = encoder_dict.get('use_cost_volume_fusion', False)
-    cost_volume_depth_bins = encoder_dict.get('cost_volume_depth_bins', 32)
-    cost_volume_depth_min = encoder_dict.get('cost_volume_depth_min', 0.1)
-    cost_volume_depth_max = encoder_dict.get('cost_volume_depth_max', 80.0)
-    num_passes = encoder_dict.get('num_passes', 2)
-    no_temporal_fusion = encoder_dict.get('no_temporal_fusion', False)
-    
-    print(f"Loaded model configuration:")
-    print(f"  Use cost volume fusion: {use_cost_volume_fusion}")
-    print(f"  Num passes: {num_passes}")
-    print(f"  No temporal fusion: {no_temporal_fusion}")
-
-    # Setup models - student mode
-    encoder = networks.ManyDepthAnythingEncoder(encoder_name=depth_anything_encoder)
-    depth_decoder = networks.ManyDepthAnythingDecoder(
-        patch_h=HEIGHT // 14, patch_w=WIDTH // 14,
-        temporal_fusion=not no_temporal_fusion,
-        use_cost_volume_fusion=use_cost_volume_fusion,
-        cost_volume_depth_bins=cost_volume_depth_bins,
-        cost_volume_depth_min=cost_volume_depth_min,
-        cost_volume_depth_max=cost_volume_depth_max,
-        num_passes=num_passes)
-
-    encoder = replace_qkv_with_mergedlinear(encoder, lora_dropout=0.0)
-    depth_decoder = replace_conv_with_loraconv(depth_decoder, lora_dropout=0.0)
-
-    # Load state dicts
-    encoder.load_state_dict(encoder_dict, strict=False)
-    depth_decoder.load_state_dict(torch.load(decoder_path, map_location=device))
-    
-    # Move to device and set to eval mode
-    encoder.eval()
-    depth_decoder.eval()
-    encoder.to(device)
-    depth_decoder.to(device)
-    
-    return encoder, depth_decoder, HEIGHT, WIDTH
-
-def predict_depth_student(encoder, depth_decoder, input_color, lookup_frames):
-    """Student mode depth prediction - multi-frame without poses"""
-    
-    features, lookup_features = encoder(input_color, lookup_frames)
-    patch_h, patch_w = input_color.shape[-2] // 14, input_color.shape[-1] // 14
-    output, _ = depth_decoder(features, lookup_features, patch_h, patch_w)
-    
-    return output
 
 def create_video_demo(image_folder, weights_folder, output_video, 
                      depth_anything_encoder="vits", height=288, width=512, fps=15,
