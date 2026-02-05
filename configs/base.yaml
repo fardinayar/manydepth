@@ -10,7 +10,7 @@ model_name: "mdp"                 # Subfolder name under log_dir for this run
 # TRAINING
 split: "eigen_zhou"               # Train/val split: eigen_zhou, eigen_full, odom, benchmark, cityscapes_preprocessed
 dataset: "kitti"                  # Dataset: kitti, kitti_odom, cityscapes_preprocessed, gopro
-png: false                        # If true, load images from PNG instead of JPEG (KITTI raw)
+png: true                        # If true, load images from PNG instead of JPEG (KITTI raw)
 height: 182                       # Input image height (must be multiple of 14)
 width: 630                        # Input image width (must be multiple of 14)
 disparity_smoothness: 0.0         # Weight for disparity smoothness loss
@@ -64,7 +64,7 @@ depth_anything_encoder: "vits"    # Encoder size: vits, vitb, vitl, vitg
 depth_anything_checkpoint_dir: "checkpoints"  # Dir containing depth_anything_v2_<encoder>.pth
 encoder_lr_coef: 1.0              # Learning rate multiplier for the encoder
 fusion_lr_coef: 4.0               # Learning rate multiplier for feature fusion parameters
-g2s: false                        # Use g2s (gradient-to-scale) loss
+g2s: true                        # Use g2s (gradient-to-scale) loss
 data_percent: 100.0               # Percent of training data to use (1–100)
 pose_from_scratch: false          # Initialize pose encoder/decoder randomly (no pretrain)
 gradient_accumulation_steps: 1    # Gradient accumulation steps (effective batch = batch_size * this)
