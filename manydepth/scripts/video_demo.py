@@ -20,8 +20,7 @@ import json
 import sys
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
-from layers import disp_to_depth
-from utils_scripts import load_image, setup_models, predict_depth_student
+from utils_scripts import load_image, setup_models, predict_depth_student, postprocess_depth_output
 
 def colorize_depth(depth, min_depth=0.1, max_depth=80):
     """Convert depth map to colorized visualization"""
@@ -308,8 +307,7 @@ def create_video_demo(image_folder, weights_folder, output_video,
             output = predict_depth_student(encoder, depth_decoder, input_color, lookup_frames)
             
             # Convert to depth and disparity
-            output = output.sigmoid()
-            pred_disp, pred_depth = disp_to_depth(output, min_depth, max_depth)
+            pred_disp, pred_depth = postprocess_depth_output(output, max_depth)
             
             # Convert disparity and depth to numpy
             disp_map = pred_disp.cpu().squeeze().numpy()
@@ -434,4 +432,4 @@ def main():
     )
 
 if __name__ == "__main__":
-    main() 
+    main()

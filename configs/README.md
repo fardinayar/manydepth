@@ -4,11 +4,15 @@
 
 Priority (lowest to highest):
 
-1. **Parser defaults** (in `manydepth/options.py`)
+1. **Saved run config** from `--load_weights_folder`, when provided
 2. **Config file(s)** from `-c` / `--config` (if you pass multiple, **later files override earlier**)
 3. **Command line** arguments
 
-So: **CLI overrides config file overrides defaults.**
+So: **CLI overrides config file overrides a saved run config.**
+
+There are no parser defaults. A run needs either a complete config file, a config
+that inherits a complete base via `extends`, or a saved run config from
+`--load_weights_folder`.
 
 ## Base config inherited in-file (`extends`)
 
@@ -36,9 +40,10 @@ Then a single `-c configs/ablation_no_lora.yaml` gives you the full base plus th
 |--------|----------|------------|
 | `ablation_no_lora.yaml` | no_lora: true | mdp_no_lora |
 | `ablation_no_temporal_fusion.yaml` | no_temporal_fusion: true | mdp_no_temporal_fusion |
+| `ablation_independent_fusion_blocks.yaml` | fusion_independent_blocks: true, fusion_lora_rank: 0 | mdp_independent_fusion_blocks |
 | `ablation_no_consistency_loss.yaml` | no_consistency_loss: true | mdp_no_consistency_loss |
 | `ablation_no_loss_dynamic_weight.yaml` | no_loss_dynamic_weight: true | mdp_no_loss_dynamic_weight |
-| `ablation_no_ignore_high_low_loss.yaml` | ignore_high_low_loss_pixels: false | mdp_no_ignore_high_low_loss |
+| `ablation_no_ignore_high_low_loss.yaml` | ignore_high_low_loss_pixels: false (disables high-loss filtering) | mdp_no_ignore_high_low_loss |
 
 ### Using one config file
 

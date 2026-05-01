@@ -88,7 +88,7 @@ To recreate the results from our paper, run:
 
 ```bash
 CUDA_VISIBLE_DEVICES=<your_desired_GPU> \
-python -m manydepth.train \
+python manydepth/train.py -c configs/base.yaml \
     --data_path <your_KITTI_path> \
     --log_dir <your_save_path>  \
     --model_name <your_model_name>
@@ -96,6 +96,7 @@ python -m manydepth.train \
 
 Depending on the size of your GPU, you may need to set `--batch_size` to be lower than 12. Additionally you can train
 a high resolution model by adding `--height 320 --width 1024`.
+Commands in this repository are documented using script paths, not `python -m`, because the code uses local sibling imports.
 
 For instructions on downloading the KITTI dataset, see [Monodepth2](https://github.com/nianticlabs/monodepth2)
 
@@ -103,17 +104,14 @@ To train a CityScapes model, run:
 
 ```bash
 CUDA_VISIBLE_DEVICES=<your_desired_GPU> \
-python -m manydepth.train \
+python manydepth/train.py -c configs/base.yaml \
     --data_path <your_preprocessed_cityscapes_path> \
     --log_dir <your_save_path>  \
     --model_name <your_model_name> \
     --dataset cityscapes_preprocessed \
     --split cityscapes_preprocessed \
-    --freeze_teacher_epoch 5 \
     --height 192 --width 512
 ```
-
-Note here the `--freeze_teacher_epoch 5` command - we found this to be important for Cityscapes models, due to the large number of images in the training set. 
 
 This assumes you have already preprocessed the CityScapes dataset using SfMLearner's [prepare_train_data.py](https://github.com/tinghuiz/SfMLearner/blob/master/data/prepare_train_data.py) script.
 We used the following command:
@@ -144,10 +142,10 @@ To evaluate a model on KITTI, run:
 
 ```bash
 CUDA_VISIBLE_DEVICES=<your_desired_GPU> \
-python -m manydepth.evaluate_depth \
+python manydepth/evaluate_depth_mda.py \
     --data_path <your_KITTI_path> \
-    --load_weights_folder <your_model_path>
-    --eval_mono
+    --load_weights_folder <your_model_path> \
+    --eval_split eigen
 ```
 
 Make sure you have first run `export_gt_depth.py` to extract ground truth files.
@@ -156,10 +154,9 @@ And to evaluate a model on Cityscapes, run:
 
 ```bash
 CUDA_VISIBLE_DEVICES=<your_desired_GPU> \
-python -m manydepth.evaluate_depth \
+python manydepth/evaluate_depth_mda.py \
     --data_path <your_cityscapes_path> \
-    --load_weights_folder <your_model_path>
-    --eval_mono \
+    --load_weights_folder <your_model_path> \
     --eval_split cityscapes
 ```
 
@@ -169,28 +166,26 @@ We provide ground truth depth files [HERE](https://storage.googleapis.com/nianti
 which were converted from pixel disparities using intrinsics and the known baseline. Download this and unzip into `splits/cityscapes`.
 
 
-If you want to evaluate a teacher network (i.e. the monocular network used for consistency loss), then add the flag `--eval_teacher`. This will 
-load the weights of `mono_encoder.pth` and `mono_depth.pth`, which are provided for our KITTI models. 
+If you want to evaluate a teacher network (i.e. the monocular network used for consistency loss), then add the flag `--eval_teacher`. This will
+load the weights of `mono_encoder.pth` and `mono_depth.pth`.
 
 ## 🖼 Running on your own images
 
-We provide some sample code in `test_simple.py` which demonstrates multi-frame inference.
-This predicts depth for a sequence of two images cropped from a [dashcam video](https://www.youtube.com/watch?v=sF0wXxZwISw).
-Prediction also requires an estimate of the intrinsics matrix, in json format.
-For the provided test images, we have estimated the intrinsics to be equivalent to those of the KITTI dataset.
-Note that the intrinsics provided in the json file are expected to be in [normalised coordinates](https://github.com/nianticlabs/monodepth2/issues/6#issuecomment-494407590).
+The inference helpers in `manydepth/scripts/` demonstrate multi-frame inference.
+`save_pointcloud.py` predicts depth for a target image and one lookup frame.
+If you provide `--fx` and `--fy`, it can also export a point cloud.
 
-Download and unzip model weights from one of the links above, and then run the following command:
+Download and unzip model weights, then run:
 
 ```bash
-python -m manydepth.test_simple \
-    --target_image_path assets/test_sequence_target.jpg \
-    --source_image_path assets/test_sequence_source.jpg \
-    --intrinsics_json_path assets/test_sequence_intrinsics.json \
-    --model_path path/to/weights
+python manydepth/scripts/save_pointcloud.py \
+    --target_image assets/test_sequence_target.jpg \
+    --lookup_frame assets/test_sequence_source.jpg \
+    --weights_folder path/to/weights \
+    --output_dir outputs/demo
 ```
 
-A predicted depth map rendering will be saved to `assets/test_sequence_target_disp.jpeg`.
+Depth and disparity arrays will be saved under `outputs/demo`.
 
 ## 👩‍⚖️ License
 

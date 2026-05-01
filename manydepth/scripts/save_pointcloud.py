@@ -18,13 +18,13 @@ import open3d as o3d
 import sys
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
-from layers import disp_to_depth
 from utils_scripts import (
     load_image,
     load_image_from_array,
     get_original_rgb_image,
     setup_models,
     predict_depth_student,
+    postprocess_depth_output,
     depth_to_pointcloud,
 )
 
@@ -81,8 +81,7 @@ def infer_depth_disparity_and_pointcloud(
         lookup_frames = lookup_color.unsqueeze(1).to(device)
 
         output = predict_depth_student(encoder, depth_decoder, target_color, lookup_frames)
-        output = output.sigmoid()
-        pred_disp, pred_depth = disp_to_depth(output, max_depth)
+        pred_disp, pred_depth = postprocess_depth_output(output, max_depth)
 
         disp_map = pred_disp.cpu().squeeze().numpy()
         depth_map = pred_depth.cpu().squeeze().numpy()

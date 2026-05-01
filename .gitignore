@@ -17,4 +17,7 @@ Grounded-SAM-2/
 *.ply
 splits/eigen_benchmark/gt_depths.npz
 splits/eigen_benchmark/gt_depths.npz
-miyabi_run.bash
+*.bash
+1.txt
+2.txt
+*.bash.*

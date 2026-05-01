@@ -5,9 +5,12 @@
 # available in the LICENSE file.
 
 import os
+import subprocess
+import sys
 os.environ["MKL_NUM_THREADS"] = "1"  # noqa F402
 os.environ["NUMEXPR_NUM_THREADS"] = "1"  # noqa F402
 os.environ["OMP_NUM_THREADS"] = "1"  # noqa F402
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/manydepth_matplotlib")
 
 import numpy as np
 import time
@@ -24,12 +27,15 @@ import json
 
 from utils import readlines, sec_to_hm_str
 from layers import SSIM, BackprojectDepth, Project3D, transformation_from_parameters, \
-    disp_to_depth, get_smooth_loss, compute_depth_errors
+    disp_to_depth, get_smooth_loss
 import loralib as lora
 
 import datasets, networks
+import matplotlib
+matplotlib.use("Agg")  # headless backend for batch/PBS (avoids hang when no DISPLAY)
 import matplotlib.pyplot as plt
-from networks.replace_with_lora import replace_qkv_with_mergedlinear, replace_conv_with_loraconv
+from PIL import Image
+from networks.replace_with_lora import replace_mlp_with_lora, replace_conv_with_loraconv
 _DEPTH_COLORMAP = plt.get_cmap('plasma', 256)  # for plotting
 
 
@@ -44,6 +50,7 @@ class Trainer:
         self.opt = options
 
         self.log_path = os.path.join(self.opt.log_dir, self.opt.model_name)
+        self.prediction_output_path = os.path.join("output_preds", self.opt.model_name)
 
         # checking height and width are multiples of 14
         assert self.opt.height % 14 == 0, "'height' must be a multiple of 14"
@@ -54,6 +61,8 @@ class Trainer:
 
         self.device = torch.device("cpu" if self.opt.no_cuda else "cuda")
 
+        self.epoch = 0
+        self.step = 0
         self.num_scales = len(self.opt.scales)
         self.num_input_frames = len(self.opt.frame_ids)
         self.num_pose_frames = 2
@@ -66,6 +75,8 @@ class Trainer:
 
         assert self.opt.frame_ids[0] == 0, "frame_ids must start with 0"
         assert len(self.opt.frame_ids) > 1, "frame_ids must have more than 1 frame specified"
+        if self.opt.num_matching_frames != 1:
+            raise ValueError("num_matching_frames must be 1 with the current temporal fusion block")
 
         # check the frames we need the dataloader to load
         frames_to_load = self.opt.frame_ids.copy()
@@ -78,13 +89,20 @@ class Trainer:
         print('Loading frames: {}'.format(frames_to_load))
 
         # MODEL SETUP
-        self.models["encoder"] = networks.ManyDepthAnythingEncoder(encoder_name=self.opt.depth_anything_encoder)
+        self.models["encoder"] = networks.ManyDepthAnythingEncoder(
+            encoder_name=self.opt.depth_anything_encoder,
+            checkpoint_dir=self.opt.depth_anything_checkpoint_dir,
+        )
         if not self.opt.no_lora:
             print("Using LoRA in the encoder")
-            self.models['encoder'] = replace_qkv_with_mergedlinear(
+            self.models['encoder'] = replace_mlp_with_lora(
                 self.models["encoder"], r=self.opt.lora_rank, lora_alpha=self.opt.lora_alpha, lora_dropout=self.opt.lora_dropout
             )
-        lora.mark_only_lora_as_trainable(self.models['encoder'])
+            lora.mark_only_lora_as_trainable(self.models['encoder'])
+        else:
+            print("Training full encoder parameters without LoRA")
+            for param in self.models["encoder"].parameters():
+                param.requires_grad = True
 
         
         self.models["encoder"].to(self.device)
@@ -105,6 +123,7 @@ class Trainer:
             num_register_tokens=self.opt.num_register_tokens,
             fusion_neighborhood_size=self.opt.fusion_neighborhood_size,
             fusion_num_scales=self.opt.fusion_num_scales,
+            fusion_independent_blocks=self.opt.fusion_independent_blocks,
             fusion_lora_rank=self.opt.fusion_lora_rank,
             fusion_lora_alpha=self.opt.fusion_lora_alpha,
             fusion_dropout=self.opt.fusion_dropout,
@@ -132,7 +151,7 @@ class Trainer:
             )
             lora.mark_only_lora_as_trainable(self.models['depth'])
         print("Enable gradient for output convolution")
-        # We need to enable gradient for output convolution to train the depth decoder, beacuse we have changed the activation function  from relu to sigmoid
+
         for name, param in self.models['depth'].named_parameters():
             if 'output_conv' in name:
                 param.requires_grad = True
@@ -140,32 +159,39 @@ class Trainer:
         for name, p in self.models['depth'].named_parameters():
             if 'multi_frame_feature_fusion' in name:
                 p.requires_grad = True
-        
+
         self.models["depth"].to(self.device)
 
         if self.opt.encoder_lr_coef != 0.0:
-            self.parameters_to_train.append({'params': self.models["encoder"].parameters(), 'lr': self.opt.encoder_lr_coef * self.opt.learning_rate})
-        
-        # Separate feature fusion parameters for higher learning rate
+            enc_trainable = [p for p in self.models["encoder"].parameters() if p.requires_grad]
+            self.parameters_to_train.append({'params': enc_trainable, 'lr': self.opt.encoder_lr_coef * self.opt.learning_rate})
+
         depth_params = []
         fusion_params = []
         for name, param in self.models["depth"].named_parameters():
+            if not param.requires_grad:
+                continue
             if 'multi_frame_feature_fusion' in name:
                 fusion_params.append(param)
             else:
                 depth_params.append(param)
-        
-        self.parameters_to_train.append({'params': depth_params, 'lr': self.opt.learning_rate})
-        self.parameters_to_train.append({'params': fusion_params, 'lr': self.opt.learning_rate * self.opt.fusion_lr_coef})  # Higher LR for feature fusion
+
+        if depth_params:
+            self.parameters_to_train.append({'params': depth_params, 'lr': self.opt.learning_rate})
+        if fusion_params:
+            self.parameters_to_train.append({'params': fusion_params, 'lr': self.opt.learning_rate * self.opt.fusion_lr_coef})
         # Print total number of learnable parameters
-        encoder_params = sum(p.numel() for p in self.models["encoder"].parameters() if p.requires_grad)
-        depth_params = sum(p.numel() for p in self.models["depth"].parameters() if p.requires_grad)
-        fusion_params = sum(p.numel() for p in fusion_params)
-        print(f"Total learnable parameters in encoder: {encoder_params}")
-        print(f"Total learnable parameters in depth decoder: {depth_params - fusion_params}")
-        print(f"Total learnable parameters in feature fusion: {fusion_params}")
+        n_encoder = sum(p.numel() for p in self.models["encoder"].parameters() if p.requires_grad)
+        n_fusion  = sum(p.numel() for p in fusion_params)
+        n_depth   = sum(p.numel() for p in depth_params)
+        print(f"Total learnable parameters in encoder: {n_encoder}")
+        print(f"Total learnable parameters in depth decoder: {n_depth}")
+        print(f"Total learnable parameters in feature fusion: {n_fusion}")
         print(f"Feature fusion learning rate: {self.opt.learning_rate * self.opt.fusion_lr_coef}")
-        encoder, decoder = networks.get_da_encoder_decoder(encoder_name=self.opt.depth_anything_encoder)
+        encoder, decoder = networks.get_da_encoder_decoder(
+            encoder_name=self.opt.depth_anything_encoder,
+            checkpoint_dir=self.opt.depth_anything_checkpoint_dir,
+        )
         self.models["mono_encoder"] = encoder
         self.models["mono_encoder"].to(self.device).eval()
 
@@ -174,7 +200,7 @@ class Trainer:
         
 
         self.models["pose_encoder"] = \
-            networks.ResnetEncoder(self.opt.pose_encoder_num_layers, self.opt.weights_init == "pretrained",
+            networks.ResnetEncoder(self.opt.pose_encoder_num_layers, self.opt.pose_weights_init == "pretrained",
                                     num_input_images=self.num_pose_frames)
         self.models["pose"] = \
             networks.PoseDecoder(self.models["pose_encoder"].num_ch_enc,
@@ -183,13 +209,22 @@ class Trainer:
 
         if not self.opt.pose_from_scratch:
             print("Using pretrained pose encoder and decoder")
-            pose_encoder_pretrained_weights = torch.load(f'checkpoints/pose_encoder_R18.pth', map_location='cpu')
+            pose_suffix = "R{}".format(self.opt.pose_encoder_num_layers)
+            pose_encoder_path = os.path.join("checkpoints", "pose_encoder_{}.pth".format(pose_suffix))
+            pose_decoder_path = os.path.join("checkpoints", "pose_{}.pth".format(pose_suffix))
+            if not os.path.isfile(pose_encoder_path) or not os.path.isfile(pose_decoder_path):
+                raise FileNotFoundError(
+                    "Pretrained pose checkpoints for {} were not found. "
+                    "Expected {} and {}. Set pose_from_scratch=true to train this pose encoder from scratch.".format(
+                        pose_suffix, pose_encoder_path, pose_decoder_path
+                    )
+                )
+            pose_encoder_pretrained_weights = torch.load(pose_encoder_path, map_location='cpu')
             self.models["pose_encoder"].load_state_dict(pose_encoder_pretrained_weights, strict=False)
             
-            pose_decoder_pretrained_weights = torch.load(f'checkpoints/pose_R18.pth', map_location='cpu')
+            pose_decoder_pretrained_weights = torch.load(pose_decoder_path, map_location='cpu')
             self.models["pose"].load_state_dict(pose_decoder_pretrained_weights, strict=False)
-        else:
-            print("Using random pose encoder and decoder")
+
         
         self.models["pose_encoder"].to(self.device)
         self.models["pose"].to(self.device)
@@ -205,39 +240,71 @@ class Trainer:
         # DATA
         datasets_dict = {"kitti": datasets.KITTIRAWDataset,
                          "cityscapes_preprocessed": datasets.CityscapesPreprocessedDataset,
-                         "kitti_odom": datasets.KITTIOdomDataset,
-                         "gopro": datasets.GoProDataset}
+                         "kitti_odom": datasets.KITTIOdomDataset}
         
+        if self.opt.dataset not in datasets_dict:
+            raise ValueError(
+                "Unknown dataset '{}'. Available datasets: {}".format(
+                    self.opt.dataset, ", ".join(sorted(datasets_dict))
+                )
+            )
         self.dataset = datasets_dict[self.opt.dataset]
 
         fpath = os.path.join("splits", self.opt.split, "{}_files.txt")
         train_filenames = readlines(fpath.format("train"))
         
         
-        # TODO: Check if this is correct
         percent = self.opt.data_percent
         print(f"Using {percent} percent of the training data")
-        len_train_filenames = len(train_filenames)
-        train_filenames = train_filenames[:int(len(train_filenames) * percent/100)]
-        # Duplicate the train filenames to keep it len fixed
-        train_filenames = train_filenames * (len_train_filenames // len(train_filenames))
+        if percent <= 0.0 or percent > 100.0:
+            raise ValueError("data_percent must be in the range (0, 100]")
+        if percent < 100.0:
+            full_len = len(train_filenames)
+            keep = max(1, int(full_len * percent / 100))
+            seed = self.opt.pytorch_random_seed if self.opt.pytorch_random_seed is not None else 1
+            rng = random.Random(seed)
+            train_filenames = list(train_filenames)
+            rng.shuffle(train_filenames)
+            subset = train_filenames[:keep]
+            repeats, remainder = divmod(full_len, keep)
+            train_filenames = subset * repeats + subset[:remainder]
         
         val_filenames = readlines(fpath.format("val"))
         img_ext = '.png' if self.opt.png else '.jpg'
 
         num_train_samples = len(train_filenames)
-        self.num_total_steps = num_train_samples // self.effective_batch_size * self.opt.num_epochs
+        num_train_batches = num_train_samples // self.opt.batch_size
+        if num_train_batches < 1:
+            raise ValueError(
+                "Training set has {} samples, which is smaller than batch_size={} with drop_last=True".format(
+                    num_train_samples, self.opt.batch_size
+                )
+            )
+        steps_per_epoch = math.ceil(num_train_batches / self.gradient_accumulation_steps)
+        self.num_total_steps = steps_per_epoch * self.opt.num_epochs
         print('Total number of steps: ', self.num_total_steps, "Total number of epochs:", self.opt.num_epochs)
         
-        self.model_optimizer = optim.AdamW(self.parameters_to_train, self.opt.learning_rate)
-        steps_per_epoch = self.num_total_steps // self.opt.num_epochs
-        step_size = steps_per_epoch * self.opt.scheduler_step_epochs
-        self.model_lr_scheduler = optim.lr_scheduler.StepLR(
-            self.model_optimizer, step_size=step_size, gamma=self.opt.scheduler_gamma
-        )
+        self.model_optimizer = optim.AdamW(self.parameters_to_train, self.opt.learning_rate, weight_decay=1e-4)
 
         # Warmup configuration
         self.warmup_steps = self.opt.warmup_steps
+        if self.opt.cosine_min_lr_factor < 0.0 or self.opt.cosine_min_lr_factor > 1.0:
+            raise ValueError("cosine_min_lr_factor must be in the range [0, 1]")
+        cosine_steps = max(1, self.num_total_steps - self.warmup_steps)
+        min_lr_factor = self.opt.cosine_min_lr_factor
+
+        def cosine_lr_factor(step):
+            progress = min(float(step) / float(cosine_steps), 1.0)
+            return min_lr_factor + (1.0 - min_lr_factor) * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+        self.model_lr_scheduler = optim.lr_scheduler.LambdaLR(
+            self.model_optimizer, lr_lambda=cosine_lr_factor
+        )
+        print(
+            "Using cosine LR scheduler over {} steps with min factor {:.4f}".format(
+                cosine_steps, min_lr_factor
+            )
+        )
         # Store base learning rates for each param group for warmup
         self.base_lrs = [group['lr'] for group in self.model_optimizer.param_groups]
         if self.warmup_steps > 0:
@@ -252,10 +319,6 @@ class Trainer:
             self.opt.data_path, train_filenames, self.opt.height, self.opt.width,
             frames_to_load, 4, is_train=True, img_ext=img_ext, load_gps=self.g2s)
         
-        if self.opt.dataset == "gopro":
-            num_train_samples = len(train_dataset)
-            self.num_total_steps = num_train_samples // self.effective_batch_size * self.opt.num_epochs
-        
         self.train_loader = DataLoader(
             train_dataset, self.opt.batch_size, True,
             num_workers=self.opt.num_workers, pin_memory=True, drop_last=True,
@@ -265,7 +328,7 @@ class Trainer:
             frames_to_load, 4, is_train=False, img_ext=img_ext, load_gps=self.g2s)
         self.val_loader = DataLoader(
             val_dataset, self.opt.batch_size, False,
-            num_workers=self.opt.num_workers, pin_memory=True, drop_last=True)
+            num_workers=self.opt.num_workers, pin_memory=True, drop_last=False)
         self.val_iter = iter(self.val_loader)
 
         self.writers = {}
@@ -288,9 +351,6 @@ class Trainer:
             self.project_3d[scale] = Project3D(self.opt.batch_size, h, w)
             self.project_3d[scale].to(self.device)
 
-        self.depth_metric_names = [
-            "de/abs_rel", "de/sq_rel", "de/rms", "de/log_rms", "da/a1", "da/a2", "da/a3"]
-
         print("Using split:\n  ", self.opt.split)
         print("There are {:d} training items and {:d} validation items\n".format(
             len(train_dataset), len(val_dataset)))
@@ -307,9 +367,11 @@ class Trainer:
         self.save_opts()
 
     def g2s_weight(self):
-        maximum_steps = ((4 * self.num_total_steps)) // self.opt.num_epochs
-        return (self.step / maximum_steps) ** 2 if self.step <= maximum_steps else 1
-
+        maximum_steps = self.opt.g2s_weight_factor * ((self.num_total_steps // self.opt.num_epochs))
+        if maximum_steps <= 0:
+            return 1
+        return (self.step / maximum_steps) ** 3 if self.step <= maximum_steps else 1
+    
     def get_warmup_factor(self):
         """Calculate warmup factor for learning rate
         Returns a factor between 0 and 1 based on current step
@@ -317,6 +379,21 @@ class Trainer:
         if self.warmup_steps <= 0 or self.step >= self.warmup_steps:
             return 1.0
         return float(self.step) / float(self.warmup_steps)
+
+    def ffn_residual_scale_stats(self):
+        """Return mean/min/max for fusion FFN residual scales, for console logging."""
+        fusion_blocks = getattr(self.models["depth"], "multi_frame_feature_fusion", None)
+        if not fusion_blocks:
+            return None
+        scale_tensors = [
+            block.ffn_residual_scale.detach().float().reshape(-1)
+            for block in fusion_blocks
+            if hasattr(block, "ffn_residual_scale")
+        ]
+        if not scale_tensors:
+            return None
+        scales = torch.cat(scale_tensors)
+        return scales.mean().item(), scales.min().item(), scales.max().item()
 
     
 
@@ -336,13 +413,14 @@ class Trainer:
     def train(self):
         """Run the entire training pipeline
         """
-        self.epoch = 0
-        self.step = 0
         self.start_time = time.time()
-        for self.epoch in range(self.opt.num_epochs):
+        for self.epoch in range(self.epoch, self.opt.num_epochs):
             self.run_epoch()
             if (self.epoch + 1) % self.opt.save_frequency == 0:
+                save_folder = os.path.join(self.log_path, "models", "weights_{}".format(self.epoch))
                 self.save_model()
+                if self.opt.eval_after_each_epoch:
+                    self._run_eval_on_test_set(save_folder)
         self.save_opts()  # save final config at end of run
 
     def run_epoch(self):
@@ -352,20 +430,26 @@ class Trainer:
         print("Training")
         self.set_train()
 
+        if not self.opt.no_cuda:
+            torch.cuda.synchronize()
+
         # Initialize gradient accumulation variables
         accumulated_loss = 0.0
         accumulated_mono_loss = 0.0
         accumulated_scale = 0.0 if self.g2s else None
         accumulation_count = 0
 
+        num_batches = len(self.train_loader)
         for batch_idx, inputs in enumerate(self.train_loader):
 
             before_op_time = time.time()
 
             outputs, losses, mono_losses = self.process_batch(inputs, is_train=True)
             
-            # Scale loss by accumulation steps to maintain correct gradient magnitude
-            scaled_loss = losses["loss"] / self.gradient_accumulation_steps
+            # Scale by the actual accumulation window size; the last window can be partial.
+            window_start = (batch_idx // self.gradient_accumulation_steps) * self.gradient_accumulation_steps
+            window_size = min(self.gradient_accumulation_steps, num_batches - window_start)
+            scaled_loss = losses["loss"] / window_size
             scaled_loss.backward()
             
             # Accumulate losses for logging
@@ -375,8 +459,12 @@ class Trainer:
                 accumulated_scale += losses["scale"].item()
             accumulation_count += 1
 
-            # Only update optimizer and scheduler after accumulating gradients
-            if (batch_idx + 1) % self.gradient_accumulation_steps == 0:
+            # Only update optimizer and scheduler after accumulating gradients.
+            should_step = (
+                (batch_idx + 1) % self.gradient_accumulation_steps == 0
+                or (batch_idx + 1) == num_batches
+            )
+            if should_step:
                 # Apply gradient clipping if enabled (max_grad_norm > 0)
                 if self.opt.max_grad_norm > 0:
                     params = [
@@ -439,9 +527,6 @@ class Trainer:
                     else:
                         self.log_time(batch_idx, duration, avg_loss, avg_mono_loss)
 
-                    if "depth_gt" in inputs:
-                        self.compute_depth_losses(inputs, outputs, losses)
-
                     # Update losses with averaged values for logging
                     losses["loss"] = torch.tensor(avg_loss, device=losses["loss"].device)
                     mono_losses["loss"] = torch.tensor(avg_mono_loss, device=mono_losses["loss"].device)
@@ -480,7 +565,7 @@ class Trainer:
         relative_poses = [inputs[('relative_pose', idx)] for idx in self.matching_ids[1:]]
         relative_poses = torch.stack(relative_poses, 1)
 
-        lookup_frames = [inputs[('color_aug', idx, 0)] for idx in self.matching_ids[1:]]
+        lookup_frames = [inputs[('color_aug_norm', idx, 0)] for idx in self.matching_ids[1:]]
         lookup_frames = torch.stack(lookup_frames, 1)  # batch x frames x 3 x h x w
 
         # apply static frame and zero cost volume augmentation
@@ -492,7 +577,7 @@ class Trainer:
                 # static camera augmentation -> overwrite lookup frames with current frame
                 if rand_num < 0.25:
                     replace_frames = \
-                        [inputs[('color', 0, 0)][batch_idx] for _ in self.matching_ids[1:]]
+                        [inputs[('color_aug_norm', 0, 0)][batch_idx] for _ in self.matching_ids[1:]]
                     replace_frames = torch.stack(replace_frames, 0)
                     lookup_frames[batch_idx] = replace_frames
                     augmentation_mask[batch_idx] += 1
@@ -504,13 +589,12 @@ class Trainer:
         outputs['augmentation_mask'] = augmentation_mask
 
         with torch.no_grad():
-            input_image = inputs["color_aug", 0, 0]
+            input_image = inputs["color_aug_norm", 0, 0]
             patch_h, patch_w = input_image.shape[-2] // 14, input_image.shape[-1] // 14
             feats = self.models["mono_encoder"].get_intermediate_layers(input_image, self.models["mono_encoder"].intermediate_layer_idx, return_class_token=True)
             monodepth, _ = self.models['mono_depth'](feats, patch_h, patch_w)
         monodepth = {("disp", 0): F.relu(monodepth)}
         mono_outputs.update(monodepth)
-       
 
         self.generate_images_pred(inputs, mono_outputs)
         mono_losses = self.compute_losses(inputs, mono_outputs, is_multi=False)
@@ -524,15 +608,17 @@ class Trainer:
                 outputs[_key] = mono_outputs[key]
 
         # multi frame path
+        encoder_lookup_frames = None if self.opt.no_temporal_fusion else lookup_frames
         if self.opt.encoder_lr_coef == 0.0:
             with torch.no_grad():
-                features, lookup_features = self.models["encoder"](inputs["color_aug", 0, 0], lookup_frames)
+                features, lookup_features = self.models["encoder"](
+                    inputs["color_aug_norm", 0, 0], encoder_lookup_frames)
         else:
-            features, lookup_features = self.models["encoder"](inputs["color_aug", 0, 0], lookup_frames)
-        
+            features, lookup_features = self.models["encoder"](
+                inputs["color_aug_norm", 0, 0], encoder_lookup_frames)
 
         depth, _ = self.models["depth"](features, lookup_features)
-        
+
         depth =  F.relu(depth)
         outputs.update({("disp", 0): depth})
 
@@ -597,10 +683,9 @@ class Trainer:
                         if fi != 1:
                             pose = torch.matmul(pose, inputs[('relative_pose', fi - 1)])
 
-                    # set missing images to 0 pose
-                    for batch_idx, feat in enumerate(pose_feats[fi]):
-                        if feat.sum() == 0:
-                            pose[batch_idx] *= 0
+                    missing_key = ("missing_frame", fi)
+                    if missing_key in inputs:
+                        pose[inputs[missing_key].bool()] *= 0
 
                     inputs[('relative_pose', fi)] = pose
         else:
@@ -616,13 +701,14 @@ class Trainer:
             inputs = next(self.val_iter)
         except StopIteration:
             self.val_iter = iter(self.val_loader)
-            inputs = next(self.val_iter)
+            try:
+                inputs = next(self.val_iter)
+            except StopIteration:
+                self.set_train()
+                return
 
         with torch.no_grad():
             outputs, losses, mono_losses = self.process_batch(inputs)
-
-            if "depth_gt" in inputs:
-                self.compute_depth_losses(inputs, outputs, losses)
 
             self.log("val", inputs, outputs, losses, mono_losses)
             del inputs, outputs, losses
@@ -694,6 +780,54 @@ class Trainer:
 
         return reprojection_loss_mask
 
+    @staticmethod
+    def pose_translation_norm(translation):
+        """Return one translation magnitude per sample."""
+        translation = translation[:, 0].reshape(translation.shape[0], -1)
+        if translation.shape[1] != 3:
+            raise RuntimeError(
+                "Expected pose translation to contain 3 values per sample, got shape {}".format(
+                    tuple(translation.shape)
+                )
+            )
+        return torch.norm(translation, dim=1)
+
+    @staticmethod
+    def patch_ssi_loss(prediction, target, margin, patch_size=16, variance_threshold=1e-3):
+        """Scale/shift-invariant patch loss for relative disparity supervision."""
+        stride = patch_size // 2
+        prediction_patches = F.unfold(prediction, kernel_size=patch_size, stride=stride)
+        target_patches = F.unfold(target, kernel_size=patch_size, stride=stride)
+
+        prediction_mean = prediction_patches.mean(dim=1, keepdim=True)
+        target_mean = target_patches.mean(dim=1, keepdim=True)
+        prediction_var = ((prediction_patches - prediction_mean) ** 2).mean(dim=1, keepdim=True)
+        target_var = ((target_patches - target_mean) ** 2).mean(dim=1, keepdim=True)
+
+        prediction_norm = (prediction_patches - prediction_mean) / torch.sqrt(prediction_var + 1e-5)
+        target_norm = (target_patches - target_mean) / torch.sqrt(target_var + 1e-5)
+
+        patch_loss = F.relu(torch.abs(prediction_norm - target_norm).mean(dim=1) - float(margin))
+        prediction_norm_grid = prediction_norm.reshape(
+            prediction.shape[0], prediction.shape[1], patch_size, patch_size, -1)
+        target_norm_grid = target_norm.reshape(
+            target.shape[0], target.shape[1], patch_size, patch_size, -1)
+        grad_x_diff = torch.abs(
+            (prediction_norm_grid[:, :, :, 1:, :] - prediction_norm_grid[:, :, :, :-1, :])
+            - (target_norm_grid[:, :, :, 1:, :] - target_norm_grid[:, :, :, :-1, :])
+        )
+        grad_y_diff = torch.abs(
+            (prediction_norm_grid[:, :, 1:, :, :] - prediction_norm_grid[:, :, :-1, :, :])
+            - (target_norm_grid[:, :, 1:, :, :] - target_norm_grid[:, :, :-1, :, :])
+        )
+        grad_x_loss = F.relu(grad_x_diff - float(margin)).mean(dim=(1, 2, 3))
+        grad_y_loss = F.relu(grad_y_diff - float(margin)).mean(dim=(1, 2, 3))
+        patch_loss = patch_loss + (grad_x_loss + grad_y_loss)
+        valid_mask = torch.min(prediction_var, target_var).squeeze(1) > variance_threshold
+        loss = (patch_loss * valid_mask).sum(dim=-1) / (valid_mask.sum(dim=-1) + 1e-7)
+
+        return loss.mean(), patch_loss
+
     def compute_losses(self, inputs, outputs, is_multi=False):
         """Compute the reprojection, smoothness and proxy supervised losses for a minibatch
         """
@@ -725,6 +859,7 @@ class Trainer:
                                                       keepdim=True)
 
             reprojection_loss, _ = torch.min(reprojection_losses, dim=1, keepdim=True)
+            outputs[("reprojection_loss_map", scale)] = reprojection_loss.detach()
 
             # add random numbers to break ties
             identity_reprojection_loss += torch.randn(identity_reprojection_loss.shape).to(self.device) * 0.00001
@@ -736,18 +871,14 @@ class Trainer:
             )
 
             # ------------------------------------------------------------------
-            # Optionally ignore the highest-loss and lowest-loss pixels among the
-            # already valid pixels, and visualize which pixels were ignored.
+            # Optionally ignore the highest-loss pixels among the already valid
+            # pixels, and visualize which pixels were ignored.
             # ------------------------------------------------------------------
             if self.opt.ignore_high_low_loss_pixels:
                 top_percent = 0.30  # ignore top 30% highest-loss pixels over the full batch
-                bottom_percent = 0.0  # ignore bottom 0% lowest-loss pixels over the full batch
 
                 valid = reprojection_loss_mask > 0
                 ignored_high_loss_mask = torch.zeros_like(
-                    reprojection_loss_mask, device=reprojection_loss.device
-                )
-                ignored_low_loss_mask = torch.zeros_like(
                     reprojection_loss_mask, device=reprojection_loss.device
                 )
 
@@ -768,27 +899,15 @@ class Trainer:
                         high = (reprojection_loss >= high_threshold) & valid
                         ignored_high_loss_mask[high] = 1.0
 
-                    # Mask low-loss pixels
-                    if bottom_percent > 0.0:
-                        low_percentile = bottom_percent
-                        k_low = max(1, min(int(low_percentile * n) + 1, n))
-                        low_threshold, _ = torch.kthvalue(valid_vals, k_low)
-
-                        # Mark low-loss pixels across the whole batch using the same threshold
-                        low = (reprojection_loss <= low_threshold) & valid
-                        ignored_low_loss_mask[low] = 1.0
-
-                    # Remove both high and low loss pixels from the effective mask
-                    reprojection_loss_mask = reprojection_loss_mask * (1.0 - ignored_high_loss_mask) * (1.0 - ignored_low_loss_mask)
+                    # Remove high-loss pixels from the effective mask
+                    reprojection_loss_mask = (
+                        reprojection_loss_mask * (1.0 - ignored_high_loss_mask)
+                    )
 
                 # Store visualization of ignored pixels (per-scale)
                 outputs[("high_loss_mask", scale)] = ignored_high_loss_mask.detach()
-                outputs[("low_loss_mask", scale)] = ignored_low_loss_mask.detach()
             else:
                 outputs[("high_loss_mask", scale)] = torch.zeros_like(
-                    reprojection_loss_mask, device=reprojection_loss.device
-                ).detach()
-                outputs[("low_loss_mask", scale)] = torch.zeros_like(
                     reprojection_loss_mask, device=reprojection_loss.device
                 ).detach()
 
@@ -804,66 +923,28 @@ class Trainer:
             # consistency loss:
             if is_multi and not self.opt.no_consistency_loss:
 
-                # Get the depth outputs
-                multi_depth = outputs[("depth", 0, scale)]
-                # no gradients for mono prediction!
-                mono_depth = outputs[("mono_depth", 0, scale)].detach()
-                
-                # Define patch size
-                patch_size = 8
+                patch_size = 32
+                multi_disp = outputs[("disp", scale)]
+                mono_disp = outputs[("mono_disp", scale)].detach()
 
-                # Unfold into patches
-                b, c, h, w = multi_depth.shape
-                patches_multi = F.unfold(multi_depth, kernel_size=patch_size, stride=patch_size//2, padding=0)
-                patches_mono = F.unfold(mono_depth, kernel_size=patch_size, stride=patch_size//2, padding=0)
-
-                # Reshape to [B, C*patch_size*patch_size, n_patches]
-                n_patches = patches_multi.shape[2]
-                patches_multi = patches_multi.reshape(b, c*patch_size*patch_size, n_patches)
-                patches_mono = patches_mono.reshape(b, c*patch_size*patch_size, n_patches)
-
-                # Calculate mean and variance for each patch
-                mean_multi = patches_multi.mean(dim=1, keepdim=True)
-                mean_mono = patches_mono.mean(dim=1, keepdim=True)
-
-                var_multi = ((patches_multi - mean_multi)**2).mean(dim=1, keepdim=True)
-                var_mono = ((patches_mono - mean_mono)**2).mean(dim=1, keepdim=True)
-
-                # Normalize patches using alpha (scale) and beta (shift)
-                alpha_multi = torch.sqrt(var_multi + 1e-5)
-                alpha_mono = torch.sqrt(var_mono + 1e-5)
-
-                beta_multi = mean_multi
-                beta_mono = mean_mono
-
-                patches_multi_norm = (patches_multi - beta_multi) / alpha_multi
-                patches_mono_norm = (patches_mono - beta_mono) / alpha_mono
-
-                # Calculate patch-wise loss
-                patch_ssi_loss = torch.abs(patches_multi_norm - patches_mono_norm).mean(dim=1)
-
-                depth_var = torch.min(var_multi, var_mono)  # [B, 1, n_patches]
-
-                valid_mask = (depth_var > 0.001).squeeze(1)  # [B, n_patches]
-
-
-                masked_patch_ssi_loss = patch_ssi_loss * valid_mask
-                ssi_loss = masked_patch_ssi_loss.sum(dim=-1) / (valid_mask.sum(dim=-1) + 1e-7)
-
-                ssi_loss = ssi_loss.mean() 
+                ssi_loss, patch_ssi_loss = self.patch_ssi_loss(
+                    multi_disp,
+                    mono_disp,
+                    self.opt.consistency_disp_margin,
+                    patch_size=patch_size,
+                )
                 
                 # Store patch-wise SSI loss for visualization
-                # Calculate spatial dimensions of patch grid
-                patch_grid_h = (h - patch_size) // (patch_size // 2) + 1
-                patch_grid_w = (w - patch_size) // (patch_size // 2) + 1
-                
-                # Reshape patch_ssi_loss to spatial dimensions for visualization
+                b, _, h, w = multi_disp.shape
+                stride = patch_size // 2
+                patch_grid_h = (h - patch_size) // stride + 1
+                patch_grid_w = (w - patch_size) // stride + 1
                 patch_ssi_loss_spatial = patch_ssi_loss.view(b, patch_grid_h, patch_grid_w)
                 outputs[("ssi_loss", scale)] = patch_ssi_loss_spatial
                 
                 # Combine losses
                 if not self.opt.no_loss_dynamic_weight:
-                    ssi_weight = (1-self.g2s_weight()) / 10
+                    ssi_weight = 0.001
                 else:
                     ssi_weight = 0.01
                 
@@ -893,57 +974,41 @@ class Trainer:
 
         if self.g2s and is_multi:
             #TRANSLATIONS
-            t12 = torch.norm(outputs[("translation", 0, -1)][:, 0].squeeze(), dim=1)
-            t23 = torch.norm(outputs[("translation", 0, 1)][:, 0].squeeze(), dim=1)
+            t12 = self.pose_translation_norm(outputs[("translation", 0, -1)])
+            t23 = self.pose_translation_norm(outputs[("translation", 0, 1)])
 
+            eps = 1e-5
+            min_gps_motion = 0.01
 
-            s1 = inputs["gps12"].float() / (t12 + 1e-7)
-            s2 = inputs["gps23"].float() / (t23 + 1e-7) 
-            
-            g2s_loss = torch.nn.functional.mse_loss(s1, torch.ones_like(s1)) + torch.nn.functional.mse_loss(s2, torch.ones_like(s2))
+            pred_t = torch.stack([t12, t23], dim=1).clamp_min(eps)
+            gps12 = inputs["gps12"].float().view(-1)
+            gps23 = inputs["gps23"].float().view(-1)
+            gps_t = torch.stack([gps12, gps23], dim=1).to(
+                device=pred_t.device, dtype=pred_t.dtype
+            )
+
+            valid_g2s = gps_t > min_gps_motion
+            clamped_gps_t = gps_t.clamp_min(eps)
+            log_scale_error = torch.log(pred_t) - torch.log(clamped_gps_t)
+
+            if valid_g2s.any().item():
+                g2s_loss = log_scale_error[valid_g2s].pow(2).mean()
+                scale_values = (clamped_gps_t / pred_t.detach())[valid_g2s]
+                losses["scale"] = scale_values.mean()
+            else:
+                g2s_loss = pred_t.new_tensor(0.0)
+                losses["scale"] = pred_t.new_tensor(0.0)
             
             if not self.opt.no_loss_dynamic_weight:
                 total_loss += self.g2s_weight() * g2s_loss 
             else:
                 total_loss += g2s_loss
-            losses["scale"] = 0.5 * torch.mean(s1 + s2)
+            losses["g2s_loss"] = g2s_loss.detach()
+            losses["g2s_valid_ratio"] = valid_g2s.float().mean()
             
         losses["loss"] = total_loss
 
         return losses
-
-    def compute_depth_losses(self, inputs, outputs, losses):
-        """Compute depth metrics, to allow monitoring during training
-
-        This isn't particularly accurate as it averages over the entire batch,
-        so is only used to give an indication of validation performance
-        """
-        min_depth = 1e-3
-        max_depth = 80
-
-        depth_pred = outputs[("depth", 0, 0)]
-        depth_pred = torch.clamp(F.interpolate(
-            depth_pred, [375, 1242], mode="bilinear", align_corners=False), 1e-3, 80)
-        depth_pred = depth_pred.detach()
-
-        depth_gt = inputs["depth_gt"]
-        mask = (depth_gt > min_depth) * (depth_gt < max_depth)
-
-        # garg/eigen crop
-        crop_mask = torch.zeros_like(mask)
-        crop_mask[:, :, 153:371, 44:1197] = 1
-        mask = mask * crop_mask
-
-        depth_gt = depth_gt[mask]
-        depth_pred = depth_pred[mask]
-        depth_pred *= torch.median(depth_gt) / torch.median(depth_pred)
-
-        depth_pred = torch.clamp(depth_pred, min=1e-3, max=80)
-
-        depth_errors = compute_depth_errors(depth_gt, depth_pred)
-
-        for i, metric in enumerate(self.depth_metric_names):
-            losses[metric] = np.array(depth_errors[i].cpu())
 
     def log_time(self, batch_idx, duration, loss, mono_loss, scale=None):
         """Print a logging statement to the terminal."""
@@ -987,6 +1052,11 @@ class Trainer:
             print_string += " | warmup: {}/{}"
             print_data.extend([self.step, self.warmup_steps])
 
+        ffn_scale_stats = self.ffn_residual_scale_stats()
+        if ffn_scale_stats is not None:
+            print_string += " | ffn_res_scale mean/min/max: {:.4f}/{:.4f}/{:.4f}"
+            print_data.extend(ffn_scale_stats)
+
         print(print_string.format(*print_data))
 
 
@@ -1004,27 +1074,17 @@ class Trainer:
             writer.add_scalar("gradient_accumulation_steps", self.gradient_accumulation_steps, self.step)
             writer.add_scalar("effective_batch_size", self.effective_batch_size, self.step)
 
-        # Unnormalization function for ImageNet normalization
-        def unnormalize_image(img):
-            """Unnormalize image from ImageNet normalization"""
-            mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1).to(img.device)
-            std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1).to(img.device)
-            return img * std + mean
-
-        for j in range(min(4, self.opt.batch_size)):  # write a maxmimum of four images
+        batch_size = inputs[("color", 0, 0)].shape[0]
+        for j in range(min(4, batch_size)):  # write a maxmimum of four images
             s = 0  # log only max scale
             for frame_id in self.opt.frame_ids:
-                # Unnormalize color images before writing
-                color_img = unnormalize_image(inputs[("color", frame_id, s)][j])
                 writer.add_image(
                     "color_{}_{}/{}".format(frame_id, s, j),
-                    color_img.data, self.step)
+                    inputs[("color", frame_id, s)][j].data, self.step)
                 if s == 0 and frame_id != 0:
-                    # Unnormalize predicted color images before writing
-                    color_pred_img = unnormalize_image(outputs[("color", frame_id, s)][j])
                     writer.add_image(
                         "color_pred_{}_{}/{}".format(frame_id, s, j),
-                        color_pred_img.data, self.step)
+                        outputs[("color", frame_id, s)][j].data, self.step)
 
             disp = colormap(outputs[("disp", s)][j, 0])
             writer.add_image(
@@ -1050,14 +1110,27 @@ class Trainer:
                     "high_loss_mask_{}/{}".format(s, j),
                     high_loss_mask_img, self.step)
 
-            # Log low loss mask visualization
-            if ("low_loss_mask", s) in outputs:
-                low_loss_mask_img = colormap(outputs[("low_loss_mask", s)][j, 0])
-                writer.add_image(
-                    "low_loss_mask_{}/{}".format(s, j),
-                    low_loss_mask_img, self.step)
+        self.save_depth_prediction_images(mode, outputs)
 
-        
+    def save_depth_prediction_images(self, mode, outputs):
+        """Save predicted disparity visualizations matching TensorBoard logs."""
+        s = 0
+        disp_key = ("disp", s)
+        if disp_key not in outputs:
+            return
+
+        disp = outputs[disp_key]
+        num_images = min(4, disp.shape[0])
+        os.makedirs(self.prediction_output_path, exist_ok=True)
+
+        for j in range(num_images):
+            disp_vis = colormap(disp[j, 0], torch_transpose=False)
+            disp_vis = np.clip(disp_vis * 255.0, 0, 255).astype(np.uint8)
+            save_path = os.path.join(
+                self.prediction_output_path,
+                "{}_step_{:08d}_disp_multi_{:02d}.png".format(mode, self.step, j),
+            )
+            Image.fromarray(disp_vis).save(save_path)
 
     def save_opts(self):
         """Save config to run output dir and to models/ as YAML (config.yaml).
@@ -1092,11 +1165,36 @@ class Trainer:
                 to_save['width'] = self.opt.width
                 to_save['num_passes'] = self.opt.num_passes
                 to_save['no_temporal_fusion'] = self.opt.no_temporal_fusion
+                to_save['fusion_independent_blocks'] = self.opt.fusion_independent_blocks
 
             torch.save(to_save, save_path)
 
         save_path = os.path.join(save_folder, "{}.pth".format("adam"))
         torch.save(self.model_optimizer.state_dict(), save_path)
+
+        save_path = os.path.join(save_folder, "{}.pth".format("scheduler"))
+        torch.save(self.model_lr_scheduler.state_dict(), save_path)
+
+        training_state = {
+            "epoch": self.epoch,
+            "step": self.step,
+            "base_lrs": self.base_lrs,
+        }
+        save_path = os.path.join(save_folder, "{}.pth".format("training_state"))
+        torch.save(training_state, save_path)
+
+    def _run_eval_on_test_set(self, save_folder):
+        """Run test-set evaluation (evaluate_depth_mda.py) on the given weights folder."""
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        script = os.path.join(repo_root, "manydepth", "evaluate_depth_mda.py")
+        cmd = [
+            sys.executable, "-u", script,
+            "--load_weights_folder", save_folder,
+            "--data_path", self.opt.data_path,
+            "--eval_split", self.opt.eval_split,
+        ]
+        print("Running test-set evaluation: {}".format(" ".join(cmd)))
+        subprocess.run(cmd, cwd=repo_root, check=True)
 
     def load_mono_model(self):
 
@@ -1105,7 +1203,7 @@ class Trainer:
             print('loading {}'.format(n))
             path = os.path.join(self.opt.mono_weights_folder, "{}.pth".format(n))
             model_dict = self.models[n].state_dict()
-            pretrained_dict = torch.load(path)
+            pretrained_dict = torch.load(path, map_location=self.device)
 
             pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict}
             model_dict.update(pretrained_dict)
@@ -1124,7 +1222,7 @@ class Trainer:
             print("Loading {} weights...".format(n))
             path = os.path.join(self.opt.load_weights_folder, "{}.pth".format(n))
             model_dict = self.models[n].state_dict()
-            pretrained_dict = torch.load(path)
+            pretrained_dict = torch.load(path, map_location=self.device)
 
             pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict}
             model_dict.update(pretrained_dict)
@@ -1135,12 +1233,28 @@ class Trainer:
         if os.path.isfile(optimizer_load_path):
             try:
                 print("Loading Adam weights")
-                optimizer_dict = torch.load(optimizer_load_path)
+                optimizer_dict = torch.load(optimizer_load_path, map_location=self.device)
                 self.model_optimizer.load_state_dict(optimizer_dict)
             except ValueError:
                 print("Can't load Adam - using random")
         else:
             print("Cannot find Adam weights so Adam is randomly initialized")
+
+        scheduler_load_path = os.path.join(self.opt.load_weights_folder, "scheduler.pth")
+        if os.path.isfile(scheduler_load_path):
+            print("Loading scheduler state")
+            self.model_lr_scheduler.load_state_dict(
+                torch.load(scheduler_load_path, map_location=self.device)
+            )
+
+        training_state_path = os.path.join(self.opt.load_weights_folder, "training_state.pth")
+        if os.path.isfile(training_state_path):
+            print("Loading training state")
+            training_state = torch.load(training_state_path, map_location=self.device)
+            self.step = int(training_state.get("step", self.step))
+            self.epoch = int(training_state.get("epoch", -1)) + 1
+            self.base_lrs = list(training_state.get("base_lrs", self.base_lrs))
+            print("Resuming from epoch {}, global step {}".format(self.epoch, self.step))
 
 
 def colormap(inputs, normalize=True, torch_transpose=True):

@@ -101,13 +101,14 @@ class TrainConfig:
     warmup_steps: int
 
     # ABLATION
-    weights_init: str
+    pose_weights_init: str
     num_matching_frames: int
     no_temporal_fusion: bool
     no_lora: bool
     no_consistency_loss: bool
     no_loss_dynamic_weight: bool
     ignore_high_low_loss_pixels: bool
+    consistency_disp_margin: float  # Margin on patch-normalized disparity shape difference
 
     # SYSTEM
     no_cuda: bool
@@ -132,6 +133,7 @@ class TrainConfig:
     no_eval: bool
     eval_eigen_to_benchmark: bool
     eval_teacher: bool
+    eval_after_each_epoch: bool  # Run test-set evaluation after each save (when save_frequency epochs)
 
     # DEPTH_ANYTHING
     depth_anything_encoder: str
@@ -139,6 +141,7 @@ class TrainConfig:
     encoder_lr_coef: float
     fusion_lr_coef: float
     g2s: bool
+    g2s_weight_factor: int  # Factor for g2s weight ramp (maximum_steps = factor * total_steps / num_epochs)
     data_percent: float
     pose_from_scratch: bool
     gradient_accumulation_steps: int
@@ -154,14 +157,14 @@ class TrainConfig:
     # Ablation: feature fusion
     fusion_neighborhood_size: Optional[Tuple[int, ...]]
     fusion_num_scales: int
+    fusion_independent_blocks: bool
     fusion_lora_rank: int
     fusion_lora_alpha: float
     fusion_dropout: float
     fusion_drop_path: float
 
-    # Ablation: scheduler
-    scheduler_gamma: float
-    scheduler_step_epochs: int
+    # Scheduler
+    cosine_min_lr_factor: float
 
     # Ablation: pose encoder
     pose_encoder_num_layers: int
@@ -180,6 +183,11 @@ class TrainConfig:
         Build config from dict. Raises ValueError if any required key is missing.
         """
         d = dict(d)
+        # Backward compatibility for older saved runs/configs.
+        if "pose_weights_init" not in d and "weights_init" in d:
+            d["pose_weights_init"] = d.pop("weights_init")
+        if "fusion_independent_blocks" not in d:
+            d["fusion_independent_blocks"] = False
         fields = cls.__dataclass_fields__
         missing = [name for name in fields if name not in d]
         if missing:

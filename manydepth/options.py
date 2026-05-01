@@ -6,6 +6,7 @@
 
 import os
 import sys
+import types
 from typing import Any, Dict, List, Tuple, Union, get_origin, get_args
 
 try:
@@ -17,6 +18,52 @@ from config import TrainConfig, load_yaml_with_extends, get_config_schema
 
 # CLI options we consume ourselves (not TrainConfig keys)
 _CLI_SPECIAL = frozenset({"config", "c", "load_weights_folder"})
+_NONE_TYPE = type(None)
+
+
+def _is_union_origin(origin: Any) -> bool:
+    return origin is Union or origin is getattr(types, "UnionType", None)
+
+
+def _strip_optional(typ: Any) -> Tuple[Any, bool]:
+    origin = get_origin(typ)
+    args = get_args(typ)
+    if _is_union_origin(origin) and _NONE_TYPE in args:
+        non_none = [arg for arg in args if arg is not _NONE_TYPE]
+        if len(non_none) == 1:
+            return non_none[0], True
+    return typ, False
+
+
+def _parse_bool(raw: str) -> bool:
+    value = raw.lower()
+    if value in ("1", "true", "t", "yes", "y", "on"):
+        return True
+    if value in ("0", "false", "f", "no", "n", "off"):
+        return False
+    raise ValueError("Expected a boolean value, got {!r}".format(raw))
+
+
+def _convert_scalar(raw: str, typ: Any):
+    if typ is bool:
+        return _parse_bool(raw)
+    if typ is int:
+        return int(raw)
+    if typ is float:
+        return float(raw)
+    if typ is str:
+        return raw
+    return raw
+
+
+def _convert_sequence(values: list, typ: Any):
+    origin = get_origin(typ)
+    args = get_args(typ)
+    elem_type = args[0] if args else str
+    converted = [_convert_scalar(value, elem_type) for value in values]
+    if origin is tuple:
+        return tuple(converted)
+    return converted
 
 
 def _collect_config_from_argv(argv: list) -> Tuple[list, str]:
@@ -55,31 +102,28 @@ def _parse_cli_overrides(argv: list) -> dict:
         if key in _CLI_SPECIAL or key not in valid_keys:
             i += 1
             continue
-        typ = type_hints[key]
+        typ, optional = _strip_optional(type_hints[key])
         origin = get_origin(typ)
-        args_ = get_args(typ)
 
         if typ is bool:
-            overrides[key] = True
-            i += 1
+            if i + 1 < len(argv) and not argv[i + 1].startswith("--"):
+                overrides[key] = _parse_bool(argv[i + 1])
+                i += 2
+            else:
+                overrides[key] = True
+                i += 1
             continue
-        if origin is list:
-            # List[int], List[str], etc.: consume values until next --
+        if origin in (list, tuple):
+            # List[int], Tuple[int, ...], etc.: consume values until next --
             vals = []
             i += 1
             while i < len(argv) and not argv[i].startswith("--"):
                 vals.append(argv[i])
                 i += 1
-            if args_:
-                elem_type = args_[0]
-                if elem_type is int:
-                    overrides[key] = [int(x) for x in vals]
-                elif elem_type is float:
-                    overrides[key] = [float(x) for x in vals]
-                else:
-                    overrides[key] = vals
+            if optional and len(vals) == 1 and vals[0].lower() in ("null", "none"):
+                overrides[key] = None
             else:
-                overrides[key] = vals
+                overrides[key] = _convert_sequence(vals, typ)
             continue
         # Single value
         i += 1
@@ -87,27 +131,10 @@ def _parse_cli_overrides(argv: list) -> dict:
             continue
         raw = argv[i]
         i += 1
-        if raw.lower() in ("null", "none") and (origin is type(Union) and type(None) in (args_ or ())):
+        if optional and raw.lower() in ("null", "none"):
             overrides[key] = None
             continue
-        if typ is int:
-            overrides[key] = int(raw)
-        elif typ is float:
-            overrides[key] = float(raw)
-        elif typ is str:
-            overrides[key] = raw
-        elif origin is type(Union) and args_:
-            non_none = [a for a in args_ if a is not type(None)]
-            if non_none and non_none[0] is int:
-                overrides[key] = int(raw)
-            elif non_none and non_none[0] is float:
-                overrides[key] = float(raw)
-            elif non_none and non_none[0] is str:
-                overrides[key] = raw
-            else:
-                overrides[key] = raw
-        else:
-            overrides[key] = raw
+        overrides[key] = _convert_scalar(raw, typ)
     return overrides
 
 
@@ -125,16 +152,39 @@ def _build_merged_config(
         try:
             cfg = TrainConfig.from_saved_run_dir(load_weights_folder)
             config.update(cfg.to_dict())
-        except Exception:
-            pass
+        except FileNotFoundError as e:
+            if not config_paths:
+                raise FileNotFoundError(
+                    "Could not load saved config from {!r}: {}. Provide -c/--config as a fallback.".format(
+                        load_weights_folder, e
+                    )
+                ) from e
+            print(
+                "Warning: could not load saved config from {!r}: {}. Using explicit config file(s).".format(
+                    load_weights_folder, e
+                )
+            )
+        except Exception as e:
+            raise RuntimeError(
+                "Failed to load saved config from {!r}: {}".format(load_weights_folder, e)
+            ) from e
     for path in config_paths:
-        if os.path.isfile(path) and yaml is not None:
-            try:
-                data, _ = load_yaml_with_extends(path)
-                config.update(data)
-            except Exception:
-                pass
+        if not os.path.isfile(path):
+            raise FileNotFoundError(
+                "Config file not found: {!r} (cwd={!r}). Use an absolute path or run from repo root.".format(
+                    path, os.getcwd()
+                )
+            )
+        if yaml is None:
+            raise ImportError("PyYAML is required to load config. pip install PyYAML")
+        try:
+            data, _ = load_yaml_with_extends(path)
+            config.update(data)
+        except Exception as e:
+            raise RuntimeError("Failed to load config from {!r}: {}".format(path, e)) from e
     config.update(cli_overrides)
+    if load_weights_folder is not None:
+        config["load_weights_folder"] = load_weights_folder
     return config
 
 

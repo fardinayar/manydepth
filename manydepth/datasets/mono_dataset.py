@@ -50,6 +50,48 @@ def pil_loader(path):
             return img.convert('RGB')
 
 
+def adjust_hue_pil(img, hue_factor):
+    """PIL hue adjustment compatible with NumPy 2 negative uint casts."""
+    if not (-0.5 <= hue_factor <= 0.5):
+        raise ValueError("hue_factor ({}) is not in [-0.5, 0.5].".format(hue_factor))
+
+    input_mode = img.mode
+    if input_mode in {"L", "1", "I", "F"}:
+        return img
+
+    h, s, v = img.convert("HSV").split()
+    np_h = np.array(h, dtype=np.uint8)
+    hue_offset = int(hue_factor * 255)
+    np_h = ((np_h.astype(np.int16) + hue_offset) % 256).astype(np.uint8)
+
+    h = Image.fromarray(np_h, "L")
+    return Image.merge("HSV", (h, s, v)).convert(input_mode)
+
+
+def build_color_jitter(brightness, contrast, saturation, hue):
+    """Sample one ColorJitter transform and reuse it for every frame/scale."""
+    params = transforms.ColorJitter.get_params(brightness, contrast, saturation, hue)
+    if callable(params):
+        return params
+
+    fn_idx, brightness_factor, contrast_factor, saturation_factor, hue_factor = params
+
+    def color_aug(img):
+        for fn_id in fn_idx:
+            fn_id = int(fn_id)
+            if fn_id == 0 and brightness_factor is not None:
+                img = transforms.functional.adjust_brightness(img, brightness_factor)
+            elif fn_id == 1 and contrast_factor is not None:
+                img = transforms.functional.adjust_contrast(img, contrast_factor)
+            elif fn_id == 2 and saturation_factor is not None:
+                img = transforms.functional.adjust_saturation(img, saturation_factor)
+            elif fn_id == 3 and hue_factor is not None:
+                img = adjust_hue_pil(img, hue_factor)
+        return img
+
+    return color_aug
+
+
 class MonoDataset(data.Dataset):
     """Superclass for monocular dataloaders
     """
@@ -80,7 +122,11 @@ class MonoDataset(data.Dataset):
         self.img_ext = img_ext
 
         self.loader = pil_loader
-        self.to_tensor = transforms.Compose([transforms.ToTensor(), transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
+        self.to_tensor = transforms.ToTensor()
+        self.normalize = transforms.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225],
+        )
 
         # We need to specify augmentations differently in newer versions of torchvision.
         # We first try the newer tuple version; if this fails we fall back to scalars
@@ -103,7 +149,6 @@ class MonoDataset(data.Dataset):
             self.resize[i] = transforms.Resize((self.height // s, self.width // s),
                                                interpolation=self.interp)
 
-        self.load_depth = self.check_depth()
         self.load_gps = load_gps
 
     def preprocess(self, inputs, color_aug):
@@ -123,12 +168,18 @@ class MonoDataset(data.Dataset):
             f = inputs[k]
             if "color" in k:
                 n, im, i = k
-                inputs[(n, im, i)] = self.to_tensor(f)
-                # check it isn't a blank frame - keep _aug as zeros so we can check for it
-                if inputs[(n, im, i)].sum() == 0:
-                    inputs[(n + "_aug", im, i)] = inputs[(n, im, i)]
+                color = self.to_tensor(f)
+                inputs[(n, im, i)] = color
+
+                if inputs.get(("missing_frame", im), False):
+                    color_aug_tensor = color
+                    color_aug_norm = torch.zeros_like(color)
                 else:
-                    inputs[(n + "_aug", im, i)] = self.to_tensor(color_aug(f))
+                    color_aug_tensor = self.to_tensor(color_aug(f))
+                    color_aug_norm = self.normalize(color_aug_tensor)
+
+                inputs[(n + "_aug", im, i)] = color_aug_tensor
+                inputs[(n + "_aug_norm", im, i)] = color_aug_norm
 
 
     def __len__(self):
@@ -145,8 +196,9 @@ class MonoDataset(data.Dataset):
 
             ("color", <frame_id>, <scale>)          for raw colour images,
             ("color_aug", <frame_id>, <scale>)      for augmented colour images,
+            ("color_aug_norm", <frame_id>, <scale>) for normalized network inputs,
             ("K", scale) or ("inv_K", scale)        for camera intrinsics,
-            "depth_gt"                              for ground truth depth maps
+            ("missing_frame", <frame_id>)           for dummy-filled missing frames
 
         <frame_id> is:
             an integer (e.g. 0, -1, or 1) representing the temporal step relative to 'index',
@@ -164,7 +216,6 @@ class MonoDataset(data.Dataset):
         do_flip = self.is_train and random.random() > 0.5
 
         folder, frame_index, side = self.index_to_folder_and_frame_idx(index)
-        poses = {}
         if type(self).__name__ in ["CityscapesPreprocessedDataset", "CityscapesEvalDataset"]:
             inputs.update(self.get_colors(folder, frame_index, side, do_flip))
         else:
@@ -173,16 +224,18 @@ class MonoDataset(data.Dataset):
                     other_side = {"r": "l", "l": "r"}[side]
                     inputs[("color", i, -1)] = self.get_color(
                         folder, frame_index, other_side, do_flip)
+                    inputs[("missing_frame", i)] = False
                 else:
                     try:
                         inputs[("color", i, -1)] = self.get_color(
                             folder, frame_index + i, side, do_flip)
+                        inputs[("missing_frame", i)] = False
                     except FileNotFoundError as e:
                         if i != 0:
                             # fill with dummy values
                             inputs[("color", i, -1)] = \
                                 Image.fromarray(np.zeros((100, 100, 3)).astype(np.uint8))
-                            poses[i] = None
+                            inputs[("missing_frame", i)] = True
                         else:
                             raise FileNotFoundError(f'Cannot find frame - make sure your '
                                                     f'--data_path is set correctly, or try adding'
@@ -208,7 +261,8 @@ class MonoDataset(data.Dataset):
             inputs[("inv_K", scale)] = torch.from_numpy(inv_K)
 
         if do_color_aug:
-            color_aug = transforms.ColorJitter( self.brightness, self.contrast, self.saturation, self.hue)
+            color_aug = build_color_jitter(
+                self.brightness, self.contrast, self.saturation, self.hue)
         else:
             color_aug = (lambda x: x)
 
@@ -217,6 +271,7 @@ class MonoDataset(data.Dataset):
         for i in self.frame_idxs:
             del inputs[("color", i, -1)]
             del inputs[("color_aug", i, -1)]
+            del inputs[("color_aug_norm", i, -1)]
 
         # Add sample index for per-sample variance tracking
         inputs["sample_index"] = index

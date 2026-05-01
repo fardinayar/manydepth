@@ -12,13 +12,9 @@ import torch.nn.functional as F
 
 
 def disp_to_depth(disp, max_depth):
-    """Convert network's sigmoid output into depth prediction
-    The formula for this conversion is given in the 'additional considerations'
-    section of the paper.
-    """
-    min_disp = 1 / max_depth
-    scaled_disp = min_disp + disp
-    depth = 1 / scaled_disp
+    min_disp = 1.0 / max_depth
+    scaled_disp = disp.clamp_min(min_disp)
+    depth = 1.0 / scaled_disp
     return scaled_disp, depth
 
 
@@ -161,9 +157,12 @@ class BackprojectDepth(nn.Module):
                                        requires_grad=False)
 
     def forward(self, depth, inv_K):
-        cam_points = torch.matmul(inv_K[:, :3, :3], self.pix_coords)
-        cam_points = depth.view(self.batch_size, 1, -1) * cam_points
-        cam_points = torch.cat([cam_points, self.ones], 1)
+        batch_size = depth.shape[0]
+        pix_coords = self.pix_coords[:batch_size]
+        ones = self.ones[:batch_size]
+        cam_points = torch.matmul(inv_K[:, :3, :3], pix_coords)
+        cam_points = depth.view(batch_size, 1, -1) * cam_points
+        cam_points = torch.cat([cam_points, ones], 1)
 
         return cam_points
 
@@ -181,12 +180,13 @@ class Project3D(nn.Module):
         self.eps = eps
 
     def forward(self, points, K, T):
+        batch_size = points.shape[0]
         P = torch.matmul(K, T)[:, :3, :]
 
         cam_points = torch.matmul(P, points)
 
         pix_coords = cam_points[:, :2, :] / (cam_points[:, 2, :].unsqueeze(1) + self.eps)
-        pix_coords = pix_coords.view(self.batch_size, 2, self.height, self.width)
+        pix_coords = pix_coords.view(batch_size, 2, self.height, self.width)
         pix_coords = pix_coords.permute(0, 2, 3, 1)
         pix_coords[..., 0] /= self.width - 1
         pix_coords[..., 1] /= self.height - 1

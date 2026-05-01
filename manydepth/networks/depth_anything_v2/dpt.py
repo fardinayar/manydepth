@@ -176,7 +176,7 @@ class DepthAnythingV2(nn.Module):
         
         features = self.pretrained.get_intermediate_layers(x, self.intermediate_layer_idx[self.encoder], return_class_token=True)
         
-        depth = self.depth_head(features, patch_h, patch_w)
+        depth, _ = self.depth_head(features, patch_h, patch_w)
         depth = F.relu(depth)
         
         return depth.squeeze(1)

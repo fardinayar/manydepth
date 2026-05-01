@@ -71,7 +71,7 @@ class KITTIDataset(MonoDataset):
 
 
 class KITTIRAWDataset(KITTIDataset):
-    """KITTI dataset which loads the original velodyne depth maps for ground truth
+    """KITTI raw image dataset.
     """
     def __init__(self, *args, **kwargs):
         super(KITTIRAWDataset, self).__init__(*args, **kwargs)

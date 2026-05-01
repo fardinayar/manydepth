@@ -50,6 +50,13 @@ def export_gt_depths_kitti():
         elif opt.split == "eigen_benchmark":
             gt_depth_path = os.path.join(opt.data_path, folder, "proj_depth",
                                          "groundtruth", "image_02", "{:010d}.png".format(frame_id))
+            if not os.path.isfile(gt_depth_path):
+                raise FileNotFoundError(
+                    "Ground truth depth not found: {}\n"
+                    "The eigen_benchmark split requires KITTI depth completion ground truth "
+                    "(proj_depth/groundtruth/image_02). Use --split eigen if you only have "
+                    "raw KITTI, or ensure the depth completion benchmark data is present.".format(gt_depth_path)
+                )
             gt_depth = np.array(pil.open(gt_depth_path)).astype(np.float32) / 256
 
         gt_depths.append(gt_depth.astype(np.float32))

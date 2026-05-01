@@ -2,9 +2,9 @@ import torch
 import torch.nn as nn
 import loralib as lora
 
-def replace_qkv_with_mergedlinear(model, r=4, lora_alpha=4, lora_dropout=0.0):
+def replace_mlp_with_lora(model, r=4, lora_alpha=4, lora_dropout=0.0):
     """
-    Recursively replace all qkv linear layers in the model with MergedLinear from loralib.
+    Recursively replace DINO MLP fc layers in the model with LoRA linear layers.
     
     Args:
     - model: The PyTorch model to modify
@@ -17,12 +17,11 @@ def replace_qkv_with_mergedlinear(model, r=4, lora_alpha=4, lora_dropout=0.0):
     """
     for name, module in model.named_children():
         if isinstance(module, nn.Linear) and 'fc' in name.lower():
-            # This is likely a qkv linear layer
             in_features = module.in_features
             out_features = module.out_features
             bias = module.bias is not None
             
-            # Create a new MergedLinear layer
+            # Create a new LoRA linear layer
             new_layer = lora.Linear(
                 in_features=in_features,
                 out_features=out_features,
@@ -42,7 +41,7 @@ def replace_qkv_with_mergedlinear(model, r=4, lora_alpha=4, lora_dropout=0.0):
             print(f"Replaced {name} with LoRA layer")
         else:
             # Recursively apply to child modules
-            replace_qkv_with_mergedlinear(module, r, lora_alpha, lora_dropout)
+            replace_mlp_with_lora(module, r, lora_alpha, lora_dropout)
     
     return model
 

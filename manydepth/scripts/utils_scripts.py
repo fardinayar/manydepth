@@ -15,8 +15,9 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from config import TrainConfig
+from layers import disp_to_depth
 import networks
-from networks.replace_with_lora import replace_qkv_with_mergedlinear, replace_conv_with_loraconv
+from networks.replace_with_lora import replace_mlp_with_lora, replace_conv_with_loraconv
 
 try:
     import open3d as o3d
@@ -108,14 +109,19 @@ def setup_models(
         print('No "height" or "width" in encoder state_dict, using provided values!')
         HEIGHT, WIDTH = height, width
 
+    saved_cfg = TrainConfig.from_saved_run_dir(weights_folder)
+
     if teacher_mode:
         encoder, depth_decoder = networks.get_da_encoder_decoder(
-            encoder_name=depth_anything_encoder
+            encoder_name=depth_anything_encoder,
+            checkpoint_dir=saved_cfg.depth_anything_checkpoint_dir,
         )
     else:
-        saved_cfg = TrainConfig.from_saved_run_dir(weights_folder)
         config = networks.MODEL_CONFIGS[depth_anything_encoder]
-        encoder = networks.ManyDepthAnythingEncoder(encoder_name=depth_anything_encoder)
+        encoder = networks.ManyDepthAnythingEncoder(
+            encoder_name=depth_anything_encoder,
+            checkpoint_dir=saved_cfg.depth_anything_checkpoint_dir,
+        )
         depth_decoder = networks.ManyDepthAnythingDecoder(
             patch_h=HEIGHT // 14,
             patch_w=WIDTH // 14,
@@ -127,29 +133,36 @@ def setup_models(
             num_register_tokens=saved_cfg.num_register_tokens,
             fusion_neighborhood_size=saved_cfg.fusion_neighborhood_size,
             fusion_num_scales=saved_cfg.fusion_num_scales,
+            fusion_independent_blocks=saved_cfg.fusion_independent_blocks,
             fusion_lora_rank=saved_cfg.fusion_lora_rank,
             fusion_lora_alpha=saved_cfg.fusion_lora_alpha,
             fusion_dropout=saved_cfg.fusion_dropout,
             fusion_drop_path=saved_cfg.fusion_drop_path,
         )
-        encoder = replace_qkv_with_mergedlinear(
-            encoder,
-            r=saved_cfg.lora_rank,
-            lora_alpha=saved_cfg.lora_alpha,
-            lora_dropout=0.0,
-        )
-        depth_decoder = replace_conv_with_loraconv(
-            depth_decoder,
-            r=saved_cfg.lora_rank,
-            lora_alpha=saved_cfg.lora_alpha,
-            lora_dropout=0.0,
-        )
+        if not saved_cfg.no_lora:
+            encoder = replace_mlp_with_lora(
+                encoder,
+                r=saved_cfg.lora_rank,
+                lora_alpha=saved_cfg.lora_alpha,
+                lora_dropout=0.0,
+            )
+            depth_decoder = replace_conv_with_loraconv(
+                depth_decoder,
+                r=saved_cfg.lora_rank,
+                lora_alpha=saved_cfg.lora_alpha,
+                lora_dropout=0.0,
+            )
         print(
             f"  num_passes: {saved_cfg.num_passes}, no_temporal_fusion: {saved_cfg.no_temporal_fusion}"
         )
 
     encoder.load_state_dict(encoder_dict, strict=False)
-    depth_decoder.load_state_dict(torch.load(decoder_path, map_location=device))
+    decoder_state = torch.load(decoder_path, map_location=device)
+    missing, unexpected = depth_decoder.load_state_dict(decoder_state, strict=False)
+    if missing:
+        print(f"Depth decoder missing keys during load: {missing}")
+    if unexpected:
+        print(f"Depth decoder unexpected keys during load: {unexpected}")
     encoder.eval()
     depth_decoder.eval()
     encoder.to(device)
@@ -161,7 +174,7 @@ def setup_models(
 def predict_depth_teacher(encoder, depth_decoder, input_color: torch.Tensor):
     """Teacher (monocular) depth prediction."""
     features = encoder.get_intermediate_layers(
-        input_color, [2, 5, 8, 11], return_class_token=True
+        input_color, encoder.intermediate_layer_idx, return_class_token=True
     )
     patch_h = input_color.shape[-2] // 14
     patch_w = input_color.shape[-1] // 14
@@ -174,9 +187,17 @@ def predict_depth_student(
     encoder, depth_decoder, input_color: torch.Tensor, lookup_frames: torch.Tensor
 ):
     """Student (multi-frame) depth prediction."""
-    features, lookup_features = encoder(input_color, lookup_frames)
+    if getattr(depth_decoder, "temporal_fusion", True) and lookup_frames.shape[1] != 1:
+        raise ValueError("Student inference currently supports exactly one matching frame")
+    encoder_lookup_frames = lookup_frames if getattr(depth_decoder, "temporal_fusion", True) else None
+    features, lookup_features = encoder(input_color, encoder_lookup_frames)
     output, _ = depth_decoder(features, lookup_features)
     return output
+
+
+def postprocess_depth_output(output: torch.Tensor, max_depth: float):
+    """Convert a raw model output to disparity and depth using training/eval semantics."""
+    return disp_to_depth(output.relu(), max_depth)
 
 
 def depth_to_pointcloud(

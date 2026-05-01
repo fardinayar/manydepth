@@ -7,7 +7,7 @@
 import os
 import cv2
 
-from networks.replace_with_lora import replace_qkv_with_mergedlinear, replace_conv_with_loraconv
+from networks.replace_with_lora import replace_mlp_with_lora, replace_conv_with_loraconv
 os.environ["MKL_NUM_THREADS"] = "1"  # noqa F402
 os.environ["NUMEXPR_NUM_THREADS"] = "1"  # noqa F402
 os.environ["OMP_NUM_THREADS"] = "1"  # noqa F402
@@ -72,6 +72,8 @@ def evaluate(opt):
     MAX_DEPTH = 80
 
     frames_to_load = [0]
+    if opt.num_matching_frames != 1:
+        raise ValueError("num_matching_frames must be 1 with the current temporal fusion block")
     for idx in range(-1, -1 - opt.num_matching_frames, -1):
         if idx not in frames_to_load:
             frames_to_load.append(idx)
@@ -97,7 +99,7 @@ def evaluate(opt):
             encoder_path = os.path.join(opt.load_weights_folder, "encoder.pth")
             decoder_path = os.path.join(opt.load_weights_folder, "depth.pth")
 
-        encoder_dict = torch.load(encoder_path)
+        encoder_dict = torch.load(encoder_path, map_location='cpu')
         try:
             HEIGHT, WIDTH = encoder_dict['height'], encoder_dict['width']
             opt.height, opt.width = HEIGHT, WIDTH
@@ -112,6 +114,9 @@ def evaluate(opt):
         num_register_tokens = opt.num_register_tokens
         fusion_neighborhood_size = opt.fusion_neighborhood_size
         fusion_num_scales = opt.fusion_num_scales
+        fusion_independent_blocks = encoder_dict.get(
+            'fusion_independent_blocks', opt.fusion_independent_blocks
+        )
         fusion_lora_rank = opt.fusion_lora_rank
         fusion_lora_alpha = opt.fusion_lora_alpha
         fusion_dropout = opt.fusion_dropout
@@ -121,6 +126,7 @@ def evaluate(opt):
         print(f"  Height x Width: {HEIGHT} x {WIDTH}")
         print(f"  Num passes: {num_passes}")
         print(f"  No temporal fusion: {no_temporal_fusion}")
+        print(f"  Independent fusion blocks: {fusion_independent_blocks}")
 
         if opt.eval_split == 'cityscapes':
             dataset = datasets.CityscapesEvalDataset(opt.data_path, filenames,
@@ -138,10 +144,17 @@ def evaluate(opt):
 
         # setup models
         if opt.eval_teacher:
-            encoder, depth_decoder = networks.get_da_encoder_decoder(encoder_name=opt.depth_anything_encoder)
+            encoder, depth_decoder = networks.get_da_encoder_decoder(
+                encoder_name=opt.depth_anything_encoder,
+                checkpoint_dir=opt.depth_anything_checkpoint_dir,
+            )
         else:
-            pose_enc_dict = torch.load(os.path.join(opt.load_weights_folder, "pose_encoder.pth"))
-            pose_dec_dict = torch.load(os.path.join(opt.load_weights_folder, "pose.pth"))
+            pose_enc_dict = torch.load(
+                os.path.join(opt.load_weights_folder, "pose_encoder.pth"), map_location='cpu'
+            )
+            pose_dec_dict = torch.load(
+                os.path.join(opt.load_weights_folder, "pose.pth"), map_location='cpu'
+            )
 
             pose_enc = networks.ResnetEncoder(opt.pose_encoder_num_layers, False, num_input_images=2)
             pose_dec = networks.PoseDecoder(pose_enc.num_ch_enc, num_input_features=1,
@@ -158,7 +171,10 @@ def evaluate(opt):
                 pose_enc.cuda()
                 pose_dec.cuda()
 
-            encoder = networks.ManyDepthAnythingEncoder(encoder_name=opt.depth_anything_encoder)
+            encoder = networks.ManyDepthAnythingEncoder(
+                encoder_name=opt.depth_anything_encoder,
+                checkpoint_dir=opt.depth_anything_checkpoint_dir,
+            )
             config = networks.MODEL_CONFIGS[opt.depth_anything_encoder]
             depth_decoder = networks.ManyDepthAnythingDecoder(
                 patch_h=opt.height // 14, patch_w=opt.width // 14,
@@ -168,13 +184,14 @@ def evaluate(opt):
                 num_passes=num_passes,
                 fusion_neighborhood_size=fusion_neighborhood_size,
                 fusion_num_scales=fusion_num_scales,
+                fusion_independent_blocks=fusion_independent_blocks,
                 fusion_lora_rank=fusion_lora_rank,
                 fusion_lora_alpha=fusion_lora_alpha,
                 fusion_dropout=fusion_dropout,
                 fusion_drop_path=fusion_drop_path,
             )
             if not opt.no_lora:
-                encoder = replace_qkv_with_mergedlinear(
+                encoder = replace_mlp_with_lora(
                     encoder, r=opt.lora_rank, lora_alpha=opt.lora_alpha, lora_dropout=0.0
                 )
                 depth_decoder = replace_conv_with_loraconv(
@@ -183,7 +200,12 @@ def evaluate(opt):
 
         encoder.load_state_dict(encoder_dict, strict=False)
         
-        depth_decoder.load_state_dict(torch.load(decoder_path))
+        decoder_state = torch.load(decoder_path, map_location='cpu')
+        missing, unexpected = depth_decoder.load_state_dict(decoder_state, strict=False)
+        if missing:
+            print("Depth decoder missing keys during load: {}".format(missing))
+        if unexpected:
+            print("Depth decoder unexpected keys during load: {}".format(unexpected))
         encoder.eval()
         depth_decoder.eval()
         if torch.cuda.is_available():
@@ -197,22 +219,25 @@ def evaluate(opt):
         # do inference
         with torch.no_grad():
             for i, data in tqdm.tqdm(enumerate(dataloader)):
-                input_color = data[('color', 0, 0)]
+                input_color = data[('color_aug_norm', 0, 0)]
                 if torch.cuda.is_available():
                     input_color = input_color.cuda()
 
                 if opt.eval_teacher:
-                    features = encoder.get_intermediate_layers(input_color, [2, 5, 8, 11], return_class_token=True)
+                    features = encoder.get_intermediate_layers(
+                        input_color, encoder.intermediate_layer_idx, return_class_token=True
+                    )
                     patch_h, patch_w = input_color.shape[-2] // 14, input_color.shape[-1] // 14
                     output, _ = depth_decoder(features, patch_h, patch_w)
                 else:
-                    lookup_frames = [data[('color', idx, 0)] for idx in frames_to_load[1:]]
+                    lookup_frames = [data[('color_aug_norm', idx, 0)] for idx in frames_to_load[1:]]
                     lookup_frames = torch.stack(lookup_frames, 1)  # batch x frames x 3 x h x w
 
                     if torch.cuda.is_available():
                         lookup_frames = lookup_frames.cuda()
 
-                    features, lookup_features = encoder(input_color, lookup_frames)
+                    encoder_lookup_frames = None if no_temporal_fusion else lookup_frames
+                    features, lookup_features = encoder(input_color, encoder_lookup_frames)
                     output, _ = depth_decoder(features, lookup_features)
                 if opt.eval_teacher:
                     output = output.relu()
