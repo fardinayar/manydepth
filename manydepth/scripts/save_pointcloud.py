@@ -30,7 +30,6 @@ from utils_scripts import (
 
 def infer_depth_disparity_and_pointcloud(
     target_image: Union[str, np.ndarray],
-    lookup_frame: Union[str, np.ndarray],
     weights_folder: str,
     depth_anything_encoder: str = "vits",
     height: Optional[int] = None,
@@ -56,8 +55,6 @@ def infer_depth_disparity_and_pointcloud(
 
     if isinstance(target_image, str) and not os.path.exists(target_image):
         raise ValueError(f"Target image not found: {target_image}")
-    if isinstance(lookup_frame, str) and not os.path.exists(lookup_frame):
-        raise ValueError(f"Lookup frame not found: {lookup_frame}")
     if not os.path.exists(weights_folder):
         raise ValueError(f"Weights folder not found: {weights_folder}")
 
@@ -74,13 +71,7 @@ def infer_depth_disparity_and_pointcloud(
             target_color = load_image_from_array(target_image, HEIGHT, WIDTH)
         target_color = target_color.to(device)
 
-        if isinstance(lookup_frame, str):
-            lookup_color = load_image(lookup_frame, HEIGHT, WIDTH)
-        else:
-            lookup_color = load_image_from_array(lookup_frame, HEIGHT, WIDTH)
-        lookup_frames = lookup_color.unsqueeze(1).to(device)
-
-        output = predict_depth_student(encoder, depth_decoder, target_color, lookup_frames)
+        output = predict_depth_student(encoder, depth_decoder, target_color)
         pred_disp, pred_depth = postprocess_depth_output(output, max_depth)
 
         disp_map = pred_disp.cpu().squeeze().numpy()
@@ -147,7 +138,7 @@ def infer_depths_for_folder(
     extensions: Tuple[str, ...] = (".png", ".jpg", ".jpeg", ".bmp", ".webp"),
     coordinate_system: str = "lidar",
 ) -> Dict[str, Dict[str, Any]]:
-    """Process a folder of images, pairing each image with its previous one as lookup.
+    """Process a folder of images, predicting depth for each image independently.
 
     - Saves depth/disp for each processed image when output_dir is provided.
     - Saves point clouds only if fx and fy are provided.
@@ -163,21 +154,16 @@ def infer_depths_for_folder(
     all_files = [os.path.join(input_folder, f) for f in os.listdir(input_folder)]
     image_files = sorted([p for p in all_files if os.path.splitext(p)[1].lower() in extensions])
 
-    if len(image_files) < 2:
-        raise ValueError("Need at least two images in the folder to form (target, lookup) pairs")
+    if len(image_files) < 1:
+        raise ValueError("Need at least one image in the folder")
 
     if output_dir is not None and not os.path.exists(output_dir):
         os.makedirs(output_dir, exist_ok=True)
 
     results: Dict[str, Dict[str, Any]] = {}
-    # Iterate over images, pairing each with its previous one as lookup
-    for idx in range(1, len(image_files)):
-        target_path = image_files[idx]
-        lookup_path = image_files[idx - 1]
-
+    for target_path in image_files:
         result = infer_depth_disparity_and_pointcloud(
             target_image=target_path,
-            lookup_frame=lookup_path,
             weights_folder=weights_folder,
             depth_anything_encoder=depth_anything_encoder,
             height=None,
@@ -196,13 +182,11 @@ def infer_depths_for_folder(
     return results
 
 def main():
-    parser = argparse.ArgumentParser(description='Run inference and save point cloud, depth, and disparity - student mode, multi-frame, no poses')
+    parser = argparse.ArgumentParser(description='Run inference and save point cloud, depth, and disparity - student mode, single-frame')
     parser.add_argument('--target_image', type=str, default="kitti_data/2011_09_26/2011_09_26_drive_0001_sync/image_02/data/0000000005.png",
                         help='Path to target image (main image for depth prediction)')
-    parser.add_argument('--lookup_frame', type=str, default="kitti_data/2011_09_26/2011_09_26_drive_0001_sync/image_02/data/0000000004.png",
-                        help='Path to lookup frame image for matching')
     parser.add_argument('--input_folder', type=str, default=None,
-                        help='Folder containing images; each image is paired with the previous one as lookup')
+                        help='Folder containing images; each image is processed independently')
     parser.add_argument('--output_dir', type=str, default="output_pointclouds",
                         help='Directory to save outputs into')
     parser.add_argument('--weights_folder', type=str, default="outs/kitti/base/mdp/models/weights_4",
@@ -249,7 +233,6 @@ def main():
     else:
         result = infer_depth_disparity_and_pointcloud(
             target_image=args.target_image,
-            lookup_frame=args.lookup_frame,
             weights_folder=args.weights_folder,
             depth_anything_encoder=args.depth_anything_encoder,
             height=args.height,

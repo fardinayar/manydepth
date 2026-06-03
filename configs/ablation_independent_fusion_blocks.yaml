@@ -1,7 +1,0 @@
-# Independent full fusion block per feature scale.
-# This is the clean ablation against the default shared block + per-scale LoRA.
-extends: base.yaml
-model_name: "mdp_independent_fusion_blocks"
-fusion_independent_blocks: true
-fusion_lora_rank: 0
-fusion_lora_alpha: 0.0

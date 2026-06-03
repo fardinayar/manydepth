@@ -72,13 +72,7 @@ def evaluate(opt):
     MAX_DEPTH = 80
 
     frames_to_load = [0]
-    if opt.num_matching_frames != 1:
-        raise ValueError("num_matching_frames must be 1 with the current temporal fusion block")
-    for idx in range(-1, -1 - opt.num_matching_frames, -1):
-        if idx not in frames_to_load:
-            frames_to_load.append(idx)
 
-    
     if opt.ext_disp_to_eval is None:
 
         opt.load_weights_folder = os.path.expanduser(opt.load_weights_folder)
@@ -108,31 +102,8 @@ def evaluate(opt):
                   'using command line values!')
             HEIGHT, WIDTH = opt.height, opt.width
         
-        # Params come from parsed opt (saved config is auto-loaded from run's config.yaml and overridable by -c/CLI)
-        num_passes = encoder_dict.get('num_passes', opt.num_passes)
-        no_temporal_fusion = encoder_dict.get('no_temporal_fusion', opt.no_temporal_fusion)
-        num_register_tokens = opt.num_register_tokens
-        fusion_neighborhood_size = opt.fusion_neighborhood_size
-        fusion_num_scales = opt.fusion_num_scales
-        fusion_independent_blocks = encoder_dict.get(
-            'fusion_independent_blocks', opt.fusion_independent_blocks
-        )
-        fusion_mode = encoder_dict.get('fusion_mode', opt.fusion_mode)
-        fusion_separate_norms = encoder_dict.get(
-            'fusion_separate_norms', opt.fusion_separate_norms
-        )
-        fusion_lora_rank = opt.fusion_lora_rank
-        fusion_lora_alpha = opt.fusion_lora_alpha
-        fusion_dropout = opt.fusion_dropout
-        fusion_drop_path = opt.fusion_drop_path
-
         print(f"Loaded model configuration:")
         print(f"  Height x Width: {HEIGHT} x {WIDTH}")
-        print(f"  Num passes: {num_passes}")
-        print(f"  No temporal fusion: {no_temporal_fusion}")
-        print(f"  Independent fusion blocks: {fusion_independent_blocks}")
-        print(f"  Fusion mode: {fusion_mode}")
-        print(f"  Separate fusion norms: {fusion_separate_norms}")
 
         if opt.eval_split == 'cityscapes':
             dataset = datasets.CityscapesEvalDataset(opt.data_path, filenames,
@@ -163,18 +134,6 @@ def evaluate(opt):
             depth_decoder = networks.ManyDepthAnythingDecoder(
                 patch_h=opt.height // 14, patch_w=opt.width // 14,
                 features=config['features'], in_channels=config['in_channels'], out_channels=config['out_channels'],
-                temporal_fusion=not no_temporal_fusion,
-                num_register_tokens=num_register_tokens,
-                num_passes=num_passes,
-                fusion_neighborhood_size=fusion_neighborhood_size,
-                fusion_num_scales=fusion_num_scales,
-                fusion_independent_blocks=fusion_independent_blocks,
-                fusion_mode=fusion_mode,
-                fusion_lora_rank=fusion_lora_rank,
-                fusion_lora_alpha=fusion_lora_alpha,
-                fusion_dropout=fusion_dropout,
-                fusion_drop_path=fusion_drop_path,
-                fusion_separate_norms=fusion_separate_norms,
                 use_cls_scale_shift=getattr(opt, "use_cls_scale_shift", False),
             )
             if not opt.no_lora:
@@ -217,18 +176,8 @@ def evaluate(opt):
                     patch_h, patch_w = input_color.shape[-2] // 14, input_color.shape[-1] // 14
                     output, _ = depth_decoder(features, patch_h, patch_w)
                 else:
-                    lookup_frames = [data[('color_aug_norm', idx, 0)] for idx in frames_to_load[1:]]
-                    lookup_frames = torch.stack(lookup_frames, 1)  # batch x frames x 3 x h x w
-
-                    if torch.cuda.is_available():
-                        lookup_frames = lookup_frames.cuda()
-
-                    encoder_lookup_frames = None if no_temporal_fusion else lookup_frames
-                    features, lookup_features = encoder(input_color, encoder_lookup_frames)
-                    output, _ = depth_decoder(
-                        features,
-                        lookup_features,
-                    )
+                    features = encoder(input_color)
+                    output, _ = depth_decoder(features)
                 if opt.eval_teacher:
                     output = output.relu()
                 else:

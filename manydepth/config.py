@@ -59,15 +59,6 @@ def load_yaml_with_extends(
     return (merged, True)
 
 
-def _ensure_tuple(v: Union[None, int, List[int], Tuple[int, ...]]) -> Optional[Tuple[int, ...]]:
-    """Convert list or int to tuple for neighborhood_size; None stays None."""
-    if v is None:
-        return None
-    if isinstance(v, (list, tuple)):
-        return tuple(int(x) for x in v)
-    return (int(v), int(v))
-
-
 @dataclass
 class TrainConfig:
     """
@@ -102,8 +93,6 @@ class TrainConfig:
 
     # ABLATION
     pose_weights_init: str
-    num_matching_frames: int
-    no_temporal_fusion: bool
     no_lora: bool
     no_consistency_loss: bool
     no_loss_dynamic_weight: bool
@@ -143,31 +132,17 @@ class TrainConfig:
     depth_anything_checkpoint_dir: str
     encoder_lr_coef: float
     encoder_token_lr_coef: float
-    fusion_lr_coef: float
     g2s: bool
     g2s_weight_factor: int  # Factor for g2s weight ramp (maximum_steps = factor * total_steps / num_epochs)
     data_percent: float
     pose_from_scratch: bool
     gradient_accumulation_steps: int
 
-    num_passes: int
-    num_register_tokens: int
-
     # Ablation: LoRA (encoder/decoder)
     lora_rank: int
     lora_alpha: float
     lora_dropout: float
 
-    # Ablation: feature fusion
-    fusion_neighborhood_size: Optional[Tuple[int, ...]]
-    fusion_num_scales: int
-    fusion_independent_blocks: bool
-    fusion_mode: str
-    fusion_separate_norms: bool
-    fusion_lora_rank: int
-    fusion_lora_alpha: float
-    fusion_dropout: float
-    fusion_drop_path: float
     use_cls_scale_shift: bool
 
     # Scheduler
@@ -193,10 +168,6 @@ class TrainConfig:
         # Backward compatibility for older saved runs/configs.
         if "pose_weights_init" not in d and "weights_init" in d:
             d["pose_weights_init"] = d.pop("weights_init")
-        if "fusion_independent_blocks" not in d:
-            d["fusion_independent_blocks"] = False
-        if "fusion_mode" not in d:
-            d["fusion_mode"] = "attention"
         if "use_cls_scale_shift" not in d:
             d["use_cls_scale_shift"] = False
         if "encoder_token_lr_coef" not in d:
@@ -207,6 +178,15 @@ class TrainConfig:
             d["depth_edge_mask_threshold"] = 0.15
         if "depth_edge_mask_dilation" not in d:
             d["depth_edge_mask_dilation"] = 1
+        # Drop multi-frame fusion keys that may linger in older saved configs.
+        for _legacy in (
+            "num_matching_frames", "no_temporal_fusion", "fusion_lr_coef",
+            "num_passes", "num_register_tokens", "fusion_neighborhood_size",
+            "fusion_num_scales", "fusion_independent_blocks", "fusion_mode",
+            "fusion_separate_norms", "fusion_lora_rank", "fusion_lora_alpha",
+            "fusion_dropout", "fusion_drop_path",
+        ):
+            d.pop(_legacy, None)
         fields = cls.__dataclass_fields__
         missing = [name for name in fields if name not in d]
         if missing:
@@ -216,8 +196,6 @@ class TrainConfig:
                     ", ".join(sorted(missing))
                 )
             )
-        if d["fusion_neighborhood_size"] is not None:
-            d["fusion_neighborhood_size"] = _ensure_tuple(d["fusion_neighborhood_size"])
         if isinstance(d["scales"], (list, tuple)):
             d["scales"] = list(d["scales"])
         if isinstance(d["frame_ids"], (list, tuple)):

@@ -212,9 +212,9 @@ def overlay_masks_with_distance(image, masks, labels, depth_map, alpha=0.3):
     
     return overlay
 
-def create_video_demo(image_folder, weights_folder, output_video, 
+def create_video_demo(image_folder, weights_folder, output_video,
                      depth_anything_encoder="vits", height=288, width=512, fps=15,
-                     min_depth=0.1, max_depth=80, num_matching_frames=2, max_frames=None, mask_folder=None):
+                     min_depth=0.1, max_depth=80, max_frames=None, mask_folder=None):
     """Create a video demo with original images, depth predictions, and optional mask overlays with distance labels
     """
     
@@ -245,7 +245,6 @@ def create_video_demo(image_folder, weights_folder, output_video,
     
     print(f"Processing {len(image_files)} images")
     print(f"-> Computing predictions with size {HEIGHT}x{WIDTH}")
-    print(f"-> Using {num_matching_frames} matching frames")
     
     # Get original image dimensions from first image for display resolution
     first_image = cv2.imread(image_files[0])
@@ -290,22 +289,10 @@ def create_video_demo(image_folder, weights_folder, output_video,
             # Load current frame
             input_color = load_image(image_path, HEIGHT, WIDTH)
             input_color = input_color.to(device)
-            
-            # Create lookup frames (previous frames or repeated current frame if at start)
-            lookup_frame_list = []
-            for j in range(1, num_matching_frames + 1):
-                lookup_idx = max(0, i - j)  # Use previous frames, or repeat first frame
-                lookup_image_path = image_files[lookup_idx]
-                lookup_frame = load_image(lookup_image_path, HEIGHT, WIDTH)
-                lookup_frame_list.append(lookup_frame)
-            
-            # Stack lookup frames: batch x frames x 3 x h x w
-            lookup_frames = torch.stack(lookup_frame_list, dim=1).to(device)
 
-            
-            # Predict depth (student mode, multi-frame, no poses)
-            output = predict_depth_student(encoder, depth_decoder, input_color, lookup_frames)
-            
+            # Predict depth (student mode, single-frame)
+            output = predict_depth_student(encoder, depth_decoder, input_color)
+
             # Convert to depth and disparity
             pred_disp, pred_depth = postprocess_depth_output(output, max_depth)
             
@@ -362,7 +349,7 @@ def create_video_demo(image_folder, weights_folder, output_video,
         print("Error: Video file was not created!")
 
 def main():
-    parser = argparse.ArgumentParser(description='Create video demo with depth estimation, and optional Grounding DINO mask overlays - student mode, multi-frame, no poses')
+    parser = argparse.ArgumentParser(description='Create video demo with depth estimation, and optional Grounding DINO mask overlays - student mode, single-frame')
     parser.add_argument('--image_folder', type=str, required=True,
                         help='Path to folder containing input images')
     parser.add_argument('--weights_folder', type=str, required=True,
@@ -382,8 +369,6 @@ def main():
                         help='Minimum depth for visualization')
     parser.add_argument('--max_depth', type=float, default=80,
                         help='Maximum depth for visualization')
-    parser.add_argument('--num_matching_frames', type=int, default=1,
-                        help='Number of previous frames to use for matching')
     parser.add_argument('--max_frames', type=int, default=None,
                         help='Maximum number of frames to process (default: process all frames)')
     parser.add_argument('--mask_folder', type=str, default=None,
@@ -407,9 +392,8 @@ def main():
     if output_dir and not os.path.exists(output_dir):
         os.makedirs(output_dir)
     
-    print(f"Mode: Student (multi-frame, no poses)")
+    print(f"Mode: Student (single-frame)")
     print(f"Encoder: {args.depth_anything_encoder}")
-    print(f"Matching frames: {args.num_matching_frames}")
     if args.max_frames:
         print(f"Max frames to process: {args.max_frames}")
     if args.mask_folder:
@@ -426,7 +410,6 @@ def main():
         args.fps,
         args.min_depth,
         args.max_depth,
-        args.num_matching_frames,
         args.max_frames,
         args.mask_folder,
     )

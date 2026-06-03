@@ -5,7 +5,6 @@ import torch
 import torch.nn.functional as F
 from .depth_anything_v2.util.blocks import FeatureFusionBlock, _make_scratch
 import copy
-from .feature_fusion import MultiFrameFeatureFusion
 
 MODEL_CONFIGS = {
     'vits': {'encoder': 'vits', 'features': 64, 'in_channels': 384, 'out_channels': [48, 96, 192, 384]},
@@ -144,18 +143,10 @@ class ManyDepthAnythingEncoder(nn.Module):
         super(ManyDepthAnythingEncoder, self).__init__()
         self.encoder = get_da_encoder_decoder(encoder_name, checkpoint, checkpoint_dir)[0]
         
-    def forward(self, image, lookup_frames=None, return_class_token=True):
-        out_features = self.encoder.get_intermediate_layers(image, self.encoder.intermediate_layer_idx, return_class_token=return_class_token)
-        if lookup_frames is None:
-            return out_features, None
-
-        b, n, c, h, w = lookup_frames.shape
-        if n != 1:
-            raise ValueError("ManyDepthAnythingEncoder currently supports exactly one matching frame")
-        lookup_frames = lookup_frames.reshape((b*n, c, h, w))
-        lookup_features = self.encoder.get_intermediate_layers(lookup_frames, self.encoder.intermediate_layer_idx, return_class_token=return_class_token)
-
-        return out_features, lookup_features
+    def forward(self, image, return_class_token=True):
+        return self.encoder.get_intermediate_layers(
+            image, self.encoder.intermediate_layer_idx, return_class_token=return_class_token
+        )
 
 class ManyDepthAnythingDecoder(nn.Module):
     def __init__(
@@ -167,18 +158,6 @@ class ManyDepthAnythingDecoder(nn.Module):
         use_clstoken=False,
         patch_h=518//14,
         patch_w=518//14,
-        temporal_fusion=True,
-        num_passes=2,
-        num_register_tokens=8,
-        fusion_neighborhood_size=(3, 15),
-        fusion_num_scales=4,
-        fusion_independent_blocks=False,
-        fusion_mode="attention",
-        fusion_lora_rank=32,
-        fusion_lora_alpha=4.0,
-        fusion_dropout=0.0,
-        fusion_drop_path=0.0,
-        fusion_separate_norms=True,
         use_cls_scale_shift=False,
     ):
         super(ManyDepthAnythingDecoder, self).__init__()
@@ -187,13 +166,6 @@ class ManyDepthAnythingDecoder(nn.Module):
         self.patch_w = patch_w
         self.out_channels = out_channels
         self.use_clstoken = use_clstoken
-        self.temporal_fusion = temporal_fusion
-        self.num_passes = num_passes
-        self.num_register_tokens = num_register_tokens
-        self.fusion_num_scales = int(fusion_num_scales)
-        self.fusion_independent_blocks = fusion_independent_blocks
-        self.fusion_mode = (fusion_mode or "attention").lower()
-        self.fusion_separate_norms = bool(fusion_separate_norms)
         self.use_cls_scale_shift = use_cls_scale_shift
         self.cls_scale_shift = (
             ClsTokenScaleShiftCorrector(in_channels) if use_cls_scale_shift else None
@@ -245,36 +217,7 @@ class ManyDepthAnythingDecoder(nn.Module):
             groups=1,
             expand=False,
         )
-        
 
-        
-        if self.temporal_fusion:
-            if self.fusion_mode not in ("attention", "feature_attention"):
-                raise ValueError(
-                    "Unknown fusion_mode '{}'. Expected 'attention' or 'feature_attention'.".format(
-                        fusion_mode
-                    )
-                )
-            num_fusion_blocks = fusion_num_scales if fusion_independent_blocks else 1
-            block_num_scales = 1 if fusion_independent_blocks else fusion_num_scales
-            self.multi_frame_feature_fusion = nn.ModuleList([
-                MultiFrameFeatureFusion(
-                    in_channels, self.patch_h, self.patch_w,
-                    dropout=fusion_dropout,
-                    drop_path=fusion_drop_path,
-                    neighborhood_size=fusion_neighborhood_size,
-                    temporal_fusion=True,
-                    num_register_tokens=self.num_register_tokens,
-                    num_scales=block_num_scales,
-                    lora_rank=fusion_lora_rank,
-                    lora_alpha=fusion_lora_alpha,
-                    separate_norms=self.fusion_separate_norms,
-                )
-                for _ in range(num_fusion_blocks)
-            ])
-        else:
-            self.multi_frame_feature_fusion = nn.ModuleList()
-        
         self.scratch.stem_transpose = None
         
         self.scratch.refinenet1 = _make_fusion_block(features, use_bn)
@@ -292,24 +235,7 @@ class ManyDepthAnythingDecoder(nn.Module):
             nn.Conv2d(head_features_2, 1, kernel_size=1, stride=1, padding=0),
         )
     
-    def _fuse_features_multi_frame(self, current_feats, lookup_feats, i, fusion_mask=None):
-        batch_size, channels, height, width = current_feats.shape
-        if lookup_feats.shape[0] != batch_size:
-            raise ValueError("ManyDepthAnythingDecoder currently supports exactly one matching frame")
-        current_feats_flat = current_feats.view(batch_size, channels, -1)
-        lookup_feats_flat = lookup_feats.view(batch_size, -1, height * width)
-        output = current_feats_flat
-        for _ in range(self.num_passes):
-            fused = torch.cat((output, lookup_feats_flat), 1).permute(0, 2, 1)
-            if self.fusion_independent_blocks:
-                fused_out = self.multi_frame_feature_fusion[i](fused, 0, fusion_mask)
-            else:
-                fused_out = self.multi_frame_feature_fusion[0](fused, i, fusion_mask)
-            output = fused_out.permute(0, 2, 1)
-        output = output.view(batch_size, channels, height, width)
-        return output
-
-    def forward(self, out_features, lookup_features, fusion_mask=None):
+    def forward(self, out_features):
         out = []
         last_cls_token = None
         for i, x in enumerate(out_features):
@@ -322,27 +248,14 @@ class ManyDepthAnythingDecoder(nn.Module):
                     last_cls_token = x[1]
                 else:
                     last_cls_token = last_cls_token + x[1]
-            lookup_feature = lookup_features[i] if self.temporal_fusion else None
             if self.use_clstoken:
                 x, cls_token = x[0], x[1]
                 readout = cls_token.unsqueeze(1).expand_as(x)
                 x = self.readout_projects[i](torch.cat((x, readout), -1))
-
-                if self.temporal_fusion:
-                    lookup_feature, cls_token = lookup_feature[0], lookup_feature[1]
-                    readout = cls_token.unsqueeze(1).expand_as(lookup_feature)
-                    lookup_feature = self.readout_projects[i](torch.cat((lookup_feature, readout), -1))
             else:
                 x = x[0]
-                if self.temporal_fusion:
-                    lookup_feature = lookup_feature[0]
 
             x = x.permute(0, 2, 1).reshape((x.shape[0], x.shape[-1], self.patch_h, self.patch_w))
-            if self.temporal_fusion:
-                lookup_feature = lookup_feature.permute(0, 2, 1).reshape(
-                    (lookup_feature.shape[0], lookup_feature.shape[-1], self.patch_h, self.patch_w)
-                )
-                x = self._fuse_features_multi_frame(x, lookup_feature, i, fusion_mask)
             x = self.projects[i](x)
             x = self.resize_layers[i](x)
 

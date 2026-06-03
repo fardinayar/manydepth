@@ -31,7 +31,6 @@ from utils_scripts import (
 
 def infer_depth_disparity_and_pointcloud(
     target_image: Union[str, np.ndarray],
-    lookup_frame: Union[str, np.ndarray],
     weights_folder: str,
     depth_anything_encoder: str = "vits",
     height: Optional[int] = None,
@@ -49,7 +48,7 @@ def infer_depth_disparity_and_pointcloud(
 
     - If fx and fy are provided, a point cloud is generated and optionally saved.
     - Depth and disparity are always computed and optionally saved when output_path is provided.
-    - teacher_mode: if True, runs monocular inference; if False, runs multi-frame inference
+    - teacher_mode: if True, runs the frozen teacher; both modes are single-frame.
 
     Returns a dict with keys: 'disp', 'depth', 'pointcloud' (None if no fx/fy), 'paths' (if saved).
     """
@@ -59,8 +58,6 @@ def infer_depth_disparity_and_pointcloud(
 
     if isinstance(target_image, str) and not os.path.exists(target_image):
         raise ValueError(f"Target image not found: {target_image}")
-    if isinstance(lookup_frame, str) and not os.path.exists(lookup_frame):
-        raise ValueError(f"Lookup frame not found: {lookup_frame}")
     if not os.path.exists(weights_folder):
         raise ValueError(f"Weights folder not found: {weights_folder}")
 
@@ -78,17 +75,12 @@ def infer_depth_disparity_and_pointcloud(
         target_color = target_color.to(device)
 
         if teacher_mode:
-            # Teacher mode: monocular inference
+            # Teacher mode: frozen monocular inference
             output = predict_depth_teacher(encoder, depth_decoder, target_color)
         else:
-            # Student mode: multi-frame inference
-            if isinstance(lookup_frame, str):
-                lookup_color = load_image(lookup_frame, HEIGHT, WIDTH)
-            else:
-                lookup_color = load_image_from_array(lookup_frame, HEIGHT, WIDTH)
-            lookup_frames = lookup_color.unsqueeze(1).to(device)
-            output = predict_depth_student(encoder, depth_decoder, target_color, lookup_frames)
-        
+            # Student mode: single-frame LoRA-finetuned inference
+            output = predict_depth_student(encoder, depth_decoder, target_color)
+
         pred_disp, pred_depth = postprocess_depth_output(output, max_depth)
 
         disp_map = pred_disp.cpu().squeeze().numpy()
@@ -146,10 +138,8 @@ def main():
     parser = argparse.ArgumentParser(description='Run inference and save point cloud, depth, and disparity - supports both teacher and student modes')
     parser.add_argument('--target_image', type=str, default="kitti_data/2011_09_26/2011_09_26_drive_0001_sync/image_02/data/0000000005.png",
                         help='Path to target image (main image for depth prediction)')
-    parser.add_argument('--lookup_frame', type=str, default="kitti_data/2011_09_26/2011_09_26_drive_0001_sync/image_02/data/0000000004.png",
-                        help='Path to lookup frame image for matching (ignored in teacher mode)')
     parser.add_argument('--input_folder', type=str, default=None,
-                        help='Folder containing images; each image is paired with the previous one as lookup')
+                        help='Folder containing images; each image is processed independently')
     parser.add_argument('--output_dir', type=str, default="output_pointclouds",
                         help='Directory to save outputs into')
     parser.add_argument('--weights_folder', type=str, default="outs/kitti/base/mdp/models/weights_4",
@@ -172,13 +162,12 @@ def main():
     parser.add_argument('--coordinate_system', type=str, choices=['camera', 'lidar'], default='camera',
                         help='Coordinate frame for saved PLY: camera (Z forward) or lidar (Z up)')
     parser.add_argument('--teacher_mode', action='store_true',
-                        help='Run in teacher mode (monocular inference) instead of student mode (multi-frame)')
-    
+                        help='Run in teacher mode (frozen monocular) instead of student mode (LoRA-finetuned)')
+
     args = parser.parse_args()
 
     result = infer_depth_disparity_and_pointcloud(
         target_image=args.target_image,
-        lookup_frame=args.lookup_frame,
         weights_folder=args.weights_folder,
         depth_anything_encoder=args.depth_anything_encoder,
         height=args.height,

@@ -171,8 +171,8 @@ load the weights of `mono_encoder.pth` and `mono_depth.pth`.
 
 ## 🖼 Running on your own images
 
-The inference helpers in `manydepth/scripts/` demonstrate multi-frame inference.
-`save_pointcloud.py` predicts depth for a target image and one lookup frame.
+The inference helpers in `manydepth/scripts/` demonstrate single-frame inference.
+`save_pointcloud.py` predicts depth for a single target image.
 If you provide `--fx` and `--fy`, it can also export a point cloud.
 
 Download and unzip model weights, then run:
@@ -180,7 +180,6 @@ Download and unzip model weights, then run:
 ```bash
 python manydepth/scripts/save_pointcloud.py \
     --target_image assets/test_sequence_target.jpg \
-    --lookup_frame assets/test_sequence_source.jpg \
     --weights_folder path/to/weights \
     --output_dir outputs/demo
 ```

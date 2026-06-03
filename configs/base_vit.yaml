@@ -28,8 +28,6 @@ warmup_steps: 0                # LR warmup steps (0 to disable)
 
 # ABLATION FLAGS
 pose_weights_init: "pretrained"   # Pose encoder init: pretrained or scratch
-num_matching_frames: 1            # Number of previous frames for temporal fusion
-no_temporal_fusion: false         # Disable temporal fusion in the depth decoder
 no_lora: false                    # Disable LoRA in encoder and decoder (use full params)
 no_consistency_loss: false        # Disable consistency loss
 no_loss_dynamic_weight: false     # Disable dynamic weighting of the loss
@@ -69,32 +67,17 @@ depth_anything_encoder: "vitb"    # Encoder size: vits, vitb, vitl, vitg
 depth_anything_checkpoint_dir: "checkpoints"  # Dir containing depth_anything_v2_<encoder>.pth
 encoder_lr_coef: 1.0              # Learning rate multiplier for the encoder
 encoder_token_lr_coef: 0.1        # Additional LR multiplier for DINOv2 cls_token and pos_embed
-fusion_lr_coef: 1.0               # Learning rate multiplier for feature fusion parameters
 g2s: true                        # Use g2s (gradient-to-scale) loss
 g2s_weight_factor: 1.0    ####         # g2s ramp-up: max_steps = factor * (total_steps / num_epochs)
 data_percent: 100.0               # Percent of training data to use (1–100)
 pose_from_scratch: false          # Initialize pose encoder/decoder randomly (no pretrain)
 gradient_accumulation_steps: 1    # Gradient accumulation steps (effective batch = batch_size * this)
 
-# Multi-frame fusion (attention-based)
-num_passes: 1                     # Number of fusion passes
-num_register_tokens: 0            # Register tokens for attention sink in MultiFrameFeatureFusion
-
 # Ablation: LoRA (encoder/decoder)
 lora_rank: 8                      # LoRA rank for encoder and decoder
 lora_alpha: 8                   # LoRA alpha (scaling)
 lora_dropout: 0.2                # LoRA dropout (training only)
 
-# Ablation: feature fusion
-fusion_neighborhood_size: [3, 15] # Attention neighborhood (height, width); empty list = global
-fusion_num_scales: 4              # Number of scales in fusion block
-fusion_independent_blocks: false  # Use a separate full fusion block per scale instead of one shared block
-fusion_mode: "attention"          # Temporal fusion implementation
-fusion_separate_norms: true       # Per-scale Q/KV LayerNorms inside temporal fusion
-fusion_lora_rank: 16              # LoRA rank in fusion block
-fusion_lora_alpha: 16            # LoRA alpha in fusion block
-fusion_dropout: 0.2            # Dropout in fusion block
-fusion_drop_path: 0.0              # Stochastic depth in fusion block
 use_cls_scale_shift: true          # CLS-token MLP disparity corrector
 
 # Scheduler

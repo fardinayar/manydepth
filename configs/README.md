@@ -39,8 +39,6 @@ Then a single `-c configs/ablation_no_lora.yaml` gives you the full base plus th
 | Config | Override | model_name |
 |--------|----------|------------|
 | `ablation_no_lora.yaml` | no_lora: true | mdp_no_lora |
-| `ablation_no_temporal_fusion.yaml` | no_temporal_fusion: true | mdp_no_temporal_fusion |
-| `ablation_independent_fusion_blocks.yaml` | fusion_independent_blocks: true, fusion_lora_rank: 0 | mdp_independent_fusion_blocks |
 | `ablation_no_consistency_loss.yaml` | no_consistency_loss: true | mdp_no_consistency_loss |
 | `ablation_no_loss_dynamic_weight.yaml` | no_loss_dynamic_weight: true | mdp_no_loss_dynamic_weight |
 | `ablation_no_ignore_high_low_loss.yaml` | ignore_high_low_loss_pixels: false (disables high-loss filtering) | mdp_no_ignore_high_low_loss |
@@ -50,7 +48,6 @@ Then a single `-c configs/ablation_no_lora.yaml` gives you the full base plus th
 ```bash
 # Any ablation: base inherited via extends, only the flag and model_name differ
 python manydepth/train.py -c configs/ablation_no_lora.yaml --log_dir outs/ablation_no_lora
-python manydepth/train.py -c configs/ablation_no_temporal_fusion.yaml --log_dir outs/no_temporal_fusion
 # Or base + CLI overrides
 python manydepth/train.py -c configs/base.yaml --log_dir outs/exp1 --no_lora
 ```
@@ -71,7 +68,4 @@ python manydepth/train.py -c configs/base.yaml --data_path "$DATA_PATH" --log_di
 
 # No LoRA ablation (base + ablation file + CLI)
 python manydepth/train.py -c configs/base.yaml -c configs/ablation_no_lora.yaml --data_path "$DATA_PATH" --log_dir "$LOG_BASE_DIR/baseline_no_lora" --png --g2s
-
-# No temporal fusion (ablation config)
-python manydepth/train.py -c configs/ablation_no_temporal_fusion.yaml --data_path "$DATA_PATH" --log_dir "$LOG_BASE_DIR/no_temporal_fusion" --png --g2s
 ```

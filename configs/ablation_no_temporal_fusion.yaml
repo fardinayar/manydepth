@@ -1,4 +1,0 @@
-# Ablation: disable temporal fusion in the depth decoder.
-extends: base.yaml
-no_temporal_fusion: true
-model_name: "mdp_no_temporal_fusion"

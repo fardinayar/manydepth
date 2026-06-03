@@ -94,7 +94,7 @@ def setup_models(
     else:
         encoder_path = os.path.join(weights_folder, "encoder.pth")
         decoder_path = os.path.join(weights_folder, "depth.pth")
-        print("-> Loading student models (multi-frame, no poses)")
+        print("-> Loading student models (single-frame, LoRA-finetuned)")
 
     if not os.path.exists(encoder_path) or not os.path.exists(decoder_path):
         raise FileNotFoundError(f"Model weights not found in {weights_folder}")
@@ -128,18 +128,6 @@ def setup_models(
             features=config["features"],
             in_channels=config["in_channels"],
             out_channels=config["out_channels"],
-            temporal_fusion=not saved_cfg.no_temporal_fusion,
-            num_passes=saved_cfg.num_passes,
-            num_register_tokens=saved_cfg.num_register_tokens,
-            fusion_neighborhood_size=saved_cfg.fusion_neighborhood_size,
-            fusion_num_scales=saved_cfg.fusion_num_scales,
-            fusion_independent_blocks=saved_cfg.fusion_independent_blocks,
-            fusion_mode=saved_cfg.fusion_mode,
-            fusion_lora_rank=saved_cfg.fusion_lora_rank,
-            fusion_lora_alpha=saved_cfg.fusion_lora_alpha,
-            fusion_dropout=saved_cfg.fusion_dropout,
-            fusion_drop_path=saved_cfg.fusion_drop_path,
-            fusion_separate_norms=saved_cfg.fusion_separate_norms,
             use_cls_scale_shift=getattr(saved_cfg, "use_cls_scale_shift", False),
         )
         if not saved_cfg.no_lora:
@@ -155,9 +143,6 @@ def setup_models(
                 lora_alpha=saved_cfg.lora_alpha,
                 lora_dropout=0.0,
             )
-        print(
-            f"  num_passes: {saved_cfg.num_passes}, no_temporal_fusion: {saved_cfg.no_temporal_fusion}"
-        )
 
     encoder.load_state_dict(encoder_dict, strict=False)
     decoder_state = torch.load(decoder_path, map_location=device)
@@ -190,14 +175,10 @@ def predict_depth_student(
     encoder,
     depth_decoder,
     input_color: torch.Tensor,
-    lookup_frames: torch.Tensor,
 ):
-    """Student (multi-frame) depth prediction."""
-    if getattr(depth_decoder, "temporal_fusion", True) and lookup_frames.shape[1] != 1:
-        raise ValueError("Student inference currently supports exactly one matching frame")
-    encoder_lookup_frames = lookup_frames if getattr(depth_decoder, "temporal_fusion", True) else None
-    features, lookup_features = encoder(input_color, encoder_lookup_frames)
-    output, _ = depth_decoder(features, lookup_features)
+    """Student (single-frame, LoRA-finetuned) depth prediction."""
+    features = encoder(input_color)
+    output, _ = depth_decoder(features)
     return output
 
 

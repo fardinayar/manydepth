@@ -8,16 +8,15 @@ Shared utilities live in `utils_scripts.py` (model loading, image preprocessing,
 
 **Purpose:** Run depth inference and export depth maps, disparity maps, and/or colored 3D point clouds (PLY).
 
-- Uses the **student (multi-frame)** model: you provide a target image and a lookup frame; depth is predicted from the target with the lookup used for matching.
-- Single-image mode: `--target_image` and `--lookup_frame` paths.
-- Folder mode: `--input_folder`; each image is paired with the previous image as lookup.
+- Uses the **student (single-frame, LoRA-finetuned)** model: depth is predicted from a single target image.
+- Single-image mode: `--target_image` path.
+- Folder mode: `--input_folder`; each image is processed independently.
 - Optional camera intrinsics (`--fx`, `--fy`) to generate PLY point clouds. Outputs can be depth PNG, disparity NPY, and PLY.
 
 **Example:**
 ```bash
 python manydepth/scripts/save_pointcloud.py \
   --target_image path/to/frame1.png \
-  --lookup_frame path/to/frame0.png \
   --weights_folder path/to/run/models/weights_4 \
   --output_dir out_ply \
   --fx 700 --fy 700
@@ -27,20 +26,19 @@ python manydepth/scripts/save_pointcloud.py \
 
 ## save_pointcloud_dual.py
 
-**Purpose:** Same as `save_pointcloud.py` but supports both **teacher (monocular)** and **student (multi-frame)** inference, and a flexible API (e.g. numpy arrays as input).
+**Purpose:** Same as `save_pointcloud.py` but supports both **teacher (frozen monocular)** and **student (single-frame, LoRA-finetuned)** inference, and a flexible API (e.g. numpy arrays as input).
 
-- Teacher mode: single-frame depth from the Depth Anything teacher (no lookup frame).
-- Student mode: multi-frame depth with target + lookup frame(s).
+- Teacher mode: single-frame depth from the frozen Depth Anything teacher.
+- Student mode: single-frame depth from the LoRA-finetuned model.
 - Accepts image paths or in-memory RGB arrays. Returns depth, disparity, and optional point cloud. Intended for programmatic use (APIs, pipelines) as well as CLI.
 
 **Example:**
 ```bash
 python manydepth/scripts/save_pointcloud_dual.py \
   --target_image frame1.png \
-  --lookup_frame frame0.png \
   --weights_folder path/to/run/models/weights_4 \
   --output_dir out_dual
-# Teacher mode: add --teacher_mode (no lookup frame needed)
+# Teacher mode: add --teacher_mode
 ```
 
 ---
@@ -49,7 +47,7 @@ python manydepth/scripts/save_pointcloud_dual.py \
 
 **Purpose:** Build a **video** from a folder of images: original frames, depth visualizations (colorized), and optional segmentation mask overlays with distance labels.
 
-- Runs student (multi-frame) depth on the image sequence.
+- Runs student (single-frame) depth on the image sequence.
 - Renders depth with a colormap and can overlay Grounding DINO–style masks and per-mask median distance.
 - Output is a single video file (e.g. MP4) combining input and depth (and optionally masks).
 

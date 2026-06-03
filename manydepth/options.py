@@ -204,14 +204,4 @@ class MonodepthOptions:
                 "No config provided. Use -c/--config <file.yaml> (with optional 'extends: base.yaml' in the file) "
                 "and/or --load_weights_folder <run_dir> to load a saved run's config."
             )
-        # Normalize list/tuple fields for from_dict
-        if merged.get("fusion_neighborhood_size") is not None:
-            ne = merged["fusion_neighborhood_size"]
-            if isinstance(ne, (list, tuple)):
-                if len(ne) == 0:
-                    merged["fusion_neighborhood_size"] = None
-                elif len(ne) == 1:
-                    merged["fusion_neighborhood_size"] = (int(ne[0]), int(ne[0]))
-                else:
-                    merged["fusion_neighborhood_size"] = tuple(int(x) for x in ne)
         return TrainConfig.from_dict(merged)

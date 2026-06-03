@@ -75,16 +75,9 @@ class Trainer:
 
         assert self.opt.frame_ids[0] == 0, "frame_ids must start with 0"
         assert len(self.opt.frame_ids) > 1, "frame_ids must have more than 1 frame specified"
-        if self.opt.num_matching_frames != 1:
-            raise ValueError("num_matching_frames must be 1 with the current temporal fusion block")
 
         # check the frames we need the dataloader to load
         frames_to_load = self.opt.frame_ids.copy()
-        self.matching_ids = [0]
-        for idx in range(-1, -1 - self.opt.num_matching_frames, -1):
-            self.matching_ids.append(idx)
-            if idx not in frames_to_load:
-                frames_to_load.append(idx)
 
         print('Loading frames: {}'.format(frames_to_load))
 
@@ -132,28 +125,13 @@ class Trainer:
         self.models["encoder"].to(self.device)
 
         model_config = networks.MODEL_CONFIGS[self.opt.depth_anything_encoder]
-        
-        if self.opt.no_temporal_fusion:
-            print("Disabling temporal fusion in the depth decoder")
-        
+
         self.models["depth"] = networks.ManyDepthAnythingDecoder(
             in_channels=model_config['in_channels'],
             out_channels=model_config['out_channels'],
             features=model_config['features'],
             patch_h=self.opt.height // 14,
             patch_w=self.opt.width // 14,
-            temporal_fusion=not self.opt.no_temporal_fusion,
-            num_passes=self.opt.num_passes,
-            num_register_tokens=self.opt.num_register_tokens,
-            fusion_neighborhood_size=self.opt.fusion_neighborhood_size,
-            fusion_num_scales=self.opt.fusion_num_scales,
-            fusion_independent_blocks=self.opt.fusion_independent_blocks,
-            fusion_mode=self.opt.fusion_mode,
-            fusion_lora_rank=self.opt.fusion_lora_rank,
-            fusion_lora_alpha=self.opt.fusion_lora_alpha,
-            fusion_dropout=self.opt.fusion_dropout,
-            fusion_drop_path=self.opt.fusion_drop_path,
-            fusion_separate_norms=self.opt.fusion_separate_norms,
             use_cls_scale_shift=self.opt.use_cls_scale_shift,
         )
 
@@ -177,15 +155,11 @@ class Trainer:
                 self.models["depth"], r=self.opt.lora_rank, lora_alpha=self.opt.lora_alpha, lora_dropout=self.opt.lora_dropout
             )
             lora.mark_only_lora_as_trainable(self.models['depth'])
-        print("Enable gradient for output convolution and CLS scale-shift head")
+        print("Enable gradient for CLS scale-shift head")
 
         for name, param in self.models['depth'].named_parameters():
             if 'cls_scale_shift' in name:
                 param.requires_grad = True
-            
-        for name, p in self.models['depth'].named_parameters():
-            if 'multi_frame_feature_fusion' in name:
-                p.requires_grad = True
 
         self.models["depth"].to(self.device)
 
@@ -217,27 +191,18 @@ class Trainer:
                 print(f"Encoder CLS/positional embedding learning rate: {encoder_token_lr}")
 
         depth_params = []
-        fusion_params = []
         for name, param in self.models["depth"].named_parameters():
             if not param.requires_grad:
                 continue
-            if 'multi_frame_feature_fusion' in name:
-                fusion_params.append(param)
-            else:
-                depth_params.append(param)
+            depth_params.append(param)
 
         if depth_params:
             self.parameters_to_train.append({'params': depth_params, 'lr': self.opt.learning_rate})
-        if fusion_params:
-            self.parameters_to_train.append({'params': fusion_params, 'lr': self.opt.learning_rate * self.opt.fusion_lr_coef})
         # Print total number of learnable parameters
         n_encoder = sum(p.numel() for p in self.models["encoder"].parameters() if p.requires_grad)
-        n_fusion  = sum(p.numel() for p in fusion_params)
         n_depth   = sum(p.numel() for p in depth_params)
         print(f"Total learnable parameters in encoder: {n_encoder}")
         print(f"Total learnable parameters in depth decoder: {n_depth}")
-        print(f"Total learnable parameters in feature fusion: {n_fusion}")
-        print(f"Feature fusion learning rate: {self.opt.learning_rate * self.opt.fusion_lr_coef}")
         encoder, decoder = networks.get_da_encoder_decoder(
             encoder_name=self.opt.depth_anything_encoder,
             checkpoint_dir=self.opt.depth_anything_checkpoint_dir,
@@ -430,81 +395,6 @@ class Trainer:
             return 1.0
         return float(self.step) / float(self.warmup_steps)
 
-    def channel_gate_stats(self):
-        """Return effective bounded channel-gate stats for console logging."""
-        fusion_blocks = getattr(self.models["depth"], "multi_frame_feature_fusion", None)
-        if not fusion_blocks:
-            return None
-        gate_tensors = [
-            torch.sigmoid(block.channel_gates.detach().float()).reshape(-1)
-            for block in fusion_blocks
-            if getattr(block, "channel_gates", None) is not None
-        ]
-        if not gate_tensors:
-            return None
-        gates = torch.cat(gate_tensors)
-        return gates.mean().item(), gates.min().item(), gates.max().item()
-
-    def patch_gate_stats(self):
-        """Return patch-gate weight/bias stats for console logging."""
-        fusion_blocks = getattr(self.models["depth"], "multi_frame_feature_fusion", None)
-        if not fusion_blocks:
-            return None
-        weight_tensors = [
-            gate.weight.detach().float().reshape(-1)
-            for block in fusion_blocks
-            if getattr(block, "patch_gates", None) is not None
-            for gate in block.patch_gates
-        ]
-        bias_tensors = [
-            gate.bias.detach().float().reshape(-1)
-            for block in fusion_blocks
-            if getattr(block, "patch_gates", None) is not None
-            for gate in block.patch_gates
-            if gate.bias is not None
-        ]
-        if not weight_tensors:
-            return None
-        weights = torch.cat(weight_tensors)
-        if bias_tensors:
-            biases = torch.cat(bias_tensors)
-            return (
-                weights.mean().item(), weights.min().item(), weights.max().item(),
-                biases.mean().item(), biases.min().item(), biases.max().item(),
-            )
-        return (
-            weights.mean().item(), weights.min().item(), weights.max().item(),
-            0.0, 0.0, 0.0,
-        )
-
-    def patch_gate_activation_stats(self):
-        """Return post-activation patch-gate stats from the latest batch."""
-        fusion_blocks = getattr(self.models["depth"], "multi_frame_feature_fusion", None)
-        if not fusion_blocks:
-            return None
-        activation_tensors = [
-            activation.detach().float().reshape(-1)
-            for block in fusion_blocks
-            for activation in getattr(block, "_last_patch_gate_activations", ())
-            if activation is not None
-        ]
-        if not activation_tensors:
-            return None
-        activations = torch.cat(activation_tensors)
-        percentiles = torch.quantile(
-            activations, activations.new_tensor([0.1, 0.5, 0.9])
-        )
-        return (
-            activations.mean().item(),
-            activations.min().item(),
-            percentiles[0].item(),
-            percentiles[1].item(),
-            percentiles[2].item(),
-            activations.max().item(),
-        )
-
-    
-
     def set_train(self):
         """Convert all models to training mode
         """
@@ -669,30 +559,7 @@ class Trainer:
         outputs.update(pose_pred)
         mono_outputs.update(pose_pred)
 
-        # Grab frames and stack for input to the multi-frame network.
-        lookup_frames = [inputs[('color_aug_norm', idx, 0)] for idx in self.matching_ids[1:]]
-        lookup_frames = torch.stack(lookup_frames, 1)  # batch x frames x 3 x h x w
-
-        # Apply static-frame and missing-fusion augmentation.
-        batch_size = len(lookup_frames)
-        augmentation_mask = torch.zeros([batch_size, 1, 1, 1]).to(self.device).float()
-        fusion_mask = torch.ones([batch_size, 1, 1]).to(self.device).float()
-        if is_train:
-            for batch_idx in range(batch_size):
-                rand_num = random.random()
-                # static camera augmentation -> overwrite lookup frames with current frame
-                if rand_num < 0.1:
-                    replace_frames = \
-                        [inputs[('color_aug_norm', 0, 0)][batch_idx] for _ in self.matching_ids[1:]]
-                    replace_frames = torch.stack(replace_frames, 0)
-                    lookup_frames[batch_idx] = replace_frames
-                    augmentation_mask[batch_idx] += 1
-                # Disable temporal residuals to simulate unavailable matching evidence.
-                elif rand_num < 0.2:
-                    fusion_mask[batch_idx] *= 0
-                    augmentation_mask[batch_idx] += 1
-        outputs['augmentation_mask'] = augmentation_mask
-
+        # Frozen monocular teacher (single-frame) provides the consistency reference.
         with torch.no_grad():
             input_image = inputs["color_aug_norm", 0, 0]
             patch_h, patch_w = input_image.shape[-2] // 14, input_image.shape[-1] // 14
@@ -702,9 +569,9 @@ class Trainer:
         mono_outputs.update(monodepth)
 
         self.generate_images_pred(inputs, mono_outputs)
-        mono_losses = self.compute_losses(inputs, mono_outputs, is_multi=False)
+        mono_losses = self.compute_losses(inputs, mono_outputs, is_student=False)
 
-        # update multi frame outputs dictionary with single frame outputs
+        # expose the teacher disparity/depth to the student outputs for the consistency loss
         for key in list(mono_outputs.keys()):
             _key = list(key)
             if _key[0] in ['depth', 'disp']:
@@ -712,30 +579,23 @@ class Trainer:
                 _key = tuple(_key)
                 outputs[_key] = mono_outputs[key]
 
-        # multi frame path
-        encoder_lookup_frames = None if self.opt.no_temporal_fusion else lookup_frames
+        # student (single-frame, LoRA-finetuned) path
         need_encoder_grad = (
             self.opt.encoder_lr_coef != 0.0 or self.opt.use_cls_scale_shift
         )
         if not need_encoder_grad:
             with torch.no_grad():
-                features, lookup_features = self.models["encoder"](
-                    inputs["color_aug_norm", 0, 0], encoder_lookup_frames)
+                features = self.models["encoder"](inputs["color_aug_norm", 0, 0])
         else:
-            features, lookup_features = self.models["encoder"](
-                inputs["color_aug_norm", 0, 0], encoder_lookup_frames)
+            features = self.models["encoder"](inputs["color_aug_norm", 0, 0])
 
-        depth, _ = self.models["depth"](
-            features,
-            lookup_features,
-            fusion_mask=fusion_mask,
-        )
+        depth, _ = self.models["depth"](features)
 
-        depth =  F.relu(depth)
+        depth = F.relu(depth)
         outputs.update({("disp", 0): depth})
 
-        self.generate_images_pred(inputs, outputs, is_multi=True)
-        losses = self.compute_losses(inputs, outputs, is_multi=True)
+        self.generate_images_pred(inputs, outputs)
+        losses = self.compute_losses(inputs, outputs, is_student=True)
 
         return outputs, losses, mono_losses
 
@@ -767,39 +627,6 @@ class Trainer:
                     # Invert the matrix if the frame id is negative
                     outputs[("cam_T_cam", 0, f_i)] = transformation_from_parameters(
                         axisangle[:, 0], translation[:, 0], invert=(f_i < 0))
-
-            # now we need poses for matching - compute without gradients
-            pose_feats = {f_i: inputs["color_aug", f_i, 0] for f_i in self.matching_ids}
-            with torch.no_grad():
-                # compute pose from 0->-1, -1->-2, -2->-3 etc and multiply to find 0->-3
-                for fi in self.matching_ids[1:]:
-                    if fi < 0:
-                        pose_inputs = [pose_feats[fi], pose_feats[fi + 1]]
-                        pose_inputs = [self.models["pose_encoder"](torch.cat(pose_inputs, 1))]
-                        axisangle, translation = self.models["pose"](pose_inputs)
-                        pose = transformation_from_parameters(
-                            axisangle[:, 0], translation[:, 0], invert=True)
-
-                        # now find 0->fi pose
-                        if fi != -1:
-                            pose = torch.matmul(pose, inputs[('relative_pose', fi + 1)])
-
-                    else:
-                        pose_inputs = [pose_feats[fi - 1], pose_feats[fi]]
-                        pose_inputs = [self.models["pose_encoder"](torch.cat(pose_inputs, 1))]
-                        axisangle, translation = self.models["pose"](pose_inputs)
-                        pose = transformation_from_parameters(
-                            axisangle[:, 0], translation[:, 0], invert=False)
-
-                        # now find 0->fi pose
-                        if fi != 1:
-                            pose = torch.matmul(pose, inputs[('relative_pose', fi - 1)])
-
-                    missing_key = ("missing_frame", fi)
-                    if missing_key in inputs:
-                        pose[inputs[missing_key].bool()] *= 0
-
-                    inputs[('relative_pose', fi)] = pose
         else:
             raise NotImplementedError
 
@@ -827,7 +654,7 @@ class Trainer:
 
         self.set_train()
 
-    def generate_images_pred(self, inputs, outputs, is_multi=False):
+    def generate_images_pred(self, inputs, outputs):
         """Generate the warped (reprojected) color images for a minibatch.
         Generated images are saved into the `outputs` dictionary.
         """
@@ -971,7 +798,7 @@ class Trainer:
 
         return loss.mean(), patch_loss
 
-    def compute_losses(self, inputs, outputs, is_multi=False):
+    def compute_losses(self, inputs, outputs, is_student=False):
         """Compute the reprojection, smoothness and proxy supervised losses for a minibatch
         """
         losses = {}
@@ -1093,7 +920,7 @@ class Trainer:
 
 
             # consistency loss:
-            if is_multi and not self.opt.no_consistency_loss:
+            if is_student and not self.opt.no_consistency_loss:
 
                 patch_size = 16
                 multi_disp = outputs[("disp", scale)]
@@ -1133,7 +960,7 @@ class Trainer:
             mean_disp = disp.mean(2, True).mean(3, True)
             norm_disp = disp / (mean_disp + 1e-7)
             smooth_loss = get_smooth_loss(norm_disp, color)
-            if not is_multi:
+            if not is_student:
                 loss += self.opt.disparity_smoothness * smooth_loss / (2 ** scale)
             total_loss += loss
             losses["loss/{}".format(scale)] = loss
@@ -1144,7 +971,7 @@ class Trainer:
 
 
 
-        if self.g2s and is_multi:
+        if self.g2s and is_student:
             #TRANSLATIONS
             t12 = self.pose_translation_norm(outputs[("translation", 0, -1)])
             t23 = self.pose_translation_norm(outputs[("translation", 0, 1)])
@@ -1224,26 +1051,6 @@ class Trainer:
             print_string += " | warmup: {}/{}"
             print_data.extend([self.step, self.warmup_steps])
 
-        channel_gate_stats = self.channel_gate_stats()
-        if channel_gate_stats is not None:
-            print_string += " | channel_gate mean/min/max: {:.4f}/{:.4f}/{:.4f}"
-            print_data.extend(channel_gate_stats)
-        else:
-            print_string += " | channel_gate: none"
-
-        patch_gate_stats = self.patch_gate_stats()
-        if patch_gate_stats is not None:
-            print_string += " | patch_gate w mean/min/max: {:.4f}/{:.4f}/{:.4f}"
-            print_string += " | patch_gate logit b mean/min/max: {:.4f}/{:.4f}/{:.4f}"
-            print_data.extend(patch_gate_stats)
-        else:
-            print_string += " | patch_gate: none"
-
-        patch_gate_activation_stats = self.patch_gate_activation_stats()
-        if patch_gate_activation_stats is not None:
-            print_string += " | patch_gate act mean/min/p10/p50/p90/max: {:.4f}/{:.4f}/{:.4f}/{:.4f}/{:.4f}/{:.4f}"
-            print_data.extend(patch_gate_activation_stats)
-
         print(print_string.format(*print_data))
 
 
@@ -1256,14 +1063,6 @@ class Trainer:
         for l, v in mono_losses.items():
             writer.add_scalar("mono_{}".format(l), v, self.step)
 
-        patch_gate_activation_stats = self.patch_gate_activation_stats()
-        if patch_gate_activation_stats is not None:
-            for name, value in zip(
-                ("mean", "min", "p10", "p50", "p90", "max"),
-                patch_gate_activation_stats,
-            ):
-                writer.add_scalar("fusion/patch_gate_activation_{}".format(name), value, self.step)
-            
         # Log gradient accumulation info
         if mode == "train":
             writer.add_scalar("gradient_accumulation_steps", self.gradient_accumulation_steps, self.step)
@@ -1283,7 +1082,7 @@ class Trainer:
 
             disp = colormap(outputs[("disp", s)][j, 0])
             writer.add_image(
-                "disp_multi_{}/{}".format(s, j),
+                "disp_student_{}/{}".format(s, j),
                 disp, self.step)
 
             disp = colormap(outputs[('mono_disp', s)][j, 0])
@@ -1291,7 +1090,7 @@ class Trainer:
                 "disp_mono/{}".format(j),
                 disp, self.step)
 
-            # Log SSI loss if available (only for multi-frame)
+            # Log SSI consistency loss if available (student path only)
             if ("ssi_loss", s) in outputs:
                 ssi_loss_img = colormap(outputs[("ssi_loss", s)][j])
                 writer.add_image(
@@ -1329,7 +1128,7 @@ class Trainer:
             disp_vis = np.clip(disp_vis * 255.0, 0, 255).astype(np.uint8)
             save_path = os.path.join(
                 self.prediction_output_path,
-                "{}_step_{:08d}_disp_multi_{:02d}.png".format(mode, self.step, j),
+                "{}_step_{:08d}_disp_student_{:02d}.png".format(mode, self.step, j),
             )
             Image.fromarray(disp_vis).save(save_path)
 
@@ -1361,14 +1160,9 @@ class Trainer:
             save_path = os.path.join(save_folder, "{}.pth".format(model_name))
             to_save = model.state_dict()
             if model_name == 'encoder':
-                # save the sizes and ablation parameters - these are needed at prediction time
+                # save the input sizes - these are needed at prediction time
                 to_save['height'] = self.opt.height
                 to_save['width'] = self.opt.width
-                to_save['num_passes'] = self.opt.num_passes
-                to_save['no_temporal_fusion'] = self.opt.no_temporal_fusion
-                to_save['fusion_independent_blocks'] = self.opt.fusion_independent_blocks
-                to_save['fusion_mode'] = self.opt.fusion_mode
-                to_save['fusion_separate_norms'] = self.opt.fusion_separate_norms
 
             torch.save(to_save, save_path)
 
