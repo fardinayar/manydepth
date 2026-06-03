@@ -1,0 +1,4 @@
+# Ablation: disable temporal fusion in the depth decoder.
+extends: base_vit.yaml
+no_temporal_fusion: true
+model_name: "mdp_no_temporal_fusion_vit"

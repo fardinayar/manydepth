@@ -99,10 +99,34 @@ class Trainer:
                 self.models["encoder"], r=self.opt.lora_rank, lora_alpha=self.opt.lora_alpha, lora_dropout=self.opt.lora_dropout
             )
             lora.mark_only_lora_as_trainable(self.models['encoder'])
+            activated_pos_params = 0
+            activated_pos_tensors = 0
+            for name, param in self.models["encoder"].named_parameters():
+                if name.endswith("pos_embed"):
+                    param.requires_grad = True
+                    activated_pos_params += param.numel()
+                    activated_pos_tensors += 1
+            print(
+                "Activated gradient for encoder positional embedding: "
+                f"{activated_pos_tensors} tensor(s), {activated_pos_params} parameter(s)"
+            )
         else:
             print("Training full encoder parameters without LoRA")
             for param in self.models["encoder"].parameters():
                 param.requires_grad = True
+
+        if self.opt.use_cls_scale_shift:
+            activated_cls_params = 0
+            activated_cls_tensors = 0
+            for name, param in self.models["encoder"].named_parameters():
+                if name.endswith("cls_token"):
+                    param.requires_grad = True
+                    activated_cls_params += param.numel()
+                    activated_cls_tensors += 1
+            print(
+                "Activated gradient for encoder CLS token: "
+                f"{activated_cls_tensors} tensor(s), {activated_cls_params} parameter(s)"
+            )
 
         
         self.models["encoder"].to(self.device)
@@ -124,10 +148,13 @@ class Trainer:
             fusion_neighborhood_size=self.opt.fusion_neighborhood_size,
             fusion_num_scales=self.opt.fusion_num_scales,
             fusion_independent_blocks=self.opt.fusion_independent_blocks,
+            fusion_mode=self.opt.fusion_mode,
             fusion_lora_rank=self.opt.fusion_lora_rank,
             fusion_lora_alpha=self.opt.fusion_lora_alpha,
             fusion_dropout=self.opt.fusion_dropout,
             fusion_drop_path=self.opt.fusion_drop_path,
+            fusion_separate_norms=self.opt.fusion_separate_norms,
+            use_cls_scale_shift=self.opt.use_cls_scale_shift,
         )
 
         depth_anything_path = os.path.join(
@@ -150,10 +177,10 @@ class Trainer:
                 self.models["depth"], r=self.opt.lora_rank, lora_alpha=self.opt.lora_alpha, lora_dropout=self.opt.lora_dropout
             )
             lora.mark_only_lora_as_trainable(self.models['depth'])
-        print("Enable gradient for output convolution")
+        print("Enable gradient for output convolution and CLS scale-shift head")
 
         for name, param in self.models['depth'].named_parameters():
-            if 'output_conv' in name:
+            if 'cls_scale_shift' in name:
                 param.requires_grad = True
             
         for name, p in self.models['depth'].named_parameters():
@@ -162,9 +189,32 @@ class Trainer:
 
         self.models["depth"].to(self.device)
 
-        if self.opt.encoder_lr_coef != 0.0:
-            enc_trainable = [p for p in self.models["encoder"].parameters() if p.requires_grad]
-            self.parameters_to_train.append({'params': enc_trainable, 'lr': self.opt.encoder_lr_coef * self.opt.learning_rate})
+        encoder_params = []
+        encoder_token_params = []
+        for name, param in self.models["encoder"].named_parameters():
+            if not param.requires_grad:
+                continue
+            if name.endswith(("cls_token", "pos_embed")):
+                encoder_token_params.append(param)
+            else:
+                encoder_params.append(param)
+        if (encoder_params or encoder_token_params) and (
+            self.opt.encoder_lr_coef != 0.0 or self.opt.use_cls_scale_shift
+        ):
+            enc_lr = (
+                self.opt.encoder_lr_coef * self.opt.learning_rate
+                if self.opt.encoder_lr_coef != 0.0
+                else self.opt.learning_rate
+            )
+            if encoder_params:
+                self.parameters_to_train.append({"params": encoder_params, "lr": enc_lr})
+            if encoder_token_params:
+                encoder_token_lr = enc_lr * self.opt.encoder_token_lr_coef
+                self.parameters_to_train.append({
+                    "params": encoder_token_params,
+                    "lr": encoder_token_lr,
+                })
+                print(f"Encoder CLS/positional embedding learning rate: {encoder_token_lr}")
 
         depth_params = []
         fusion_params = []
@@ -380,20 +430,78 @@ class Trainer:
             return 1.0
         return float(self.step) / float(self.warmup_steps)
 
-    def ffn_residual_scale_stats(self):
-        """Return mean/min/max for fusion FFN residual scales, for console logging."""
+    def channel_gate_stats(self):
+        """Return effective bounded channel-gate stats for console logging."""
         fusion_blocks = getattr(self.models["depth"], "multi_frame_feature_fusion", None)
         if not fusion_blocks:
             return None
-        scale_tensors = [
-            block.ffn_residual_scale.detach().float().reshape(-1)
+        gate_tensors = [
+            torch.sigmoid(block.channel_gates.detach().float()).reshape(-1)
             for block in fusion_blocks
-            if hasattr(block, "ffn_residual_scale")
+            if getattr(block, "channel_gates", None) is not None
         ]
-        if not scale_tensors:
+        if not gate_tensors:
             return None
-        scales = torch.cat(scale_tensors)
-        return scales.mean().item(), scales.min().item(), scales.max().item()
+        gates = torch.cat(gate_tensors)
+        return gates.mean().item(), gates.min().item(), gates.max().item()
+
+    def patch_gate_stats(self):
+        """Return patch-gate weight/bias stats for console logging."""
+        fusion_blocks = getattr(self.models["depth"], "multi_frame_feature_fusion", None)
+        if not fusion_blocks:
+            return None
+        weight_tensors = [
+            gate.weight.detach().float().reshape(-1)
+            for block in fusion_blocks
+            if getattr(block, "patch_gates", None) is not None
+            for gate in block.patch_gates
+        ]
+        bias_tensors = [
+            gate.bias.detach().float().reshape(-1)
+            for block in fusion_blocks
+            if getattr(block, "patch_gates", None) is not None
+            for gate in block.patch_gates
+            if gate.bias is not None
+        ]
+        if not weight_tensors:
+            return None
+        weights = torch.cat(weight_tensors)
+        if bias_tensors:
+            biases = torch.cat(bias_tensors)
+            return (
+                weights.mean().item(), weights.min().item(), weights.max().item(),
+                biases.mean().item(), biases.min().item(), biases.max().item(),
+            )
+        return (
+            weights.mean().item(), weights.min().item(), weights.max().item(),
+            0.0, 0.0, 0.0,
+        )
+
+    def patch_gate_activation_stats(self):
+        """Return post-activation patch-gate stats from the latest batch."""
+        fusion_blocks = getattr(self.models["depth"], "multi_frame_feature_fusion", None)
+        if not fusion_blocks:
+            return None
+        activation_tensors = [
+            activation.detach().float().reshape(-1)
+            for block in fusion_blocks
+            for activation in getattr(block, "_last_patch_gate_activations", ())
+            if activation is not None
+        ]
+        if not activation_tensors:
+            return None
+        activations = torch.cat(activation_tensors)
+        percentiles = torch.quantile(
+            activations, activations.new_tensor([0.1, 0.5, 0.9])
+        )
+        return (
+            activations.mean().item(),
+            activations.min().item(),
+            percentiles[0].item(),
+            percentiles[1].item(),
+            percentiles[2].item(),
+            activations.max().item(),
+        )
 
     
 
@@ -561,30 +669,27 @@ class Trainer:
         outputs.update(pose_pred)
         mono_outputs.update(pose_pred)
 
-        # grab poses + frames and stack for input to the multi frame network
-        relative_poses = [inputs[('relative_pose', idx)] for idx in self.matching_ids[1:]]
-        relative_poses = torch.stack(relative_poses, 1)
-
+        # Grab frames and stack for input to the multi-frame network.
         lookup_frames = [inputs[('color_aug_norm', idx, 0)] for idx in self.matching_ids[1:]]
         lookup_frames = torch.stack(lookup_frames, 1)  # batch x frames x 3 x h x w
 
-        # apply static frame and zero cost volume augmentation
+        # Apply static-frame and missing-fusion augmentation.
         batch_size = len(lookup_frames)
         augmentation_mask = torch.zeros([batch_size, 1, 1, 1]).to(self.device).float()
+        fusion_mask = torch.ones([batch_size, 1, 1]).to(self.device).float()
         if is_train:
             for batch_idx in range(batch_size):
                 rand_num = random.random()
                 # static camera augmentation -> overwrite lookup frames with current frame
-                if rand_num < 0.25:
+                if rand_num < 0.1:
                     replace_frames = \
                         [inputs[('color_aug_norm', 0, 0)][batch_idx] for _ in self.matching_ids[1:]]
                     replace_frames = torch.stack(replace_frames, 0)
                     lookup_frames[batch_idx] = replace_frames
                     augmentation_mask[batch_idx] += 1
-                # missing cost volume augmentation -> set all poses to 0, the cost volume will
-                # skip these frames
-                elif rand_num < 0.5:
-                    relative_poses[batch_idx] *= 0
+                # Disable temporal residuals to simulate unavailable matching evidence.
+                elif rand_num < 0.2:
+                    fusion_mask[batch_idx] *= 0
                     augmentation_mask[batch_idx] += 1
         outputs['augmentation_mask'] = augmentation_mask
 
@@ -609,7 +714,10 @@ class Trainer:
 
         # multi frame path
         encoder_lookup_frames = None if self.opt.no_temporal_fusion else lookup_frames
-        if self.opt.encoder_lr_coef == 0.0:
+        need_encoder_grad = (
+            self.opt.encoder_lr_coef != 0.0 or self.opt.use_cls_scale_shift
+        )
+        if not need_encoder_grad:
             with torch.no_grad():
                 features, lookup_features = self.models["encoder"](
                     inputs["color_aug_norm", 0, 0], encoder_lookup_frames)
@@ -617,7 +725,11 @@ class Trainer:
             features, lookup_features = self.models["encoder"](
                 inputs["color_aug_norm", 0, 0], encoder_lookup_frames)
 
-        depth, _ = self.models["depth"](features, lookup_features)
+        depth, _ = self.models["depth"](
+            features,
+            lookup_features,
+            fusion_mask=fusion_mask,
+        )
 
         depth =  F.relu(depth)
         outputs.update({("disp", 0): depth})
@@ -781,6 +893,37 @@ class Trainer:
         return reprojection_loss_mask
 
     @staticmethod
+    def compute_depth_edge_mask(disp, threshold=0.15, dilation=1):
+        """Mask pixels near detached disparity discontinuities."""
+        threshold = float(threshold)
+        if threshold <= 0.0:
+            return torch.zeros_like(disp[:, :1])
+
+        disp = disp.detach()
+        if disp.shape[1] != 1:
+            disp = disp.mean(dim=1, keepdim=True)
+
+        norm_disp = disp / (disp.mean(dim=(2, 3), keepdim=True) + 1e-7)
+        edge_score = torch.zeros_like(norm_disp)
+
+        grad_x = torch.abs(norm_disp[:, :, :, 1:] - norm_disp[:, :, :, :-1])
+        grad_y = torch.abs(norm_disp[:, :, 1:, :] - norm_disp[:, :, :-1, :])
+
+        edge_score[:, :, :, 1:] = torch.maximum(edge_score[:, :, :, 1:], grad_x)
+        edge_score[:, :, :, :-1] = torch.maximum(edge_score[:, :, :, :-1], grad_x)
+        edge_score[:, :, 1:, :] = torch.maximum(edge_score[:, :, 1:, :], grad_y)
+        edge_score[:, :, :-1, :] = torch.maximum(edge_score[:, :, :-1, :], grad_y)
+
+        edge_mask = (edge_score > threshold).float()
+        dilation = int(dilation)
+        if dilation > 0:
+            kernel_size = 2 * dilation + 1
+            edge_mask = F.max_pool2d(
+                edge_mask, kernel_size=kernel_size, stride=1, padding=dilation
+            )
+        return edge_mask
+
+    @staticmethod
     def pose_translation_norm(translation):
         """Return one translation magnitude per sample."""
         translation = translation[:, 0].reshape(translation.shape[0], -1)
@@ -820,9 +963,9 @@ class Trainer:
             (prediction_norm_grid[:, :, 1:, :, :] - prediction_norm_grid[:, :, :-1, :, :])
             - (target_norm_grid[:, :, 1:, :, :] - target_norm_grid[:, :, :-1, :, :])
         )
-        grad_x_loss = F.relu(grad_x_diff - float(margin)).mean(dim=(1, 2, 3))
-        grad_y_loss = F.relu(grad_y_diff - float(margin)).mean(dim=(1, 2, 3))
-        patch_loss = patch_loss + (grad_x_loss + grad_y_loss)
+        grad_x_loss = F.relu(grad_x_diff).mean(dim=(1, 2, 3))
+        grad_y_loss = F.relu(grad_y_diff).mean(dim=(1, 2, 3))
+        patch_loss = 0 * patch_loss + 0.5 * (grad_x_loss + grad_y_loss)
         valid_mask = torch.min(prediction_var, target_var).squeeze(1) > variance_threshold
         loss = (patch_loss * valid_mask).sum(dim=-1) / (valid_mask.sum(dim=-1) + 1e-7)
 
@@ -870,12 +1013,41 @@ class Trainer:
                 identity_reprojection_loss,
             )
 
+            if self.opt.ignore_depth_edge_pixels:
+                edge_source = outputs.get(("mono_disp", scale), disp)
+                ignored_depth_edge_mask = self.compute_depth_edge_mask(
+                    edge_source,
+                    threshold=self.opt.depth_edge_mask_threshold,
+                    dilation=self.opt.depth_edge_mask_dilation,
+                )
+                if ignored_depth_edge_mask.shape[-2:] != reprojection_loss_mask.shape[-2:]:
+                    ignored_depth_edge_mask = F.interpolate(
+                        ignored_depth_edge_mask,
+                        size=reprojection_loss_mask.shape[-2:],
+                        mode="nearest",
+                    )
+                ignored_depth_edge_mask = ignored_depth_edge_mask.to(
+                    device=reprojection_loss_mask.device,
+                    dtype=reprojection_loss_mask.dtype,
+                )
+                ignored_depth_edge_mask = ignored_depth_edge_mask * (
+                    reprojection_loss_mask > 0
+                ).to(dtype=reprojection_loss_mask.dtype)
+                reprojection_loss_mask = reprojection_loss_mask * (
+                    1.0 - ignored_depth_edge_mask
+                )
+            else:
+                ignored_depth_edge_mask = torch.zeros_like(
+                    reprojection_loss_mask, device=reprojection_loss.device
+                )
+            outputs[("depth_edge_mask", scale)] = ignored_depth_edge_mask.detach()
+
             # ------------------------------------------------------------------
             # Optionally ignore the highest-loss pixels among the already valid
             # pixels, and visualize which pixels were ignored.
             # ------------------------------------------------------------------
             if self.opt.ignore_high_low_loss_pixels:
-                top_percent = 0.30  # ignore top 30% highest-loss pixels over the full batch
+                top_percent = 0.1  # ignore top 20% highest-loss pixels over the full batch
 
                 valid = reprojection_loss_mask > 0
                 ignored_high_loss_mask = torch.zeros_like(
@@ -923,7 +1095,7 @@ class Trainer:
             # consistency loss:
             if is_multi and not self.opt.no_consistency_loss:
 
-                patch_size = 32
+                patch_size = 16
                 multi_disp = outputs[("disp", scale)]
                 mono_disp = outputs[("mono_disp", scale)].detach()
 
@@ -944,7 +1116,7 @@ class Trainer:
                 
                 # Combine losses
                 if not self.opt.no_loss_dynamic_weight:
-                    ssi_weight = 0.001
+                    ssi_weight = (1-self.g2s_weight())/10
                 else:
                     ssi_weight = 0.01
                 
@@ -977,8 +1149,8 @@ class Trainer:
             t12 = self.pose_translation_norm(outputs[("translation", 0, -1)])
             t23 = self.pose_translation_norm(outputs[("translation", 0, 1)])
 
-            eps = 1e-5
-            min_gps_motion = 0.01
+            eps = 1e-4
+            min_gps_motion = 0.05
 
             pred_t = torch.stack([t12, t23], dim=1).clamp_min(eps)
             gps12 = inputs["gps12"].float().view(-1)
@@ -989,7 +1161,7 @@ class Trainer:
 
             valid_g2s = gps_t > min_gps_motion
             clamped_gps_t = gps_t.clamp_min(eps)
-            log_scale_error = torch.log(pred_t) - torch.log(clamped_gps_t)
+            log_scale_error = (torch.log(pred_t) - torch.log(clamped_gps_t)).clamp(-5.0, 5.0)
 
             if valid_g2s.any().item():
                 g2s_loss = log_scale_error[valid_g2s].pow(2).mean()
@@ -1052,10 +1224,25 @@ class Trainer:
             print_string += " | warmup: {}/{}"
             print_data.extend([self.step, self.warmup_steps])
 
-        ffn_scale_stats = self.ffn_residual_scale_stats()
-        if ffn_scale_stats is not None:
-            print_string += " | ffn_res_scale mean/min/max: {:.4f}/{:.4f}/{:.4f}"
-            print_data.extend(ffn_scale_stats)
+        channel_gate_stats = self.channel_gate_stats()
+        if channel_gate_stats is not None:
+            print_string += " | channel_gate mean/min/max: {:.4f}/{:.4f}/{:.4f}"
+            print_data.extend(channel_gate_stats)
+        else:
+            print_string += " | channel_gate: none"
+
+        patch_gate_stats = self.patch_gate_stats()
+        if patch_gate_stats is not None:
+            print_string += " | patch_gate w mean/min/max: {:.4f}/{:.4f}/{:.4f}"
+            print_string += " | patch_gate logit b mean/min/max: {:.4f}/{:.4f}/{:.4f}"
+            print_data.extend(patch_gate_stats)
+        else:
+            print_string += " | patch_gate: none"
+
+        patch_gate_activation_stats = self.patch_gate_activation_stats()
+        if patch_gate_activation_stats is not None:
+            print_string += " | patch_gate act mean/min/p10/p50/p90/max: {:.4f}/{:.4f}/{:.4f}/{:.4f}/{:.4f}/{:.4f}"
+            print_data.extend(patch_gate_activation_stats)
 
         print(print_string.format(*print_data))
 
@@ -1068,6 +1255,14 @@ class Trainer:
             writer.add_scalar("{}".format(l), v, self.step)
         for l, v in mono_losses.items():
             writer.add_scalar("mono_{}".format(l), v, self.step)
+
+        patch_gate_activation_stats = self.patch_gate_activation_stats()
+        if patch_gate_activation_stats is not None:
+            for name, value in zip(
+                ("mean", "min", "p10", "p50", "p90", "max"),
+                patch_gate_activation_stats,
+            ):
+                writer.add_scalar("fusion/patch_gate_activation_{}".format(name), value, self.step)
             
         # Log gradient accumulation info
         if mode == "train":
@@ -1109,6 +1304,12 @@ class Trainer:
                 writer.add_image(
                     "high_loss_mask_{}/{}".format(s, j),
                     high_loss_mask_img, self.step)
+
+            if ("depth_edge_mask", s) in outputs:
+                depth_edge_mask_img = colormap(outputs[("depth_edge_mask", s)][j, 0])
+                writer.add_image(
+                    "depth_edge_mask_{}/{}".format(s, j),
+                    depth_edge_mask_img, self.step)
 
         self.save_depth_prediction_images(mode, outputs)
 
@@ -1166,6 +1367,8 @@ class Trainer:
                 to_save['num_passes'] = self.opt.num_passes
                 to_save['no_temporal_fusion'] = self.opt.no_temporal_fusion
                 to_save['fusion_independent_blocks'] = self.opt.fusion_independent_blocks
+                to_save['fusion_mode'] = self.opt.fusion_mode
+                to_save['fusion_separate_norms'] = self.opt.fusion_separate_norms
 
             torch.save(to_save, save_path)
 
@@ -1242,10 +1445,12 @@ class Trainer:
 
         scheduler_load_path = os.path.join(self.opt.load_weights_folder, "scheduler.pth")
         if os.path.isfile(scheduler_load_path):
-            print("Loading scheduler state")
-            self.model_lr_scheduler.load_state_dict(
-                torch.load(scheduler_load_path, map_location=self.device)
-            )
+            scheduler_dict = torch.load(scheduler_load_path, map_location=self.device)
+            if len(scheduler_dict.get("base_lrs", self.base_lrs)) == len(self.base_lrs):
+                print("Loading scheduler state")
+                self.model_lr_scheduler.load_state_dict(scheduler_dict)
+            else:
+                print("Can't load scheduler state - optimizer parameter groups changed")
 
         training_state_path = os.path.join(self.opt.load_weights_folder, "training_state.pth")
         if os.path.isfile(training_state_path):
@@ -1253,7 +1458,11 @@ class Trainer:
             training_state = torch.load(training_state_path, map_location=self.device)
             self.step = int(training_state.get("step", self.step))
             self.epoch = int(training_state.get("epoch", -1)) + 1
-            self.base_lrs = list(training_state.get("base_lrs", self.base_lrs))
+            saved_base_lrs = list(training_state.get("base_lrs", self.base_lrs))
+            if len(saved_base_lrs) == len(self.base_lrs):
+                self.base_lrs = saved_base_lrs
+            else:
+                print("Can't load base learning rates - optimizer parameter groups changed")
             print("Resuming from epoch {}, global step {}".format(self.epoch, self.step))
 
 

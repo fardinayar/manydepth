@@ -1,4 +1,0 @@
-# Ablation: disable dynamic weighting of the loss.
-extends: base.yaml
-no_loss_dynamic_weight: true
-model_name: "mdp_no_loss_dynamic_weight"

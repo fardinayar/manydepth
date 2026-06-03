@@ -1,5 +1,0 @@
-# Ablation: disable dynamic weighting of the loss.
-extends: base.yaml
-model_name: "no_fusion_lora"
-fusion_lora_rank: 0
-fusion_lora_alpha: 0

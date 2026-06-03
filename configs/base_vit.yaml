@@ -5,7 +5,7 @@
 # PATHS
 data_path: "kitti_data"           # Path to the training data root (KITTI, etc.)
 log_dir: "outs"                  # Directory for run logs and saved models
-model_name: "mdp"                 # Subfolder name under log_dir for this run
+model_name: "mdp_vit"                 # Subfolder name under log_dir for this run
 
 # TRAINING
 split: "eigen_zhou"               # Train/val split: eigen_zhou, eigen_full, odom, benchmark, cityscapes_preprocessed
@@ -65,40 +65,40 @@ eval_teacher: false               # Evaluate the teacher (mono) network instead 
 eval_after_each_epoch: true      # Run test-set evaluation after each epoch save
 
 # DEPTH_ANYTHING
-depth_anything_encoder: "vits"    # Encoder size: vits, vitb, vitl, vitg
+depth_anything_encoder: "vitb"    # Encoder size: vits, vitb, vitl, vitg
 depth_anything_checkpoint_dir: "checkpoints"  # Dir containing depth_anything_v2_<encoder>.pth
 encoder_lr_coef: 1.0              # Learning rate multiplier for the encoder
 encoder_token_lr_coef: 0.1        # Additional LR multiplier for DINOv2 cls_token and pos_embed
 fusion_lr_coef: 1.0               # Learning rate multiplier for feature fusion parameters
 g2s: true                        # Use g2s (gradient-to-scale) loss
-g2s_weight_factor: 2.0    ####         # g2s ramp-up: max_steps = factor * (total_steps / num_epochs)
+g2s_weight_factor: 1.0    ####         # g2s ramp-up: max_steps = factor * (total_steps / num_epochs)
 data_percent: 100.0               # Percent of training data to use (1–100)
 pose_from_scratch: false          # Initialize pose encoder/decoder randomly (no pretrain)
 gradient_accumulation_steps: 1    # Gradient accumulation steps (effective batch = batch_size * this)
 
 # Multi-frame fusion (attention-based)
-num_passes: 2                     # Number of fusion passes
+num_passes: 1                     # Number of fusion passes
 num_register_tokens: 0            # Register tokens for attention sink in MultiFrameFeatureFusion
 
 # Ablation: LoRA (encoder/decoder)
 lora_rank: 8                      # LoRA rank for encoder and decoder
 lora_alpha: 8                   # LoRA alpha (scaling)
-lora_dropout: 0.1                # LoRA dropout (training only)
+lora_dropout: 0.2                # LoRA dropout (training only)
 
 # Ablation: feature fusion
-fusion_neighborhood_size: [5, 15] # Attention neighborhood (height, width); empty list = global
+fusion_neighborhood_size: [3, 15] # Attention neighborhood (height, width); empty list = global
 fusion_num_scales: 4              # Number of scales in fusion block
 fusion_independent_blocks: false  # Use a separate full fusion block per scale instead of one shared block
 fusion_mode: "attention"          # Temporal fusion implementation
 fusion_separate_norms: true       # Per-scale Q/KV LayerNorms inside temporal fusion
 fusion_lora_rank: 16              # LoRA rank in fusion block
 fusion_lora_alpha: 16            # LoRA alpha in fusion block
-fusion_dropout: 0.1            # Dropout in fusion block
+fusion_dropout: 0.2            # Dropout in fusion block
 fusion_drop_path: 0.0              # Stochastic depth in fusion block
 use_cls_scale_shift: true          # CLS-token MLP disparity corrector
 
 # Scheduler
-cosine_min_lr_factor: 0.1   ####     # Final LR = base LR * this factor after cosine decay
+cosine_min_lr_factor: 0.01   ####     # Final LR = base LR * this factor after cosine decay
 
 # Ablation: pose encoder
 pose_encoder_num_layers: 18      # ResNet layers for pose encoder (e.g. 18, 50)

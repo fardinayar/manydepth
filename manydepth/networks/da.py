@@ -2,6 +2,7 @@ import os
 from .depth_anything_v2.dpt import DepthAnythingV2
 import torch.nn as nn
 import torch
+import torch.nn.functional as F
 from .depth_anything_v2.util.blocks import FeatureFusionBlock, _make_scratch
 import copy
 from .feature_fusion import MultiFrameFeatureFusion
@@ -54,7 +55,90 @@ class ConvBlock(nn.Module):
     
     def forward(self, x):
         return self.conv_block(x)
-    
+
+
+class ClsTokenScaleShiftCorrector(nn.Module):
+    """Predict disparity affine ``scale * disp + shift`` from the final DPT CLS token."""
+
+    def __init__(
+        self,
+        embed_dim,
+        hidden_dim=None,
+        dropout=0.4,
+        scale_delta=1,
+        shift_bound=1,
+        noise_std=0.05,          # added
+    ):
+        super().__init__()
+        self.embed_dim = int(embed_dim)
+        self.scale_delta = float(scale_delta)
+        self.shift_bound = float(shift_bound)
+        self.noise_std = float(noise_std)  # added
+
+        h = hidden_dim if hidden_dim is not None else self.embed_dim
+        input_dim = self.embed_dim
+
+        self.shared_mlp = nn.Sequential(
+            nn.Dropout(dropout),
+            nn.Linear(input_dim, h),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(input_dim, h),
+            nn.GELU(),
+
+
+            nn.Dropout(dropout),
+            nn.Linear(h, h),
+            nn.GELU(),
+        )
+
+        self.scale_head = nn.Linear(h, 1)
+        self.shift_head = nn.Linear(h, 1)
+
+        nn.init.zeros_(self.scale_head.weight)
+        nn.init.zeros_(self.scale_head.bias)
+
+        nn.init.zeros_(self.shift_head.weight)
+        nn.init.zeros_(self.shift_head.bias)
+
+        with torch.no_grad():
+            self.scale_head.bias[0] = torch.log(
+                torch.exp(torch.tensor(1.0)) - 1.0
+            ).item()
+
+    def _validate_cls_token(self, cls_token):
+        if cls_token.ndim != 2 or cls_token.shape[-1] != self.embed_dim:
+            raise ValueError(
+                "CLS token must have shape [B, {}], got {}".format(
+                    self.embed_dim, tuple(cls_token.shape)
+                )
+            )
+
+        return cls_token
+
+    def _add_gaussian_noise(self, x):
+        if self.training and self.noise_std > 0:
+            noise = torch.randn_like(x) * self.noise_std
+            x = x + noise
+        return x
+
+    def forward(self, cls_token):
+        cls_token = self._validate_cls_token(cls_token)
+
+        # Gaussian noise augmentation
+        cls_token = self._add_gaussian_noise(cls_token)
+
+        shared = self.shared_mlp(cls_token)
+
+        raw_scale = self.scale_head(shared)
+        raw_shift = self.shift_head(shared)
+
+        scale = F.softplus(raw_scale).unsqueeze(-1).unsqueeze(-1) + 1e-6
+        shift = raw_shift.unsqueeze(-1).unsqueeze(-1)
+
+        return scale, shift
+
+
 class ManyDepthAnythingEncoder(nn.Module):
     def __init__(self, encoder_name='vits', checkpoint=True, checkpoint_dir='checkpoints'):
         super(ManyDepthAnythingEncoder, self).__init__()
@@ -89,10 +173,13 @@ class ManyDepthAnythingDecoder(nn.Module):
         fusion_neighborhood_size=(3, 15),
         fusion_num_scales=4,
         fusion_independent_blocks=False,
+        fusion_mode="attention",
         fusion_lora_rank=32,
         fusion_lora_alpha=4.0,
         fusion_dropout=0.0,
         fusion_drop_path=0.0,
+        fusion_separate_norms=True,
+        use_cls_scale_shift=False,
     ):
         super(ManyDepthAnythingDecoder, self).__init__()
         self.num_ch_enc = in_channels
@@ -103,8 +190,15 @@ class ManyDepthAnythingDecoder(nn.Module):
         self.temporal_fusion = temporal_fusion
         self.num_passes = num_passes
         self.num_register_tokens = num_register_tokens
+        self.fusion_num_scales = int(fusion_num_scales)
         self.fusion_independent_blocks = fusion_independent_blocks
-        
+        self.fusion_mode = (fusion_mode or "attention").lower()
+        self.fusion_separate_norms = bool(fusion_separate_norms)
+        self.use_cls_scale_shift = use_cls_scale_shift
+        self.cls_scale_shift = (
+            ClsTokenScaleShiftCorrector(in_channels) if use_cls_scale_shift else None
+        )
+
         self.projects = nn.ModuleList([
             nn.Conv2d(
                 in_channels=in_channels,
@@ -155,6 +249,12 @@ class ManyDepthAnythingDecoder(nn.Module):
 
         
         if self.temporal_fusion:
+            if self.fusion_mode not in ("attention", "feature_attention"):
+                raise ValueError(
+                    "Unknown fusion_mode '{}'. Expected 'attention' or 'feature_attention'.".format(
+                        fusion_mode
+                    )
+                )
             num_fusion_blocks = fusion_num_scales if fusion_independent_blocks else 1
             block_num_scales = 1 if fusion_independent_blocks else fusion_num_scales
             self.multi_frame_feature_fusion = nn.ModuleList([
@@ -168,6 +268,7 @@ class ManyDepthAnythingDecoder(nn.Module):
                     num_scales=block_num_scales,
                     lora_rank=fusion_lora_rank,
                     lora_alpha=fusion_lora_alpha,
+                    separate_norms=self.fusion_separate_norms,
                 )
                 for _ in range(num_fusion_blocks)
             ])
@@ -190,10 +291,8 @@ class ManyDepthAnythingDecoder(nn.Module):
             nn.ReLU(True),
             nn.Conv2d(head_features_2, 1, kernel_size=1, stride=1, padding=0),
         )
-        
     
-    def _fuse_features_multi_frame(self, current_feats, lookup_feats, i,
-                                    poses=None, intrinsics=None):
+    def _fuse_features_multi_frame(self, current_feats, lookup_feats, i, fusion_mask=None):
         batch_size, channels, height, width = current_feats.shape
         if lookup_feats.shape[0] != batch_size:
             raise ValueError("ManyDepthAnythingDecoder currently supports exactly one matching frame")
@@ -203,16 +302,26 @@ class ManyDepthAnythingDecoder(nn.Module):
         for _ in range(self.num_passes):
             fused = torch.cat((output, lookup_feats_flat), 1).permute(0, 2, 1)
             if self.fusion_independent_blocks:
-                fused_out = self.multi_frame_feature_fusion[i](fused, 0)
+                fused_out = self.multi_frame_feature_fusion[i](fused, 0, fusion_mask)
             else:
-                fused_out = self.multi_frame_feature_fusion[0](fused, i)
+                fused_out = self.multi_frame_feature_fusion[0](fused, i, fusion_mask)
             output = fused_out.permute(0, 2, 1)
         output = output.view(batch_size, channels, height, width)
         return output
 
-    def forward(self, out_features, lookup_features, poses=None, intrinsics=None):
+    def forward(self, out_features, lookup_features, fusion_mask=None):
         out = []
+        last_cls_token = None
         for i, x in enumerate(out_features):
+            if (
+                self.cls_scale_shift is not None
+                and isinstance(x, (tuple, list))
+                and len(x) == 2
+            ):
+                if last_cls_token is None:
+                    last_cls_token = x[1]
+                else:
+                    last_cls_token = last_cls_token + x[1]
             lookup_feature = lookup_features[i] if self.temporal_fusion else None
             if self.use_clstoken:
                 x, cls_token = x[0], x[1]
@@ -233,7 +342,7 @@ class ManyDepthAnythingDecoder(nn.Module):
                 lookup_feature = lookup_feature.permute(0, 2, 1).reshape(
                     (lookup_feature.shape[0], lookup_feature.shape[-1], self.patch_h, self.patch_w)
                 )
-                x = self._fuse_features_multi_frame(x, lookup_feature, i, poses, intrinsics)
+                x = self._fuse_features_multi_frame(x, lookup_feature, i, fusion_mask)
             x = self.projects[i](x)
             x = self.resize_layers[i](x)
 
@@ -254,4 +363,14 @@ class ManyDepthAnythingDecoder(nn.Module):
         out = self.scratch.output_conv1(path_1)
         out_ = nn.functional.interpolate(out, (int(self.patch_h * 14), int(self.patch_w * 14)), mode="bilinear", align_corners=True)
         depth = self.scratch.output_conv2(out_)
+        if self.cls_scale_shift is not None and last_cls_token is not None:
+            # Per-image mean/std with detached stats: CLS affine on standardized maps (~O(1)) so
+            # metric / reprojection loss gradients do not disproportionately drive scale vs shape.
+            eps = 1e-6
+            mu = depth.mean(dim=(2, 3), keepdim=True).detach()
+            std = depth.std(dim=(2, 3), keepdim=True, unbiased=False).detach().clamp_min(eps)
+            dn = (depth - mu) / std
+            last_cls_token = last_cls_token.to(dtype=depth.dtype)
+            scale, shift = self.cls_scale_shift(last_cls_token)
+            depth = std * (scale * dn + shift) + mu
         return depth, out_

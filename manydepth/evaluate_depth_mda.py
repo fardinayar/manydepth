@@ -117,6 +117,10 @@ def evaluate(opt):
         fusion_independent_blocks = encoder_dict.get(
             'fusion_independent_blocks', opt.fusion_independent_blocks
         )
+        fusion_mode = encoder_dict.get('fusion_mode', opt.fusion_mode)
+        fusion_separate_norms = encoder_dict.get(
+            'fusion_separate_norms', opt.fusion_separate_norms
+        )
         fusion_lora_rank = opt.fusion_lora_rank
         fusion_lora_alpha = opt.fusion_lora_alpha
         fusion_dropout = opt.fusion_dropout
@@ -127,6 +131,8 @@ def evaluate(opt):
         print(f"  Num passes: {num_passes}")
         print(f"  No temporal fusion: {no_temporal_fusion}")
         print(f"  Independent fusion blocks: {fusion_independent_blocks}")
+        print(f"  Fusion mode: {fusion_mode}")
+        print(f"  Separate fusion norms: {fusion_separate_norms}")
 
         if opt.eval_split == 'cityscapes':
             dataset = datasets.CityscapesEvalDataset(opt.data_path, filenames,
@@ -149,28 +155,6 @@ def evaluate(opt):
                 checkpoint_dir=opt.depth_anything_checkpoint_dir,
             )
         else:
-            pose_enc_dict = torch.load(
-                os.path.join(opt.load_weights_folder, "pose_encoder.pth"), map_location='cpu'
-            )
-            pose_dec_dict = torch.load(
-                os.path.join(opt.load_weights_folder, "pose.pth"), map_location='cpu'
-            )
-
-            pose_enc = networks.ResnetEncoder(opt.pose_encoder_num_layers, False, num_input_images=2)
-            pose_dec = networks.PoseDecoder(pose_enc.num_ch_enc, num_input_features=1,
-                                            num_frames_to_predict_for=2)
-
-            pose_enc.load_state_dict(pose_enc_dict, strict=True)
-            pose_dec.load_state_dict(pose_dec_dict, strict=True)
-
-            
-            pose_enc.eval()
-            pose_dec.eval()
-
-            if torch.cuda.is_available():
-                pose_enc.cuda()
-                pose_dec.cuda()
-
             encoder = networks.ManyDepthAnythingEncoder(
                 encoder_name=opt.depth_anything_encoder,
                 checkpoint_dir=opt.depth_anything_checkpoint_dir,
@@ -185,10 +169,13 @@ def evaluate(opt):
                 fusion_neighborhood_size=fusion_neighborhood_size,
                 fusion_num_scales=fusion_num_scales,
                 fusion_independent_blocks=fusion_independent_blocks,
+                fusion_mode=fusion_mode,
                 fusion_lora_rank=fusion_lora_rank,
                 fusion_lora_alpha=fusion_lora_alpha,
                 fusion_dropout=fusion_dropout,
                 fusion_drop_path=fusion_drop_path,
+                fusion_separate_norms=fusion_separate_norms,
+                use_cls_scale_shift=getattr(opt, "use_cls_scale_shift", False),
             )
             if not opt.no_lora:
                 encoder = replace_mlp_with_lora(
@@ -238,7 +225,10 @@ def evaluate(opt):
 
                     encoder_lookup_frames = None if no_temporal_fusion else lookup_frames
                     features, lookup_features = encoder(input_color, encoder_lookup_frames)
-                    output, _ = depth_decoder(features, lookup_features)
+                    output, _ = depth_decoder(
+                        features,
+                        lookup_features,
+                    )
                 if opt.eval_teacher:
                     output = output.relu()
                 else:
@@ -375,6 +365,9 @@ def evaluate(opt):
 
         pred_depth[pred_depth < MIN_DEPTH] = MIN_DEPTH
         pred_depth[pred_depth > MAX_DEPTH] = MAX_DEPTH
+
+        pred_depth_metric[pred_depth_metric < MIN_DEPTH] = MIN_DEPTH
+        pred_depth_metric[pred_depth_metric > MAX_DEPTH] = MAX_DEPTH
 
         errors.append(compute_errors(gt_depth, pred_depth))
         errors_metric.append(compute_errors(gt_depth, pred_depth_metric))

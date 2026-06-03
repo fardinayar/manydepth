@@ -1,4 +1,0 @@
-# Ablation: disable dynamic weighting of the loss.
-extends: base.yaml
-model_name: "2_passes"
-num_passes: 2

@@ -134,10 +134,13 @@ def setup_models(
             fusion_neighborhood_size=saved_cfg.fusion_neighborhood_size,
             fusion_num_scales=saved_cfg.fusion_num_scales,
             fusion_independent_blocks=saved_cfg.fusion_independent_blocks,
+            fusion_mode=saved_cfg.fusion_mode,
             fusion_lora_rank=saved_cfg.fusion_lora_rank,
             fusion_lora_alpha=saved_cfg.fusion_lora_alpha,
             fusion_dropout=saved_cfg.fusion_dropout,
             fusion_drop_path=saved_cfg.fusion_drop_path,
+            fusion_separate_norms=saved_cfg.fusion_separate_norms,
+            use_cls_scale_shift=getattr(saved_cfg, "use_cls_scale_shift", False),
         )
         if not saved_cfg.no_lora:
             encoder = replace_mlp_with_lora(
@@ -184,7 +187,10 @@ def predict_depth_teacher(encoder, depth_decoder, input_color: torch.Tensor):
 
 @torch.no_grad()
 def predict_depth_student(
-    encoder, depth_decoder, input_color: torch.Tensor, lookup_frames: torch.Tensor
+    encoder,
+    depth_decoder,
+    input_color: torch.Tensor,
+    lookup_frames: torch.Tensor,
 ):
     """Student (multi-frame) depth prediction."""
     if getattr(depth_decoder, "temporal_fusion", True) and lookup_frames.shape[1] != 1:

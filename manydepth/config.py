@@ -108,6 +108,9 @@ class TrainConfig:
     no_consistency_loss: bool
     no_loss_dynamic_weight: bool
     ignore_high_low_loss_pixels: bool
+    ignore_depth_edge_pixels: bool
+    depth_edge_mask_threshold: float
+    depth_edge_mask_dilation: int
     consistency_disp_margin: float  # Margin on patch-normalized disparity shape difference
 
     # SYSTEM
@@ -139,6 +142,7 @@ class TrainConfig:
     depth_anything_encoder: str
     depth_anything_checkpoint_dir: str
     encoder_lr_coef: float
+    encoder_token_lr_coef: float
     fusion_lr_coef: float
     g2s: bool
     g2s_weight_factor: int  # Factor for g2s weight ramp (maximum_steps = factor * total_steps / num_epochs)
@@ -158,10 +162,13 @@ class TrainConfig:
     fusion_neighborhood_size: Optional[Tuple[int, ...]]
     fusion_num_scales: int
     fusion_independent_blocks: bool
+    fusion_mode: str
+    fusion_separate_norms: bool
     fusion_lora_rank: int
     fusion_lora_alpha: float
     fusion_dropout: float
     fusion_drop_path: float
+    use_cls_scale_shift: bool
 
     # Scheduler
     cosine_min_lr_factor: float
@@ -188,6 +195,18 @@ class TrainConfig:
             d["pose_weights_init"] = d.pop("weights_init")
         if "fusion_independent_blocks" not in d:
             d["fusion_independent_blocks"] = False
+        if "fusion_mode" not in d:
+            d["fusion_mode"] = "attention"
+        if "use_cls_scale_shift" not in d:
+            d["use_cls_scale_shift"] = False
+        if "encoder_token_lr_coef" not in d:
+            d["encoder_token_lr_coef"] = 0.1
+        if "ignore_depth_edge_pixels" not in d:
+            d["ignore_depth_edge_pixels"] = False
+        if "depth_edge_mask_threshold" not in d:
+            d["depth_edge_mask_threshold"] = 0.15
+        if "depth_edge_mask_dilation" not in d:
+            d["depth_edge_mask_dilation"] = 1
         fields = cls.__dataclass_fields__
         missing = [name for name in fields if name not in d]
         if missing:

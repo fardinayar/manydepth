@@ -1,4 +1,0 @@
-# Ablation: disable consistency loss in the depth decoder.
-extends: base.yaml
-no_consistency_loss: true
-model_name: "mdp_no_consistency_loss"
