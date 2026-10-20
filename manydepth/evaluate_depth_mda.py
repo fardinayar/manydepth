@@ -7,7 +7,9 @@
 import os
 import cv2
 
-from networks.replace_with_lora import replace_mlp_with_lora, replace_conv_with_loraconv
+from networks.replace_with_lora import (
+    replace_linear_with_lora, replace_conv_with_loraconv, encoder_lora_target_substrings,
+)
 os.environ["MKL_NUM_THREADS"] = "1"  # noqa F402
 os.environ["NUMEXPR_NUM_THREADS"] = "1"  # noqa F402
 os.environ["OMP_NUM_THREADS"] = "1"  # noqa F402
@@ -21,6 +23,7 @@ from options import MonodepthOptions
 import datasets, networks
 from layers import disp_to_depth
 import tqdm
+import torch.nn.functional as F
 
 cv2.setNumThreads(0)  # This speeds up evaluation 5x on our unix systems (OpenCV 3.3.1)
 
@@ -137,14 +140,16 @@ def evaluate(opt):
                 use_cls_scale_shift=getattr(opt, "use_cls_scale_shift", False),
             )
             if not opt.no_lora:
-                encoder = replace_mlp_with_lora(
-                    encoder, r=opt.lora_rank, lora_alpha=opt.lora_alpha, lora_dropout=0.0
+                encoder = replace_linear_with_lora(
+                    encoder, r=opt.lora_encoder_rank, lora_alpha=opt.lora_encoder_alpha, lora_dropout=0.0,
+                    target_names=encoder_lora_target_substrings(opt.lora_encoder_targets),
                 )
                 depth_decoder = replace_conv_with_loraconv(
-                    depth_decoder, r=opt.lora_rank, lora_alpha=opt.lora_alpha, lora_dropout=0.0
+                    depth_decoder, r=opt.lora_decoder_rank, lora_alpha=opt.lora_decoder_alpha, lora_dropout=0.0
                 )
 
-        encoder.load_state_dict(encoder_dict, strict=False)
+        m, u = encoder.load_state_dict(encoder_dict, strict=False)
+        print("ENCODER missing:", len(m), "unexpected:", len(u))
         
         decoder_state = torch.load(decoder_path, map_location='cpu')
         missing, unexpected = depth_decoder.load_state_dict(decoder_state, strict=False)
@@ -181,7 +186,7 @@ def evaluate(opt):
                 if opt.eval_teacher:
                     output = output.relu()
                 else:
-                    output =  (output).relu()
+                    output = F.relu(output)
                 
                 if opt.eval_teacher:
                     pred_disp, _ = disp_to_depth(output, opt.max_depth)
@@ -275,6 +280,7 @@ def evaluate(opt):
             # Bottom 25% has already been removed - so crop the sides and the top here
             gt_depth = gt_depth[256:, 192:1856]
             pred_depth = pred_depth[256:, 192:1856]
+            pred_disp = pred_disp[256:, 192:1856]
 
         if opt.eval_split == "eigen":
             mask = np.logical_and(gt_depth > MIN_DEPTH, gt_depth < MAX_DEPTH)
@@ -331,6 +337,10 @@ def evaluate(opt):
         output_path = os.path.join(
             opt.load_weights_folder, "{}_{}_errors.npy".format(tag, opt.eval_split))
         np.save(output_path, np.array(errors))
+
+        metric_output_path = os.path.join(
+            opt.load_weights_folder, "{}_{}_metric_errors.npy".format(tag, opt.eval_split))
+        np.save(metric_output_path, np.array(errors_metric))
 
     if not opt.disable_median_scaling:
         ratios = np.array(ratios)

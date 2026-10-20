@@ -97,10 +97,9 @@ class TrainConfig:
     no_consistency_loss: bool
     no_loss_dynamic_weight: bool
     ignore_high_low_loss_pixels: bool
-    ignore_depth_edge_pixels: bool
-    depth_edge_mask_threshold: float
-    depth_edge_mask_dilation: int
     consistency_disp_margin: float  # Margin on patch-normalized disparity shape difference
+    consistency_global_ssi: bool  # Add a whole-image SSI distillation term alongside the patch SSI
+    consistency_global_ssi_weight: float  # Weight of the global SSI term, relative to the patch SSI
 
     # SYSTEM
     no_cuda: bool
@@ -139,8 +138,11 @@ class TrainConfig:
     gradient_accumulation_steps: int
 
     # Ablation: LoRA (encoder/decoder)
-    lora_rank: int
-    lora_alpha: float
+    lora_encoder_rank: int
+    lora_encoder_alpha: float
+    lora_encoder_targets: List[str]  # Which encoder sublayers get LoRA: "mlp", "attention", or both
+    lora_decoder_rank: int
+    lora_decoder_alpha: float
     lora_dropout: float
 
     use_cls_scale_shift: bool
@@ -172,12 +174,22 @@ class TrainConfig:
             d["use_cls_scale_shift"] = False
         if "encoder_token_lr_coef" not in d:
             d["encoder_token_lr_coef"] = 0.1
-        if "ignore_depth_edge_pixels" not in d:
-            d["ignore_depth_edge_pixels"] = False
-        if "depth_edge_mask_threshold" not in d:
-            d["depth_edge_mask_threshold"] = 0.15
-        if "depth_edge_mask_dilation" not in d:
-            d["depth_edge_mask_dilation"] = 1
+        if "consistency_global_ssi" not in d:
+            d["consistency_global_ssi"] = False
+        if "consistency_global_ssi_weight" not in d:
+            d["consistency_global_ssi_weight"] = 1.0
+        # Backward compatibility: old configs had a single lora_rank/lora_alpha
+        # shared by encoder and decoder, and always applied LoRA to encoder MLPs only.
+        if "lora_rank" in d:
+            legacy_rank = d.pop("lora_rank")
+            d.setdefault("lora_encoder_rank", legacy_rank)
+            d.setdefault("lora_decoder_rank", legacy_rank)
+        if "lora_alpha" in d:
+            legacy_alpha = d.pop("lora_alpha")
+            d.setdefault("lora_encoder_alpha", legacy_alpha)
+            d.setdefault("lora_decoder_alpha", legacy_alpha)
+        if "lora_encoder_targets" not in d:
+            d["lora_encoder_targets"] = ["mlp"]
         # Drop multi-frame fusion keys that may linger in older saved configs.
         for _legacy in (
             "num_matching_frames", "no_temporal_fusion", "fusion_lr_coef",
@@ -185,6 +197,9 @@ class TrainConfig:
             "fusion_num_scales", "fusion_independent_blocks", "fusion_mode",
             "fusion_separate_norms", "fusion_lora_rank", "fusion_lora_alpha",
             "fusion_dropout", "fusion_drop_path",
+            "geometry_consistency", "geometry_consistency_weight",
+            "geometry_consistency_mask", "geometry_consistency_detach_source",
+            "geometry_consistency_max_depth",
         ):
             d.pop(_legacy, None)
         fields = cls.__dataclass_fields__
@@ -202,6 +217,8 @@ class TrainConfig:
             d["frame_ids"] = list(d["frame_ids"])
         if isinstance(d["models_to_load"], (list, tuple)):
             d["models_to_load"] = list(d["models_to_load"])
+        if isinstance(d["lora_encoder_targets"], (list, tuple)):
+            d["lora_encoder_targets"] = list(d["lora_encoder_targets"])
         kwargs = {name: d[name] for name in fields}
         return cls(**kwargs)
 

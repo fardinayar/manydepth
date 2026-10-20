@@ -13,9 +13,9 @@ dataset: "kitti"                  # Dataset: kitti, kitti_odom, cityscapes_prepr
 png: true                        # If true, load images from PNG instead of JPEG (KITTI raw)
 height: 182                       # Input image height (must be multiple of 14)
 width: 630                        # Input image width (must be multiple of 14)
-disparity_smoothness: 0.0         # Weight for disparity smoothness loss
+disparity_smoothness: 0.0001         # Weight for disparity smoothness loss
 scales: [0]                       # Scales used in the loss (e.g. [0] or [0,1,2])
-max_depth: 1000.0                  # Maximum depth value (meters)
+max_depth: 300.0                  # Maximum depth value (meters)
 frame_ids: [0, -1, 1]             # Frame indices to load (0=ref, -1=prev, 1=next)
 
 # OPTIMIZATION
@@ -23,8 +23,8 @@ batch_size: 12                    # Training batch size
 learning_rate: 0.0001             # Learning rate
 num_epochs: 5                     # Number of training epochs
 pytorch_random_seed: null         # Random seed for reproducibility (null = no fix)
-max_grad_norm: 0                # Gradient clipping max norm (0 to disable)
-warmup_steps: 0                # LR warmup steps (0 to disable)
+max_grad_norm: 10               # Gradient clipping max norm (0 to disable)
+warmup_steps: 500                # LR warmup steps (0 to disable)
 
 # ABLATION FLAGS
 pose_weights_init: "pretrained"   # Pose encoder init: pretrained or scratch
@@ -32,10 +32,9 @@ no_lora: false                    # Disable LoRA in encoder and decoder (use ful
 no_consistency_loss: false        # Disable consistency loss
 no_loss_dynamic_weight: false     # Disable dynamic weighting of the loss
 ignore_high_low_loss_pixels: true  # Ignore top high-loss percentile (ablation: set false to disable)
-ignore_depth_edge_pixels: false    # Ignore detached disparity/depth-edge pixels in reprojection loss
-depth_edge_mask_threshold: 0.03   # Threshold on mean-normalized disparity gradient
-depth_edge_mask_dilation: 1       # Pixel radius for dilating the depth-edge mask
 consistency_disp_margin: 0.05 ####      # Margin on patch-normalized disparity shape difference
+consistency_global_ssi: false      # Add a whole-image SSI distillation term alongside the 32x32 patch SSI
+consistency_global_ssi_weight: 1.0  # Weight of the global SSI term, relative to the patch SSI term
 
 # SYSTEM
 no_cuda: false                    # Disable CUDA (CPU only)
@@ -65,23 +64,26 @@ eval_after_each_epoch: true      # Run test-set evaluation after each epoch save
 # DEPTH_ANYTHING
 depth_anything_encoder: "vits"    # Encoder size: vits, vitb, vitl, vitg
 depth_anything_checkpoint_dir: "checkpoints"  # Dir containing depth_anything_v2_<encoder>.pth
-encoder_lr_coef: 1.0              # Learning rate multiplier for the encoder
-encoder_token_lr_coef: 0.1        # Additional LR multiplier for DINOv2 cls_token and pos_embed
+encoder_lr_coef: 1             # Learning rate multiplier for the encoder
+encoder_token_lr_coef: 0.0        # Additional LR multiplier for DINOv2 cls_token and pos_embed
 g2s: true                        # Use g2s (gradient-to-scale) loss
-g2s_weight_factor: 2.0    ####         # g2s ramp-up: max_steps = factor * (total_steps / num_epochs)
+g2s_weight_factor: 4    ####         # g2s ramp-up: max_steps = factor * (total_steps / num_epochs)
 data_percent: 100.0               # Percent of training data to use (1–100)
 pose_from_scratch: false          # Initialize pose encoder/decoder randomly (no pretrain)
 gradient_accumulation_steps: 1    # Gradient accumulation steps (effective batch = batch_size * this)
 
 # Ablation: LoRA (encoder/decoder)
-lora_rank: 8                      # LoRA rank for encoder and decoder
-lora_alpha: 8                   # LoRA alpha (scaling)
-lora_dropout: 0.1                # LoRA dropout (training only)
+lora_encoder_rank: 16              # LoRA rank for the encoder
+lora_encoder_alpha: 16             # LoRA alpha (scaling) for the encoder
+lora_encoder_targets: [mlp]        # Which encoder sublayers get LoRA: mlp, attention, or [mlp, attention]
+lora_decoder_rank: 16               # LoRA rank for the decoder
+lora_decoder_alpha: 16              # LoRA alpha (scaling) for the decoder
+lora_dropout: 0.1                 # LoRA dropout (training only, shared by encoder/decoder)
 
 use_cls_scale_shift: true          # CLS-token MLP disparity corrector
 
 # Scheduler
-cosine_min_lr_factor: 0.1   ####     # Final LR = base LR * this factor after cosine decay
+cosine_min_lr_factor: 0.01   ####     # Final LR = base LR * this factor after cosine decay
 
 # Ablation: pose encoder
 pose_encoder_num_layers: 18      # ResNet layers for pose encoder (e.g. 18, 50)

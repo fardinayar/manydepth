@@ -1,0 +1,4 @@
+# Ablation: do not ignore the top high-loss pixels (keep all pixels in the reprojection loss).
+extends: base.yaml
+model_name: "high_lora"
+lora_encoder_targets: [attention]

@@ -1,0 +1,128 @@
+Our framework adapts an affine-invariant depth foundation model into a \emph{metric}, single-image predictor through lightweight modifications that preserve the pretrained representation. We build upon DepthAnything\,V2~\cite{yang2024depth}, keeping its encoder and decoder frozen and introducing four components: (i) parameter-efficient LoRA modules~\cite{hu2022lora} that adapt the frozen backbone without catastrophic forgetting, (ii) a scale--shift decoupling head that separates the global metric scale and shift---regressed from the encoder's class tokens---from the dense relative geometry produced by the decoder, (iii) a pose network that estimates inter-frame ego-motion and receives GPS-based metric supervision, and (iv) a frozen teacher copy of the foundation model that distills fine structure into the adapted model. Adjacent frames and GPS are used \emph{only at training time}; at inference the model predicts metric depth from a single image. We first review the self-supervised preliminaries, then describe each component and the training objective.
+
+\subsection{Preliminaries: Self-Supervised Depth Estimation}
+
+Following the self-supervised paradigm~\cite{zhou2017unsupervised, godard2019digging}, we exploit photometric consistency between temporally adjacent training frames as the primary supervisory signal. Given a target frame \(I_{t}\) and source frames \(\{I_{t+n}\mid n \in \{-1, 1\}\}\), we predict the target depth \(D_t\) and the relative camera pose \(T_{t \to t+n}\). These enable differentiable view synthesis~\cite{garg2016unsupervised}: we reconstruct the target from each source by
+\begin{equation}
+  \hat{I}_{t}(p) = I_{t+n}(p'), \quad \text{where } p' \sim K\, T_{t \to t+n}\, D_t(p)\, K^{-1} p,
+\end{equation}
+with \(K\) the camera intrinsics and \(p\) pixel coordinates. The photometric reconstruction loss penalizes the discrepancy between the synthesized and observed target:
+\begin{equation}
+    \mathcal{L}_{\text{photo}} = \sum_{p} \rho\big(I_t(p), \hat{I}_{t}(p)\big),
+\end{equation}
+where \(\rho(\cdot)\) is a robust photometric error combining structural similarity (SSIM) and \(\ell_1\) distance~\cite{godard2019digging}. We handle violations of the static-scene assumption with auto-masking and a robust high-loss rejection scheme (Section~3.6). Crucially, this objective is invariant to a common rescaling of depth and translation, a property we must confront directly to recover metric scale.
+
+\bigbreak
+\begin{figure*}
+    \centering
+    % NOTE: regenerate this figure to match the single-image pipeline described below.
+    \includegraphics[width=\linewidth]{imgs/Picture1.png}
+    \caption{Overview of the proposed self-supervised metric adaptation framework.
+    A single target frame $I_t$ is encoded by a frozen DepthAnything\,V2 backbone (adapted with LoRA) and decoded by the DPT head into a relative disparity field. A \texttt{CLS}-conditioned scale--shift head predicts a per-image affine $(s,b)$ that converts the relative prediction into metric depth $D_t$, decoupling the global scale from the dense shape. A PoseNet estimates inter-frame ego-motion and is supervised by GPS displacement to inject metric scale, which propagates to depth through the photometric warping. A frozen teacher copy of the foundation model distills fine structure via a scale-shift-invariant loss. Adjacent frames, the pose branch, and the teacher are used only during training; inference is single-image.}
+    \label{fig:placeholder}
+\end{figure*}
+
+
+\subsection{Architecture and the Scale-Invariance Tension}
+
+\textbf{Foundation model selection.} While metric foundation models exist~\cite{yin2023metric3d,piccinelli2024unidepth}, we deliberately build on the \emph{affine-invariant} DepthAnything\,V2~\cite{yang2024depth} for its superior edge preservation and geometric detail~\cite{li2025benchdepth}, and accept the challenge of recovering metric scale through self-supervision. This choice is governed by a fundamental tension: self-supervised photometric losses are scale-invariant, so naive fine-tuning will not only fail to learn absolute scale but will actively erode the pretrained structure by driving parameters toward scale-ambiguous solutions. Our architecture is designed to address both halves of this tension---providing a controlled locus for metric scale while shielding the dense geometry from photometric erosion.
+
+\textbf{Feature extraction.} Let \(E_{\mathbf w}\) denote the Vision Transformer encoder. For an input image \(I_{t} \in \mathbb{R}^{3 \times H \times W}\), we extract multi-scale features from four layers following the DPT architecture, together with the corresponding class tokens:
+\begin{equation}
+\big(\{F^{i}_t\}_{i=1}^{4},\, \{c^{i}_t\}_{i=1}^{4}\big) = E_{\mathbf w}(I_t),
+\qquad F^{i}_t \in \mathbb{R}^{C \times \frac{H}{14} \times \frac{W}{14}},\; c^{i}_t \in \mathbb{R}^{C}.
+\end{equation}
+The spatial features are decoded by the DPT decoder \(D_{\boldsymbol\phi}\) into a relative disparity field \(\hat d_t = D_{\boldsymbol\phi}(\{F^{i}_t\}) \in \mathbb{R}^{1\times H\times W}\), while the class tokens \(\{c^{i}_t\}\) drive metric scale recovery (Section~3.3).
+
+\textbf{Parameter-efficient adaptation via LoRA.} To preserve the zero-shot generalization of DepthAnything\,V2, we freeze the encoder \(E_{\mathbf w}\) and decoder \(D_{\boldsymbol\phi}\), and insert Low-Rank Adaptation (LoRA)~\cite{hu2022lora} modules at (i) the query and key projections of the encoder's self-attention layers and (ii) the convolutional layers of the DPT decoder. LoRA reparameterizes each adapted weight as \(\mathbf{W} + \mathbf{B}\mathbf{A}\) with \(\mathrm{rank}(\mathbf{B}\mathbf{A}) = r \ll d\), making fewer than \(1\%\) of parameters trainable. This constrains the adapted model to stay close to the pretrained one---a structural safeguard against the erosion described above---while still allowing it to learn metric behavior.
+
+\subsection{Scale--Shift Decoupling}
+
+The defining feature of an affine-invariant model is that its prediction is meaningful only up to an unknown global scale and shift; equivalently, exactly two global degrees of freedom separate its relative output from a metric one. Our central design principle is to make these two degrees of freedom \emph{explicit} and to route all metric supervision through them, leaving the high-dimensional shape untouched.
+
+Let \(\hat d_t\) be the decoder's relative disparity. We standardize it using its own per-image statistics, treated as constants (stop-gradient, denoted \(\lfloor\cdot\rfloor\)):
+\begin{equation}
+\bar d_t = \frac{\hat d_t - \lfloor\mu_t\rfloor}{\lfloor\sigma_t\rfloor},
+\qquad \mu_t = \mathrm{mean}(\hat d_t),\;\; \sigma_t = \mathrm{std}(\hat d_t).
+\end{equation}
+A lightweight head \(g_{\boldsymbol\theta}\) regresses a per-image affine from the concatenated class tokens, summarizing global scene context (illumination, layout, scale cues) without spatial bias:
+\begin{equation}
+(s_t,\, b_t) = g_{\boldsymbol\theta}\big([\,c^{1}_t; c^{2}_t; c^{3}_t; c^{4}_t\,]\big),
+\qquad s_t = \mathrm{softplus}(\cdot) > 0,\;\; b_t \in \mathbb{R},
+\end{equation}
+and applies it to the standardized field to produce the corrected disparity, from which metric depth follows by inversion:
+\begin{equation}
+d_t = \lfloor\sigma_t\rfloor\,(s_t\, \bar d_t + b_t) + \lfloor\mu_t\rfloor,
+\qquad
+D_t = \big(\max(d_t,\, 1/d_{\max})\big)^{-1}.
+\label{eq:scaleshift}
+\end{equation}
+Two properties make this an effective decoupling. \emph{First}, because \(\mu_t,\sigma_t\) are detached, the only path by which a global rescaling of the output can be realized is through the scalars \((s_t,b_t)\); a metric loss therefore adjusts scale and shift through two well-conditioned parameters rather than by redistributing magnitude across the dense field, so it cannot reshape the relative geometry to satisfy scale. \emph{Second}, conditioning on the class tokens lets the per-image affine adapt to scene content (e.g.\ open road vs.\ cluttered intersection) while keeping the dense decoder identical to the frozen foundation model. We zero-initialize the scale and shift heads so that training begins from the near-identity affine \((s_t\!\approx\!1, b_t\!\approx\!0)\), i.e.\ from the pretrained relative prediction, and departs from it only as much as the metric signal requires. The head adds a negligible number of parameters and no inference-time cost beyond a small MLP.
+
+\subsection{GPS-Based Metric Scale Recovery}
+
+Scale--shift decoupling provides a \emph{place} for metric scale to live; we now provide the \emph{signal}. Since the photometric loss is scale-invariant, absolute scale must enter from an external metric reference. Following~\cite{chawla2021multimodal}, we use GPS traces---ubiquitous in driving data---to supervise the magnitude of the pose network's predicted translation. GPS positions are converted to a local Cartesian frame (ENU/UTM) yielding \(\mathbf{p}_k \in \mathbb{R}^3\) in meters; for a source--target pair the displacement is \(\mathbf{G}_{s \to t} = \mathbf{p}_t - \mathbf{p}_s\), and the pose network predicts relative translation \(\hat{\mathbf{T}}_{s \to t}\). We align their magnitudes,
+\begin{equation}
+\mathcal{L}_{\mathrm{g2s}}
+=
+\sum_{s,t}
+\Bigg(
+\frac{\lVert \mathbf{G}_{s\!\rightarrow t}\rVert_2}
+     {\lVert \hat{\mathbf{T}}_{s\!\rightarrow t}\rVert_2}
+-1
+\Bigg)^{\!2},
+\label{eq:gps_scale_loss}
+\end{equation}
+constraining only the scale, not the direction, which can be noisy under GPS error or changes in heading. To make supervision robust we gate it on frames with sufficient measured motion---skipping near-stationary pairs where the GPS ratio is ill-conditioned---and apply the constraint in log space in practice. GPS acts \emph{solely on the pose network}; the metric scale it fixes then propagates to depth through the shared warping geometry of the photometric loss, which couples depth and translation scale. Concretely, once the translation magnitude is metric, minimizing reprojection error drives the depth scale---and hence the affine \(s_t\) of Eq.~\eqref{eq:scaleshift}---toward the consistent metric value. Unlike LiDAR supervision, GPS is lightweight, widely available, and sensor-free.
+
+\subsection{Teacher-Guided Scale-Shift-Invariant Distillation}
+
+Even with adaptation constrained by LoRA, prolonged photometric training tends to soften edges and thin structures---the very features for which we chose an affine-invariant backbone. We counteract this with a distillation loss from a \emph{frozen} copy of DepthAnything\,V2, which serves as a teacher of fine structure. Because the teacher is itself affine-invariant, a naive pixel-wise loss against it would inject an arbitrary scale and shift and fight the metric signal of Section~3.4. We therefore distill only \emph{shape}, in a patch-wise scale-shift-invariant (SSI) form.
+
+For each \(K\times K\) patch \(p\) (\(K=32\), \(50\%\) overlap), we \(z\)-normalize the student and teacher disparities within the patch and compare them, making the term invariant to local affine transformations and tolerant of sub-pixel misalignment:
+\begin{equation}
+\ell^{\mathrm{SSI}}_{p}
+= \frac{1}{K^{2}} \sum_{(u,v)\in p} \big|\,\bar d^{\mathrm{stu}}_{p}(u,v)-\bar d^{\mathrm{tea}}_{p}(u,v)\,\big|,
+\end{equation}
+where \(\bar{(\cdot)}_p\) denotes per-patch standardization. We evaluate the loss only on high-variance patches \(\mathcal{P}=\{\,p \mid \operatorname{Var}(p)>\tau\,\}\), concentrating supervision on depth discontinuities and thin structures rather than flat regions:
+\begin{equation}
+\mathcal{L}_{\mathrm{SSI}}
+= \frac{1}{|\mathcal{P}|}\sum_{p\in\mathcal{P}} \ell^{\mathrm{SSI}}_{p}.
+\end{equation}
+An optional whole-image SSI term constrains global depth ordering and far-field structure that lie beyond a single patch. Being scale-shift-invariant, this distillation protects geometric fidelity while remaining orthogonal to metric scale: it constrains \emph{shape}, GPS constrains \emph{scale}, and the two do not interfere by construction---an explicit realization of our decoupling principle on the loss side.
+
+\textbf{Curriculum coupling.} The two objectives have complementary roles over training: structure should be anchored early, while the pose network and scale head stabilize before metric scale is enforced. We therefore couple their schedules through a single curriculum. The GPS term is ramped \emph{up} with a weight \(w_{\mathrm{GPS}}(t)\) that grows over training, preventing premature scale constraints while the pose network is still noisy; the distillation weight is correspondingly ramped \emph{down}, \(\lambda_{\mathrm{SSI}}(t) \propto 1 - w_{\mathrm{GPS}}(t)\), so structural anchoring is strongest at initialization and yields as the model commits to a metric scale. This dynamic weighting ties the two halves of the tension into a single, self-consistent schedule.
+
+\subsection{Robust Photometric Training}
+
+\textbf{Auto-masking.} Following Monodepth2~\cite{godard2019digging}, the per-pixel photometric error combines SSIM and \(\ell_1\):
+\begin{equation}
+pe(I_a, I_b) = \frac{\alpha}{2}\,\big(1-\text{SSIM}(I_a, I_b)\big)
++ (1-\alpha)\,\lVert I_a - I_b \rVert_1,
+\qquad \alpha = 0.85,
+\label{eq:pe}
+\end{equation}
+and we discard pixels whose warped error exceeds the stationary (identity) error,
+\begin{equation}
+\mu = \Big[\, \min_{n} pe\!\big(I_t,\; \hat I_{t}^{\,n}\big) \;<\; \min_{n} pe\!\big(I_t,\; I_{t+n}\big) \,\Big],
+\label{eq:auto-mask}
+\end{equation}
+with \([\cdot]\) the Iverson bracket and \(\hat I_{t}^{\,n}\) the reconstruction from source \(n\).
+
+\textbf{High-loss rejection.} Auto-masking removes stationary and ego-aligned pixels but not dynamic objects moving with the camera, severe occlusions, or non-Lambertian regions, which produce large but non-trivial reprojection errors. Rather than relying on optical flow or semantic labels, we suppress these outliers directly: among all pixels that survive auto-masking, we rank reprojection errors across the batch and discard the top \(\eta\) fraction (the highest-error tail). This flow- and semantics-free scheme prevents a small number of hard, typically dynamic, pixels from dominating the gradient. The final masked reprojection loss takes the minimum over sources on the retained pixels:
+\begin{equation}
+\mathcal{L}_{\text{reproj}} = \frac{\sum_p m(p)\,\min_{n} pe\!\big(I_t(p),\; \hat I_{t}^{\,n}(p)\big)}{\sum_p m(p) + \epsilon},
+\label{eq:Lreproj}
+\end{equation}
+where \(m\) is the combined auto-mask and high-loss-rejection mask.
+
+\subsection{Training Objective and Optimization}
+
+The total objective combines the photometric reconstruction loss with GPS metric supervision, teacher SSI distillation, and an edge-aware smoothness regularizer:
+\begin{equation}
+\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{reproj}}
++ \lambda_{\mathrm{GPS}}(t)\,\mathcal{L}_{\mathrm{g2s}}
++ \lambda_{\mathrm{SSI}}(t)\,\mathcal{L}_{\mathrm{SSI}}
++ \lambda_{\mathrm{sm}}\,\mathcal{L}_{\mathrm{sm}},
+\end{equation}
+where \(\lambda_{\mathrm{GPS}}(t)\) and \(\lambda_{\mathrm{SSI}}(t)\) follow the coupled curriculum of Section~3.5. We train the LoRA parameters, the scale--shift head \(g_{\boldsymbol\theta}\), the final DPT decoder layers, and the pose network (initialized from a Cityscapes-pretrained pose encoder); the encoder and decoder backbones, as well as the teacher copy, remain frozen. This keeps trainable parameters below \(1\%\) of the model, which we find to be the key to preserving the foundation model's generalization while grafting metric, self-supervised behavior onto it.

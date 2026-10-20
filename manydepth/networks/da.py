@@ -57,84 +57,52 @@ class ConvBlock(nn.Module):
 
 
 class ClsTokenScaleShiftCorrector(nn.Module):
-    """Predict disparity affine ``scale * disp + shift`` from the final DPT CLS token."""
+    """Predict disparity affine scale*disp+shift from the concatenated per-layer CLS tokens.
 
-    def __init__(
-        self,
-        embed_dim,
-        hidden_dim=None,
-        dropout=0.4,
-        scale_delta=1,
-        shift_bound=1,
-        noise_std=0.05,          # added
-    ):
+    All num_layers CLS tokens are concatenated and squeezed through a low-dim bottleneck
+    before the scale/shift heads. The bottleneck regularizes the head (which regresses only
+    2 global scalars per image) and keeps it smaller than the previous per-layer-weighted
+    MLP, without needing an extra regularization loss term.
+    """
+
+    def __init__(self, embed_dim, num_layers=4, bottleneck_dim=128, dropout=0.1):
         super().__init__()
         self.embed_dim = int(embed_dim)
-        self.scale_delta = float(scale_delta)
-        self.shift_bound = float(shift_bound)
-        self.noise_std = float(noise_std)  # added
+        self.num_layers = num_layers
+        in_dim = self.embed_dim * self.num_layers
 
-        h = hidden_dim if hidden_dim is not None else self.embed_dim
-        input_dim = self.embed_dim
+        h = bottleneck_dim
 
         self.shared_mlp = nn.Sequential(
-            nn.Dropout(dropout),
-            nn.Linear(input_dim, h),
+            nn.Linear(in_dim, h),
             nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(input_dim, h),
-            nn.GELU(),
-
-
             nn.Dropout(dropout),
             nn.Linear(h, h),
             nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(h, h),
+            nn.GELU(),
+            
         )
 
         self.scale_head = nn.Linear(h, 1)
         self.shift_head = nn.Linear(h, 1)
-
-        nn.init.zeros_(self.scale_head.weight)
-        nn.init.zeros_(self.scale_head.bias)
-
-        nn.init.zeros_(self.shift_head.weight)
-        nn.init.zeros_(self.shift_head.bias)
 
         with torch.no_grad():
             self.scale_head.bias[0] = torch.log(
                 torch.exp(torch.tensor(1.0)) - 1.0
             ).item()
 
-    def _validate_cls_token(self, cls_token):
-        if cls_token.ndim != 2 or cls_token.shape[-1] != self.embed_dim:
-            raise ValueError(
-                "CLS token must have shape [B, {}], got {}".format(
-                    self.embed_dim, tuple(cls_token.shape)
-                )
-            )
+    def forward(self, cls_tokens):
+        # cls_tokens: [B, num_layers, embed_dim] -> concat to [B, num_layers * embed_dim]
+        token = cls_tokens.reshape(cls_tokens.shape[0], -1)
 
-        return cls_token
-
-    def _add_gaussian_noise(self, x):
-        if self.training and self.noise_std > 0:
-            noise = torch.randn_like(x) * self.noise_std
-            x = x + noise
-        return x
-
-    def forward(self, cls_token):
-        cls_token = self._validate_cls_token(cls_token)
-
-        # Gaussian noise augmentation
-        cls_token = self._add_gaussian_noise(cls_token)
-
-        shared = self.shared_mlp(cls_token)
-
+        shared = self.shared_mlp(token)
         raw_scale = self.scale_head(shared)
         raw_shift = self.shift_head(shared)
 
         scale = F.softplus(raw_scale).unsqueeze(-1).unsqueeze(-1) + 1e-6
         shift = raw_shift.unsqueeze(-1).unsqueeze(-1)
-
         return scale, shift
 
 
@@ -237,17 +205,14 @@ class ManyDepthAnythingDecoder(nn.Module):
     
     def forward(self, out_features):
         out = []
-        last_cls_token = None
+        cls_token_list = []
         for i, x in enumerate(out_features):
             if (
                 self.cls_scale_shift is not None
                 and isinstance(x, (tuple, list))
                 and len(x) == 2
             ):
-                if last_cls_token is None:
-                    last_cls_token = x[1]
-                else:
-                    last_cls_token = last_cls_token + x[1]
+                cls_token_list.append(x[1])
             if self.use_clstoken:
                 x, cls_token = x[0], x[1]
                 readout = cls_token.unsqueeze(1).expand_as(x)
@@ -276,14 +241,14 @@ class ManyDepthAnythingDecoder(nn.Module):
         out = self.scratch.output_conv1(path_1)
         out_ = nn.functional.interpolate(out, (int(self.patch_h * 14), int(self.patch_w * 14)), mode="bilinear", align_corners=True)
         depth = self.scratch.output_conv2(out_)
-        if self.cls_scale_shift is not None and last_cls_token is not None:
+        if self.cls_scale_shift is not None and cls_token_list:
             # Per-image mean/std with detached stats: CLS affine on standardized maps (~O(1)) so
             # metric / reprojection loss gradients do not disproportionately drive scale vs shape.
             eps = 1e-6
-            mu = depth.mean(dim=(2, 3), keepdim=True).detach()
-            std = depth.std(dim=(2, 3), keepdim=True, unbiased=False).detach().clamp_min(eps)
+            mu = depth.mean(dim=(2, 3), keepdim=True)
+            std = depth.std(dim=(2, 3), keepdim=True, unbiased=False).clamp_min(eps)
             dn = (depth - mu) / std
-            last_cls_token = last_cls_token.to(dtype=depth.dtype)
-            scale, shift = self.cls_scale_shift(last_cls_token)
-            depth = std * (scale * dn + shift) + mu
+            stacked = torch.stack(cls_token_list, dim=1).to(dtype=depth.dtype)  # [B, num_layers, embed_dim]
+            scale, shift = self.cls_scale_shift(stacked)
+            depth = depth * scale + shift
         return depth, out_

@@ -1,0 +1,3 @@
+extends: ../base.yaml
+data_percent: 1.0
+model_name: "mdp_1pct"

@@ -1,0 +1,153 @@
+\documentclass[journal]{IEEEtran}
+\usepackage{amsmath,amsfonts}
+\usepackage{algorithmic}
+\usepackage{algorithm}
+\usepackage{array}
+\usepackage[caption=false,font=normalsize,labelfont=sf,textfont=sf]{subfig}
+\usepackage{textcomp}
+\usepackage{stfloats}
+\usepackage{url}
+\usepackage{verbatim}
+\usepackage{graphicx}
+\usepackage{cite}
+% ===== Preamble (put these once) =====
+\usepackage{booktabs,multirow,colortbl,xcolor}
+\usepackage{graphicx}   % for \rotatebox
+\usepackage{makecell}   % for stacked headers
+\usepackage{amssymb}    % for \checkmark
+\usepackage{arydshln}
+\usepackage[table]{xcolor} % enables \cellcolor in tables
+\usepackage{adjustbox} 
+% Define nice light tones (you can tweak these)
+\definecolor{lightgreen}{HTML}{DFF0D8} % pastel green
+\definecolor{lightyellow}{HTML}{FCF8E3} % pastel yellow
+
+\definecolor{errbg}{RGB}{255,230,230} % light red
+\definecolor{accbg}{RGB}{230,245,235} % light green
+\definecolor{probg}{RGB}{233,238,251} % light blue
+\providecommand{\best}[1]{\textbf{#1}} % bold-best helper used in result tables
+\hyphenation{op-tical net-works semi-conduc-tor IEEE-Xplore}
+% updated with editorial comments 8/9/2021
+
+\begin{document}
+
+\title{Self-Supervised Metric Adaptation of Depth Foundation Models via Scale--Shift Decoupling}
+
+\author{%
+    Fardin Ayar, Department of Computer Science, Amirkabir University of Technology\\
+    \and
+    Hossein Vahidi, Ferdowsi University of Mashhad\\
+    \and
+    Najmeh Mohammadbagheri, Amirkabir University of Technology\\
+    \and
+    Mahdi Javanmardi*, Amirkabir University of Technology\\
+    \and
+    Francesco Pilla, University College Dublin\\
+}
+
+
+
+%\author{%
+%	Behnam~Roshanfekr,
+%	Mohammad~Rahmati,
+%	Maryam~Amirmazlaghani, and
+%	Maryam~Abdolali%
+%	\thanks{B. Roshanfekr, M. Rahmati (corresponding author), and M. Amirmazlaghani are with the Department of Computer Engineering, Amirkabir University of Technology (Tehran Polytechnic), Iran (e-mails: b.roshanfekr@aut.ac.ir; rahmati@aut.ac.ir; mazlaghani@aut.ac.ir).}%
+%	\thanks{M. Abdolali is with the Department of Mathematics and Computer Science, K.N.Toosi University (KNTU), Iran (e-mail: maryam.abdolali@kntu.ac.ir).}%
+%}
+
+%\author{Behnam Roshanfekr,~\IEEEmembership{Staff,~IEEE,}
+        % <-this % stops a space
+%\thanks{This paper was produced by the IEEE Publication Technology Group. They are in Piscataway, NJ.}% <-this % stops a space
+%\thanks{Manuscript received April 19, 2021; revised August 16, 2021.}}
+
+% The paper headers
+\markboth{Journal of \LaTeX\ Class Files,~Vol.~14, No.~8, August~2021}%
+{Shell \MakeLowercase{\textit{et al.}}: A Sample Article Using IEEEtran.cls for IEEE Journals}
+
+%\IEEEpubid{0000--0000/00\$00.00~\copyright~2021 IEEE}
+% Remember, if you use this, you must call \IEEEpubidadjcol in the second
+% column for its text to clear the IEEEpubid mark.
+
+\maketitle
+
+\begin{abstract}
+    Affine-invariant depth foundation models predict relative depth with remarkable zero-shot generalization and exceptional edge and fine-structure fidelity, but their predictions lack absolute (metric) scale, which is essential for navigation and obstacle avoidance. Recovering metric scale typically demands LiDAR or ground-truth depth, or switching to metric foundation models that sacrifice geometric detail. We instead ask whether a frozen affine-invariant foundation model can be turned \emph{metric} purely through self-supervision, without any depth annotations. The central obstacle is a fundamental tension: self-supervised photometric losses are scale-invariant, so naive fine-tuning not only fails to learn absolute scale but actively erodes the rich relative structure of the pretrained model by collapsing it toward scale-ambiguous solutions. Our key idea is to \emph{decouple metric scale from depth shape}: the frozen decoder keeps producing the foundation model's sharp relative prediction, while a lightweight per-image affine transformation---regressed from the encoder's class tokens---carries the global metric scale and shift. Absolute scale is injected only through the pose branch via readily available GPS traces, and a teacher distillation loss from the frozen foundation model protects fine structure from photometric erosion. The entire adaptation is realized with Low-Rank Adaptation, training under $1\%$ of parameters. On KITTI, our single-image model produces metric depth that matches or surpasses DepthAnything\,V2 with substantially larger backbones, approaches a supervised metric foundation model, and rivals recent self-supervised methods, while preserving strong cross-domain transfer and remaining effective when trained on as little as $1\%$ of the data.
+\end{abstract}
+
+\begin{IEEEkeywords}
+Monocular depth estimation, self-supervised learning, depth foundation models, metric depth, parameter-efficient fine-tuning, scale recovery.
+\end{IEEEkeywords}
+
+\section{Introduction}\label{sec1}
+
+Monocular depth estimation is a core component in robotics, autonomous navigation, and 3D scene understanding. Self-Supervised Monocular Depth (SMD) methods~\cite{zhou2017unsupervised,8100182,godard2019digging} remove the need for costly ground-truth depth labels by exploiting photometric consistency between adjacent video frames, training depth and pose networks with view-synthesis losses under geometric warping. Despite steady progress, SMD methods inherit two persistent weaknesses. First, the photometric objective is fundamentally ambiguous with respect to scale: depth and ego-motion can be multiplied by any common factor without changing the reprojection error, so absolute (metric) depth cannot be recovered. Second, because these models are trained from scratch on a single dataset, they learn depth representations from a narrow distribution and generalize poorly across domains, often failing under shifts in camera, scene statistics, or appearance.
+
+Concurrently, depth foundation models such as MiDaS~\cite{ranftl2020towards}, Metric3D~\cite{liu2024metricdepth}, and DepthAnything\,V2~\cite{yang2024depth} have demonstrated striking zero-shot generalization by training on massive, heterogeneous data. The most accurate of these are \emph{affine-invariant}: trained with scale- and shift-invariant losses, they predict \emph{relative} depth and, freed from the burden of committing to an absolute scale, capture fine-grained geometry, edges, and thin structures with unmatched fidelity. This very property is also their main practical limitation: their predictions lack metric scale, which navigation and obstacle avoidance require. Metric foundation models~\cite{bhat2023zoedepth,yin2023metric3d,piccinelli2024unidepth} predict absolute depth directly, but enforcing a metric constraint during training measurably degrades edge sharpness and fine detail relative to their affine-invariant counterparts~\cite{li2025benchdepth}. Closing this gap by converting an affine-invariant model to metric typically reintroduces exactly the data dependency foundation models were meant to remove---LiDAR or ground-truth depth for scale calibration.
+
+This exposes a compelling opportunity. Affine-invariant foundation models provide the best relative geometry and the strongest cross-domain priors, yet lack the one ingredient---metric scale---that downstream systems need, while self-supervision offers a label-free route to scale through camera geometry. We therefore ask: \emph{can a frozen affine-invariant depth foundation model be adapted to metric, single-image depth purely through self-supervision, without any depth annotations and without sacrificing the geometric fidelity that makes it valuable?}
+
+Answering this question is harder than it appears, because of a fundamental tension that we place at the center of this work. Self-supervised photometric losses are scale-invariant, so naively fine-tuning a pretrained model to minimize reprojection error does not merely fail to learn absolute scale---it actively \emph{erodes} the metric and relative structure of the foundation model by driving its parameters toward scale-ambiguous solutions. Any successful adaptation must simultaneously (i) introduce a route for absolute scale that the photometric loss alone cannot provide, and (ii) protect the pretrained geometry from being washed out by that same loss.
+
+We resolve this tension with a single guiding principle---\emph{decouple metric scale from depth shape}---instantiated by three lightweight, complementary components. \textbf{First}, a scale--shift decoupling head lets the frozen decoder keep emitting the foundation model's sharp relative prediction, while a per-image affine transformation, regressed from the encoder's class (\texttt{CLS}) tokens, carries the two global degrees of freedom---scale and shift---needed to make it metric. Because the affine acts on a standardized depth field, gradients adjust \emph{scale} without distorting \emph{shape}. \textbf{Second}, absolute scale is injected only through the pose branch, by aligning predicted ego-motion magnitude with displacement from readily available GPS traces~\cite{chawla2021multimodal}; this metric reference then propagates to depth through the shared warping geometry. \textbf{Third}, a teacher distillation loss from the frozen foundation model, applied in a patch-wise scale-shift-invariant form, explicitly protects edges and thin structures from photometric erosion---and, being itself scale-shift-invariant, constrains shape without fighting the scale signal. A curriculum couples the two so distillation anchors structure early while GPS scale ramps in. The full adaptation is realized with Low-Rank Adaptation (LoRA)~\cite{hu2022lora}, training under $1\%$ of parameters and thereby preserving the model's zero-shot generalization. Our contributions are:
+
+\begin{itemize}
+    \item \textbf{Self-supervised metric adaptation of a relative foundation model.} We present, to our knowledge, the first framework that turns a frozen affine-invariant depth foundation model into a \emph{metric}, single-image predictor using only self-supervision and GPS---no depth ground truth, no LiDAR---while retaining its cross-domain generalization.
+    \item \textbf{Scale--shift decoupling.} We introduce a \texttt{CLS}-conditioned per-image affine head that separates the global metric component (scale and shift) from the dense relative geometry, so metric supervision can act on a low-dimensional, well-conditioned target without degrading the foundation model's fine structure.
+    \item \textbf{A training recipe that resolves the scale-invariance/erosion tension.} We combine GPS-anchored scale supervision, teacher scale-shift-invariant distillation, and a curriculum that couples them, together with a robust high-loss masking scheme that suppresses dynamic objects and occlusions without optical flow or semantics.
+    \item \textbf{Strong, data-efficient results.} Our single-image model matches or surpasses DepthAnything\,V2 with larger backbones, approaches a supervised metric foundation model, rivals recent self-supervised methods, generalizes across domains, and remains effective with as little as $1\%$ of the training data.
+\end{itemize}
+
+
+\section{Related work}\label{sec2}
+\input{related_work}
+
+\section{Proposed method}\label{sec3}
+\input{proposed}
+
+
+
+\section{Experiments}\label{sec4}
+\input{experiments}
+
+\section{Conclusion}\label{sec6}
+This paper introduced a self-supervised framework that turns a frozen affine-invariant depth foundation model into a metric, single-image depth predictor without any depth annotations. We identified the core obstacle---the scale-invariance of self-supervised photometric losses, which both prevents metric scale recovery and erodes the pretrained model's geometric structure---and resolved it through a single principle: decoupling metric scale from depth shape. A \texttt{CLS}-conditioned per-image affine head isolates the two global degrees of freedom (scale and shift) that make a relative prediction metric, GPS supervision injects absolute scale through the pose branch, and teacher scale-shift-invariant distillation protects fine structure from photometric erosion, all realized in under $1\%$ of trainable parameters via LoRA.
+
+Extensive experiments demonstrate that this lightweight adaptation yields metric depth competitive with both self-supervised methods and supervised metric foundation models, while preserving the edge fidelity and cross-domain generalization of the underlying model and remaining effective with as little as $1\%$ of the training data. By showing that metric scale can be grafted onto a relative foundation model through self-supervision alone, our work offers a practical, annotation-free path to metric depth. The main limitation is that GPS-derived scale is dataset-specific and does not transfer zero-shot across domains; future work will investigate scale priors that generalize and the extension of scale--shift decoupling to other geometric foundation tasks.
+
+%\bibliographystyle{cas-model2-names}
+\bibliographystyle{IEEEtran}
+\bibliography{cas-refs}
+
+
+
+%\newpage
+
+%\section{Biography Section}
+%If you have an EPS/PDF photo (graphicx package needed), extra braces are
+% needed around the contents of the optional argument to biography to prevent
+% the LaTeX parser from getting confused when it sees the complicated
+% $\backslash${\tt{includegraphics}} command within an optional argument. (You can create
+% your own custom macro containing the $\backslash${\tt{includegraphics}} command to make things
+% simpler here.)
+% 
+%\vspace{11pt}
+%
+%\bf{If you include a photo:}\vspace{-33pt}
+%\begin{IEEEbiography}[{\includegraphics[width=1in,height=1.25in,clip,keepaspectratio]{fig1}}]{Michael Shell}
+%Use $\backslash${\tt{begin\{IEEEbiography\}}} and then for the 1st argument use $\backslash${\tt{includegraphics}} to declare and link the author photo.
+%Use the author name as the 3rd argument followed by the biography text.
+%\end{IEEEbiography}
+%
+%\vspace{11pt}
+%
+%\bf{If you will not include a photo:}\vspace{-33pt}
+%\begin{IEEEbiographynophoto}{John Doe}
+%Use $\backslash${\tt{begin\{IEEEbiographynophoto\}}} and the author name as the argument followed by the biography text.
+%\end{IEEEbiographynophoto}
+
+\vfill
+
+\end{document}
+
+

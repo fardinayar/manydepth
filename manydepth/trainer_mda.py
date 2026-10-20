@@ -35,7 +35,9 @@ import matplotlib
 matplotlib.use("Agg")  # headless backend for batch/PBS (avoids hang when no DISPLAY)
 import matplotlib.pyplot as plt
 from PIL import Image
-from networks.replace_with_lora import replace_mlp_with_lora, replace_conv_with_loraconv
+from networks.replace_with_lora import (
+    replace_linear_with_lora, replace_conv_with_loraconv, encoder_lora_target_substrings,
+)
 _DEPTH_COLORMAP = plt.get_cmap('plasma', 256)  # for plotting
 
 
@@ -87,9 +89,11 @@ class Trainer:
             checkpoint_dir=self.opt.depth_anything_checkpoint_dir,
         )
         if not self.opt.no_lora:
-            print("Using LoRA in the encoder")
-            self.models['encoder'] = replace_mlp_with_lora(
-                self.models["encoder"], r=self.opt.lora_rank, lora_alpha=self.opt.lora_alpha, lora_dropout=self.opt.lora_dropout
+            print("Using LoRA in the encoder on: {}".format(self.opt.lora_encoder_targets))
+            self.models['encoder'] = replace_linear_with_lora(
+                self.models["encoder"], r=self.opt.lora_encoder_rank, lora_alpha=self.opt.lora_encoder_alpha,
+                lora_dropout=self.opt.lora_dropout,
+                target_names=encoder_lora_target_substrings(self.opt.lora_encoder_targets),
             )
             lora.mark_only_lora_as_trainable(self.models['encoder'])
             activated_pos_params = 0
@@ -152,7 +156,7 @@ class Trainer:
         if not self.opt.no_lora:
             print("Using LoRA in the depth decoder")
             self.models['depth'] = replace_conv_with_loraconv(
-                self.models["depth"], r=self.opt.lora_rank, lora_alpha=self.opt.lora_alpha, lora_dropout=self.opt.lora_dropout
+                self.models["depth"], r=self.opt.lora_decoder_rank, lora_alpha=self.opt.lora_decoder_alpha, lora_dropout=self.opt.lora_dropout
             )
             lora.mark_only_lora_as_trainable(self.models['depth'])
         print("Enable gradient for CLS scale-shift head")
@@ -341,9 +345,15 @@ class Trainer:
         val_dataset = self.dataset(
             self.opt.data_path, val_filenames, self.opt.height, self.opt.width,
             frames_to_load, 4, is_train=False, img_ext=img_ext, load_gps=self.g2s)
+        # val() consumes only one minibatch per log step, but its iterator is
+        # held persistently on self, so its workers stay resident for the whole
+        # run. With num_workers=12 + pin_memory that's ~12 extra worker procs
+        # plus non-swappable pinned buffers alongside the 12 train workers,
+        # which trips the cgroup memsw OOM. Keep val light.
+        val_num_workers = min(self.opt.num_workers, 2)
         self.val_loader = DataLoader(
             val_dataset, self.opt.batch_size, False,
-            num_workers=self.opt.num_workers, pin_memory=True, drop_last=False)
+            num_workers=val_num_workers, pin_memory=False, drop_last=False)
         self.val_iter = iter(self.val_loader)
 
         self.writers = {}
@@ -385,7 +395,7 @@ class Trainer:
         maximum_steps = self.opt.g2s_weight_factor * ((self.num_total_steps // self.opt.num_epochs))
         if maximum_steps <= 0:
             return 1
-        return (self.step / maximum_steps) ** 3 if self.step <= maximum_steps else 1
+        return (self.step / maximum_steps) ** 2 if self.step <= maximum_steps else 1
     
     def get_warmup_factor(self):
         """Calculate warmup factor for learning rate
@@ -719,36 +729,6 @@ class Trainer:
 
         return reprojection_loss_mask
 
-    @staticmethod
-    def compute_depth_edge_mask(disp, threshold=0.15, dilation=1):
-        """Mask pixels near detached disparity discontinuities."""
-        threshold = float(threshold)
-        if threshold <= 0.0:
-            return torch.zeros_like(disp[:, :1])
-
-        disp = disp.detach()
-        if disp.shape[1] != 1:
-            disp = disp.mean(dim=1, keepdim=True)
-
-        norm_disp = disp / (disp.mean(dim=(2, 3), keepdim=True) + 1e-7)
-        edge_score = torch.zeros_like(norm_disp)
-
-        grad_x = torch.abs(norm_disp[:, :, :, 1:] - norm_disp[:, :, :, :-1])
-        grad_y = torch.abs(norm_disp[:, :, 1:, :] - norm_disp[:, :, :-1, :])
-
-        edge_score[:, :, :, 1:] = torch.maximum(edge_score[:, :, :, 1:], grad_x)
-        edge_score[:, :, :, :-1] = torch.maximum(edge_score[:, :, :, :-1], grad_x)
-        edge_score[:, :, 1:, :] = torch.maximum(edge_score[:, :, 1:, :], grad_y)
-        edge_score[:, :, :-1, :] = torch.maximum(edge_score[:, :, :-1, :], grad_y)
-
-        edge_mask = (edge_score > threshold).float()
-        dilation = int(dilation)
-        if dilation > 0:
-            kernel_size = 2 * dilation + 1
-            edge_mask = F.max_pool2d(
-                edge_mask, kernel_size=kernel_size, stride=1, padding=dilation
-            )
-        return edge_mask
 
     @staticmethod
     def pose_translation_norm(translation):
@@ -763,7 +743,7 @@ class Trainer:
         return torch.norm(translation, dim=1)
 
     @staticmethod
-    def patch_ssi_loss(prediction, target, margin, patch_size=16, variance_threshold=1e-3):
+    def patch_ssi_loss(prediction, target, margin, patch_size=16, variance_threshold=1e-5):
         """Scale/shift-invariant patch loss for relative disparity supervision."""
         stride = patch_size // 2
         prediction_patches = F.unfold(prediction, kernel_size=patch_size, stride=stride)
@@ -792,11 +772,30 @@ class Trainer:
         )
         grad_x_loss = F.relu(grad_x_diff).mean(dim=(1, 2, 3))
         grad_y_loss = F.relu(grad_y_diff).mean(dim=(1, 2, 3))
-        patch_loss = 0 * patch_loss + 0.5 * (grad_x_loss + grad_y_loss)
+        patch_loss = patch_loss + 0.5 * (grad_x_loss + grad_y_loss)
         valid_mask = torch.min(prediction_var, target_var).squeeze(1) > variance_threshold
         loss = (patch_loss * valid_mask).sum(dim=-1) / (valid_mask.sum(dim=-1) + 1e-7)
 
         return loss.mean(), patch_loss
+
+    @staticmethod
+    def global_ssi_loss(prediction, target, eps=1e-5):
+        """Whole-image scale/shift-invariant L1 loss for global relative disparity supervision.
+
+        Unlike patch_ssi_loss (which normalizes each 32x32 patch independently and thus only
+        constrains local shape), this normalizes the full image so global depth ordering and
+        cross-patch structure (e.g. far-field layout) are matched to the teacher.
+        """
+        b = prediction.shape[0]
+        pred = prediction.reshape(b, -1)
+        tgt = target.reshape(b, -1)
+        pred_mean = pred.mean(dim=1, keepdim=True)
+        tgt_mean = tgt.mean(dim=1, keepdim=True)
+        pred_var = ((pred - pred_mean) ** 2).mean(dim=1, keepdim=True)
+        tgt_var = ((tgt - tgt_mean) ** 2).mean(dim=1, keepdim=True)
+        pred_norm = (pred - pred_mean) / torch.sqrt(pred_var + eps)
+        tgt_norm = (tgt - tgt_mean) / torch.sqrt(tgt_var + eps)
+        return torch.abs(pred_norm - tgt_norm).mean(dim=1).mean()
 
     def compute_losses(self, inputs, outputs, is_student=False):
         """Compute the reprojection, smoothness and proxy supervised losses for a minibatch
@@ -840,41 +839,13 @@ class Trainer:
                 identity_reprojection_loss,
             )
 
-            if self.opt.ignore_depth_edge_pixels:
-                edge_source = outputs.get(("mono_disp", scale), disp)
-                ignored_depth_edge_mask = self.compute_depth_edge_mask(
-                    edge_source,
-                    threshold=self.opt.depth_edge_mask_threshold,
-                    dilation=self.opt.depth_edge_mask_dilation,
-                )
-                if ignored_depth_edge_mask.shape[-2:] != reprojection_loss_mask.shape[-2:]:
-                    ignored_depth_edge_mask = F.interpolate(
-                        ignored_depth_edge_mask,
-                        size=reprojection_loss_mask.shape[-2:],
-                        mode="nearest",
-                    )
-                ignored_depth_edge_mask = ignored_depth_edge_mask.to(
-                    device=reprojection_loss_mask.device,
-                    dtype=reprojection_loss_mask.dtype,
-                )
-                ignored_depth_edge_mask = ignored_depth_edge_mask * (
-                    reprojection_loss_mask > 0
-                ).to(dtype=reprojection_loss_mask.dtype)
-                reprojection_loss_mask = reprojection_loss_mask * (
-                    1.0 - ignored_depth_edge_mask
-                )
-            else:
-                ignored_depth_edge_mask = torch.zeros_like(
-                    reprojection_loss_mask, device=reprojection_loss.device
-                )
-            outputs[("depth_edge_mask", scale)] = ignored_depth_edge_mask.detach()
 
             # ------------------------------------------------------------------
             # Optionally ignore the highest-loss pixels among the already valid
             # pixels, and visualize which pixels were ignored.
             # ------------------------------------------------------------------
             if self.opt.ignore_high_low_loss_pixels:
-                top_percent = 0.1  # ignore top 20% highest-loss pixels over the full batch
+                top_percent = 0.4  # ignore top 20% highest-loss pixels over the full batch
 
                 valid = reprojection_loss_mask > 0
                 ignored_high_loss_mask = torch.zeros_like(
@@ -922,7 +893,7 @@ class Trainer:
             # consistency loss:
             if is_student and not self.opt.no_consistency_loss:
 
-                patch_size = 16
+                patch_size = 32
                 multi_disp = outputs[("disp", scale)]
                 mono_disp = outputs[("mono_disp", scale)].detach()
 
@@ -943,12 +914,21 @@ class Trainer:
                 
                 # Combine losses
                 if not self.opt.no_loss_dynamic_weight:
-                    ssi_weight = (1-self.g2s_weight())/10
+                    ssi_weight = (1-self.g2s_weight()) / 100
                 else:
                     ssi_weight = 0.01
                 
                 consistency_loss = (ssi_weight * ssi_loss)
-                
+
+                # Optional whole-image SSI term: constrains global depth ordering and
+                # cross-patch (e.g. far-field) structure the patch term cannot see.
+                if self.opt.consistency_global_ssi:
+                    global_ssi = self.global_ssi_loss(multi_disp, mono_disp)
+                    losses['global_ssi_loss/{}'.format(scale)] = global_ssi.detach()
+                    consistency_loss = consistency_loss + (
+                        ssi_weight * self.opt.consistency_global_ssi_weight * global_ssi
+                    )
+
                 losses['consistency_loss/{}'.format(scale)] = consistency_loss
             else:
                 consistency_loss = 0
@@ -969,14 +949,12 @@ class Trainer:
 
         total_loss /= self.num_scales
 
-
-
         if self.g2s and is_student:
             #TRANSLATIONS
             t12 = self.pose_translation_norm(outputs[("translation", 0, -1)])
             t23 = self.pose_translation_norm(outputs[("translation", 0, 1)])
 
-            eps = 1e-4
+            eps = 1e-5
             min_gps_motion = 0.05
 
             pred_t = torch.stack([t12, t23], dim=1).clamp_min(eps)
@@ -999,7 +977,7 @@ class Trainer:
                 losses["scale"] = pred_t.new_tensor(0.0)
             
             if not self.opt.no_loss_dynamic_weight:
-                total_loss += self.g2s_weight() * g2s_loss 
+                total_loss += self.g2s_weight() * g2s_loss * 0.5
             else:
                 total_loss += g2s_loss
             losses["g2s_loss"] = g2s_loss.detach()
@@ -1104,11 +1082,6 @@ class Trainer:
                     "high_loss_mask_{}/{}".format(s, j),
                     high_loss_mask_img, self.step)
 
-            if ("depth_edge_mask", s) in outputs:
-                depth_edge_mask_img = colormap(outputs[("depth_edge_mask", s)][j, 0])
-                writer.add_image(
-                    "depth_edge_mask_{}/{}".format(s, j),
-                    depth_edge_mask_img, self.step)
 
         self.save_depth_prediction_images(mode, outputs)
 
@@ -1189,6 +1162,12 @@ class Trainer:
             "--load_weights_folder", save_folder,
             "--data_path", self.opt.data_path,
             "--eval_split", self.opt.eval_split,
+            # Cap eval-time host RAM: the parent training process stays fully
+            # resident while this subprocess.run blocks, so inheriting the
+            # training batch_size/num_workers (e.g. 12/12) trips the cgroup OOM
+            # during the first batch prefetch. Eval doesn't need a large batch.
+            "--batch_size", "4",
+            "--num_workers", "2",
         ]
         print("Running test-set evaluation: {}".format(" ".join(cmd)))
         subprocess.run(cmd, cwd=repo_root, check=True)

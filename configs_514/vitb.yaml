@@ -1,0 +1,20 @@
+# DepthAnything ViT-B, higher-resolution training variant.
+# Inherits every key from configs/base.yaml and overrides only the ones below.
+# Use with: python manydepth/train.py -c configs_514/vitb.yaml
+extends: ../configs/base.yaml
+
+# Run identity
+model_name: "mdp_518_vitb"        # Subfolder name under log_dir for this run
+
+# Higher input resolution (both multiples of 14; keeps ~3.3:1 KITTI aspect)
+height: 378
+width: 1246
+max_depth: 1000.0                 # Larger depth cap for the higher-res variant
+
+# Fit the encoder / higher resolution in memory
+batch_size: 3
+gradient_accumulation_steps: 4    # Effective batch = batch_size * this = 12 (matches base)
+
+# DepthAnything ViT-B encoder, and let its cls_token / pos_embed adapt
+depth_anything_encoder: "vitb"
+encoder_token_lr_coef: 1

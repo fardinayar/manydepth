@@ -1,0 +1,76 @@
+#!/bin/bash -l
+#PBS -N cityscapes_download
+#PBS -q regular-c
+#PBS -l select=1
+#PBS -l walltime=18:00:00
+#PBS -W group_list=gn21
+#PBS -j oe
+
+set -euo pipefail
+umask 077
+
+cd "${PBS_O_WORKDIR}"
+
+DEST="/work/gn21/share/datasets/cityscapes"
+PACKAGE_ID="14"
+
+mkdir -p "${DEST}"
+
+if [[ -z "${CITYSCAPES_USER:-}" || -z "${CITYSCAPES_PASS:-}" ]]; then
+    echo "ERROR: submit with CITYSCAPES_USER and CITYSCAPES_PASS"
+    exit 1
+fi
+
+WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/cityscapes_${PBS_JOBID}.XXXXXX")"
+COOKIE_FILE="${WORKDIR}/cookies.txt"
+POST_FILE="${WORKDIR}/post.txt"
+LOGIN_HTML="${WORKDIR}/login.html"
+
+cleanup() {
+    rm -rf "${WORKDIR}"
+}
+trap cleanup EXIT
+
+urlencode() {
+    local s="${1}"
+    local out=""
+    local i c
+    LC_ALL=C
+    for ((i=0; i<${#s}; i++)); do
+        c="${s:i:1}"
+        case "${c}" in
+            [a-zA-Z0-9.~_-]) out+="${c}" ;;
+            *) printf -v out '%s%%%02X' "${out}" "'${c}" ;;
+        esac
+    done
+    printf '%s' "${out}"
+}
+
+printf 'username=%s&password=%s&submit=Login' \
+    "$(urlencode "${CITYSCAPES_USER}")" \
+    "$(urlencode "${CITYSCAPES_PASS}")" > "${POST_FILE}"
+
+echo "Logging in to Cityscapes..."
+wget \
+    --keep-session-cookies \
+    --save-cookies "${COOKIE_FILE}" \
+    --post-file "${POST_FILE}" \
+    "https://www.cityscapes-dataset.com/login/" \
+    -O "${LOGIN_HTML}" \
+    --quiet
+
+echo "Downloading packageID=${PACKAGE_ID} to ${DEST}"
+wget \
+    --load-cookies "${COOKIE_FILE}" \
+    --content-disposition \
+    --continue \
+    --tries=0 \
+    --waitretry=60 \
+    --timeout=120 \
+    --retry-connrefused \
+    "https://www.cityscapes-dataset.com/file-handling/?packageID=${PACKAGE_ID}" \
+    -P "${DEST}"
+
+echo "Done."
+ls -lh "${DEST}"
+

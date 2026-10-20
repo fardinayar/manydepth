@@ -1,0 +1,4 @@
+# Ablation: do not ignore the top high-loss pixels (keep all pixels in the reprojection loss).
+extends: base.yaml
+ignore_high_low_loss_pixels: false
+model_name: "mdp_no_ignore_high_low_loss"

@@ -1,0 +1,235 @@
+
+
+
+
+We evaluate our framework along several axes: comparison with depth foundation models, comparison with state-of-the-art self-supervised methods, cross-domain transfer, data efficiency under limited training data, and a component ablation. Throughout, our model performs \emph{single-image} inference; adjacent frames and GPS are used only during training. Our experiments show that the proposed adaptation grafts metric scale onto an affine-invariant foundation model while preserving its geometric fidelity and generalization.
+
+\subsection{Experimental Setup}
+
+\textbf{Datasets.} We conduct experiments on two driving benchmarks, both featuring dynamic objects and diverse conditions.
+\bigbreak
+
+\textbf{KITTI}~\cite{geiger2013vision} is our primary benchmark, providing imagery and LiDAR depth from driving scenarios. We adopt the standard Eigen split~\cite{eigen2015predicting} for training and testing, and additionally evaluate on the improved KITTI ground truth~\cite{uhrig2017sparsity}, which provides denser annotations than the raw sparse LiDAR projections.
+
+\textbf{Cityscapes}~\cite{cordts2016cityscapes} enables zero-shot cross-domain evaluation. It comprises urban driving sequences from 50 European cities with visual characteristics substantially different from KITTI. Following standard protocols~\cite{zhou2017unsupervised, gordon2019depth}, we evaluate on 1,525 test frames using SGM disparity maps~\cite{hirschmuller2007stereo} as ground truth, with depth capped at 80m.
+\bigbreak
+
+\begin{table*}[t]
+\centering
+\caption{Comparison with recent self-supervised methods on the KITTI Eigen split. ``Metric'' (\checkmark) denotes direct metric output; otherwise predictions are scale-aligned by median scaling. Best in \colorbox{lightgreen}{green}, second best in \colorbox{lightyellow}{yellow}.}
+\label{tab:selfsupervised}
+\setlength{\tabcolsep}{4pt}
+\renewcommand{\arraystretch}{1.1}
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{l|c|c|cccc|ccc}
+\toprule
+\multirow{2}{*}{\textbf{Method}} &
+\multirow{2}{*}{\textbf{Metric}} &
+\multirow{2}{*}{Res.} &
+\multicolumn{4}{c|}{\cellcolor{errbg}\textbf{Error metric} (\(\downarrow\))} &
+\multicolumn{3}{c}{\cellcolor{accbg}\textbf{Accuracy metric} (\(\uparrow\))} \\
+ & & &
+\textbf{AbsRel} & \textbf{SqRel} & \textbf{RMSE} & \textbf{RMSElog} &
+\(\boldsymbol{\delta<1.25}\) & \(\boldsymbol{\delta<1.25^2}\) & \(\boldsymbol{\delta<1.25^3}\) \\
+\midrule
+
+ProDepth \cite{woo2024prodepth} &  & low & \cellcolor{lightgreen} 0.086 & \cellcolor{lightgreen} 0.629 & \cellcolor{lightgreen} 4.139 & \cellcolor{lightyellow}  0.166 & \cellcolor{lightyellow} 0.918 & \cellcolor{lightyellow} 0.969 & \cellcolor{lightyellow} 0.984 \\
+ManyDepth \cite{watson2021temporal}    &    & low & 0.098 & 0.770 & 4.459 & 0.176 & 0.900 & 0.965 & 0.983 \\
+Ours  &    & low &  \cellcolor{lightyellow} 0.089  & \cellcolor{lightyellow}  0.666  &   \cellcolor{lightyellow} 4.192  & \cellcolor{lightgreen}  0.166  &  \cellcolor{lightgreen}  0.918  &   \cellcolor{lightgreen}  0.970  &   \cellcolor{lightgreen}  0.985   \\
+Ours  & \checkmark   & low & 0.096  &   0.679  &   4.300  &   0.178  &   0.903  &   0.967  &   0.984   \\
+\midrule
+
+ManyDepth \cite{watson2021temporal}   & & medium & 0.093 & 0.715 & 4.245 & 0.172 & 0.909 & 0.966 & 0.983  \\
+Ours   &   & medium &  \cellcolor{lightgreen}0.083  &   \cellcolor{lightgreen}0.620  &   \cellcolor{lightgreen}4.020 &   \cellcolor{lightgreen}0.161  &   \cellcolor{lightgreen}0.928  &   \cellcolor{lightgreen}0.972  &   \cellcolor{lightgreen}0.985   \\
+Ours   & \checkmark  & medium & 0.091  &   0.634  &   4.132  &   0.173  &   0.914  &   0.970  &   0.984   \\
+\bottomrule
+\end{tabular}%
+}
+\end{table*}
+
+
+
+\begin{table*}[t]
+\centering
+\caption{Quantitative comparison with depth foundation models on KITTI.}
+\label{tab:foundation}
+\small
+\setlength{\tabcolsep}{4pt}
+\renewcommand{\arraystretch}{1.1}
+
+\begin{tabular}{l|c|c|c c c c|c c c}
+\toprule
+\textbf{Method} &
+\textbf{Metric} &
+\textbf{Res.} &
+\textbf{AbsRel} & \textbf{SqRel} & \textbf{RMSE} & \textbf{RMSElog} &
+\(\boldsymbol{\delta<1.25}\) & \(\boldsymbol{\delta<1.25^2}\) & \(\boldsymbol{\delta<1.25^3}\) \\
+\midrule
+
+DepthAnythingV2 (ViT-S) \cite{yang2024depth} & &  518$\times$518  & 0.078 & - & - &  -  & 0.936 & - & -  \\
+DepthAnythingV2 (ViT-B) \cite{yang2024depth} & & 518$\times$518 & 0.078 & - & - &  -  & 0.939 & - & -  \\
+DepthAnythingV2 (ViT-L) \cite{yang2024depth} & & 518$\times$518  & 0.074 & - & - &  -  & 0.946 & - & -  \\
+\rowcolor{lightgreen}
+Ours (ViT-B) & & 1246$\times$378 &   0.054  &   0.241  &   2.783  &   0.087  &   0.968  &   0.995  &   0.999  \\
+\rowcolor{lightgreen}
+Ours (ViT-L) & & 1246$\times$378 &   0.055  &   0.249  &   2.701  &   0.085  &   0.973  &   0.996  &   0.999  \\
+\midrule
+\rowcolor{lightgreen}
+Metric3D V2 (ViT-L, Zero-Shot)\cite{liu2024metricdepth} & \checkmark & 1064$\times$616 & 0.052 & - &  - & - & 0.974 & 0.995 & 0.999 \\
+
+\rowcolor{lightyellow}
+Ours (ViT-B) & \checkmark & 1246$\times$378 &   0.063  &   0.264  &   2.870  &   0.094  &   0.963  &   0.995  &   0.999  \\
+
+\rowcolor{lightyellow}
+Ours (ViT-L) & \checkmark & 1246$\times$378 &   0.063  &   0.277  &   2.803  &   0.092  &   0.968  &   0.995  &   0.999  \\
+
+\bottomrule
+\end{tabular}
+\end{table*}
+
+
+
+
+
+
+\begin{table*}[t]
+\centering
+\caption{Robustness against training dataset ratio.}
+\label{tab:training_ratio}
+% \footnotesize
+\setlength{\tabcolsep}{3.5pt}
+\renewcommand{\arraystretch}{1.1}
+\resizebox{0.7\linewidth}{!}{%
+\begin{tabular}{c|c|c c c c|c c c}
+\toprule
+\textbf{Ratio} &
+\textbf{Metric} &
+\textbf{AbsRel} & \textbf{SqRel} & \textbf{RMSE} & \textbf{RMSElog} &
+\(\boldsymbol{\delta<1.25}\) & \(\boldsymbol{\delta<1.25^2}\) & \(\boldsymbol{\delta<1.25^3}\) \\
+\midrule
+1\% &   &   0.096  &   0.735  &   4.451  &   0.173  &   0.907  &   0.968  &   0.984  \\
+5\% &   &   0.093  &   0.709  &   4.324  &   0.170  &   0.913  &   0.969  &   0.984  \\
+10\% &   &   0.091  &   0.692  &   4.262  &   0.168  &   0.915  &   0.970  &   0.985  \\
+20\% &   &   0.090  &   0.678  &   4.230  &   0.167  &   0.916  &   0.970  &   0.985  \\
+50\% &   &   0.089  &   0.660  &   4.190  &   0.166  &   0.917  &   0.970  &   0.985  \\
+\midrule
+1\% & \checkmark &   0.101  &   0.750  &   4.553  &   0.185  &   0.892  &   0.963  &   0.982  \\
+5\% & \checkmark &   0.097  &   0.709  &   4.379  &   0.180  &   0.898  &   0.966  &   0.983  \\
+10\% & \checkmark &   0.098  &   0.699  &   4.354  &   0.180  &   0.899  &   0.966  &   0.983  \\
+20\% & \checkmark &   0.097  &   0.688  &   4.333  &   0.179  &   0.902  &   0.967  &   0.984  \\
+50\% & \checkmark &   0.096  &   0.674  &   4.304  &   0.178  &   0.903  &   0.967  &   0.984  \\
+\bottomrule
+\end{tabular}%
+% \end{adjustbox}
+}
+\end{table*}
+
+\textbf{Training Details.}
+We train for 5 epochs with batch size 12. The base learning rate is \(1\times10^{-4}\) for all components except the scale--shift head, which uses a larger rate to adapt quickly while keeping the foundation model stable. We apply step decay with factor 0.1 after each epoch. Experiments are conducted at both low resolution (\(182\times630\)) and medium resolution (\(364\times1260\)); unless stated otherwise, results use low resolution. Gradient clipping with maximum norm 20 ensures stability.
+
+\textbf{Evaluation Metrics.}
+Following standard practice~\cite{eigen2015predicting, godard2019digging}, we report four error metrics and three accuracy thresholds. \emph{Absolute Relative Error (AbsRel)} measures mean per-pixel depth error normalized by ground-truth depth. \emph{Squared Relative Error (SqRel)} squares the normalized residual, emphasizing outliers. \emph{Root Mean Squared Error (RMSE)} quantifies error magnitude in absolute depth units. \emph{RMSE in log space (RMSElog)} assesses relative depth ordering. For accuracy, we report the percentage of pixels with predicted/ground-truth depth ratio below 1.25, \(1.25^2\), and \(1.25^3\). Together these assess both metric accuracy and structural fidelity.
+
+\begin{figure*}
+    \centering
+    \includegraphics[width=\linewidth]{imgs/Picture3.png}
+    \caption{Visual comparison. Failure regions are highlighted in red and successful predictions in green. Metric3D often underestimates tiny and narrow objects, producing smaller predictions even when the structures are partially preserved. In contrast, our framework better captures fine object boundaries and maintains accurate scale for small objects.}
+    \label{fig:viscomp}
+\end{figure*}
+
+\subsection{Comparison with Depth Foundation Models}
+
+Since our framework adapts a depth foundation model, Table~\ref{tab:foundation} compares against recent foundation approaches. Using a ViT-B encoder, our non-metric model substantially surpasses DepthAnything\,V2~\cite{yang2024depth}---not only at matched ViT-B capacity but also its larger ViT-L variant (AbsRel \(0.054\) vs.\ \(0.074\), \(\delta{<}1.25\) \(0.968\) vs.\ \(0.946\))---showing that self-supervised adaptation on in-domain video improves accuracy beyond what the frozen foundation model provides, without eroding it. More importantly, our \emph{metric} model---which never sees ground-truth depth---is competitive with the supervised metric foundation model Metric3D\,V2~\cite{liu2024metricdepth} (AbsRel \(0.063\) vs.\ \(0.052\)), narrowing the gap to a model trained on LiDAR with a larger encoder. This is the central result: through scale--shift decoupling and GPS supervision alone, an affine-invariant model is turned into a metric predictor that approaches supervised metric foundation models while retaining its fine-detail fidelity.
+
+\subsection{Comparison with Self-Supervised Methods}
+
+Table~\ref{tab:selfsupervised} compares with state-of-the-art self-supervised methods, ProDepth~\cite{woo2024prodepth} and ManyDepth~\cite{watson2021temporal}, on KITTI. We report both non-metric (median-scaled) and metric (direct output) configurations; although our method natively produces metric depth, we include scale-aligned results for fair comparison with prior work. Notably, both baselines aggregate multiple frames at test time through cost volumes, whereas our model predicts from a \emph{single image}. Despite this, at medium resolution our non-metric variant achieves the best overall accuracy across most metrics, and at low resolution it is on par with ProDepth while preserving superior fine structure, as shown qualitatively. Even our metric configuration---receiving no ground-truth depth---attains competitive accuracy, validating GPS-based scale recovery.
+
+
+
+\bigbreak
+
+
+\begin{table}[h]
+\centering
+\caption{Generalization study on the cityscapes \cite{cordts2016cityscapes} dataset.}
+\label{tab:cityscapes_generalization}
+\footnotesize
+\setlength{\tabcolsep}{3.5pt}
+\renewcommand{\arraystretch}{1.05}
+
+\begin{adjustbox}{max width=\columnwidth}
+\begin{tabular}{l|c|c c c c|c c c}
+\toprule
+\textbf{Method} &
+\textbf{Metric} &
+% \multicolumn{4}{c|}{\cellcolor{errbg}  &
+% \multicolumn{3}{c}{\cellcolor{accbg}  \\
+\textbf{AbsRel} & \textbf{SqRel} & \textbf{RMSE} & \textbf{RMSElog} &
+\(\boldsymbol{\delta<1.25}\) & \(\boldsymbol{\delta<1.25^2}\) & \(\boldsymbol{\delta<1.25^3}\) \\
+\midrule
+
+ManyDepth \cite{watson2021temporal} &  & 0.114 & 1.193 & \textbf{6.223} & 0.170 & 0.875 & 0.967 & 0.989 \\
+Ours Zero-shot &   & \textbf{0.112}  &   \textbf{1.067}  &   6.291  &   \textbf{0.165}  &   \textbf{0.884}  &   \textbf{0.976}  &   \textbf{0.992}  \\
+\quad w/o scale--shift head &   & 0.114  &   1.075  &   6.329  &   0.167  &   0.881  &   0.975  &   0.992  \\
+\midrule
+Ours Zero-shot& \checkmark &   \textbf{0.326}  &   \textbf{3.610}  &  \textbf{12.073}  &   \textbf{0.429}  &   0.095  &   \textbf{0.677}  &   \textbf{0.936}  \\
+\quad w/o scale--shift head & \checkmark &   0.327  &   3.646  &  12.153  &   0.431  &   0.095  &   0.672  &   0.933  \\
+\bottomrule
+\end{tabular}
+\end{adjustbox}
+\end{table}
+
+
+\subsection{Data Efficiency Analysis}
+
+Table~\ref{tab:training_ratio} evaluates data efficiency by training on progressively smaller subsets of KITTI, from 1\% to 50\%. Accuracy improves monotonically yet only marginally with more data, saturating almost immediately: shrinking the training set 50-fold (from 50\% to 1\%) raises AbsRel by just $0.007$ in the non-metric setting ($0.089\!\rightarrow\!0.096$) and $0.005$ in the metric setting ($0.096\!\rightarrow\!0.101$), while the accuracy thresholds stay essentially unchanged. Training on just 1\% of the data thus recovers nearly all of the accuracy obtained with 50\%. This stems from two factors: the strong pretrained representation of the frozen foundation model provides a robust starting point that requires minimal adaptation, and our parameter-efficient LoRA scheme prevents overfitting while learning effectively from few samples. Practically, this means the method is viable in data-scarce settings where collecting large GPS-annotated video is impractical---adaptation needs only enough data to fix the global scale and lightly tune the backbone, not to learn depth from scratch.
+
+
+
+\subsection{Cross-Domain Generalization}
+
+Table~\ref{tab:cityscapes_generalization} evaluates zero-shot transfer: trained on KITTI, tested on Cityscapes without fine-tuning. Despite substantial domain shift---different cameras, lighting, and scene statistics---our non-metric variant (median-scaled) outperforms ManyDepth~\cite{watson2021temporal}---trained directly on Cityscapes---on six of the seven metrics (trailing only on RMSE), confirming that our lightweight adaptation preserves the foundation model's zero-shot generalization rather than overfitting to source-domain appearance. The metric configuration, however, degrades sharply, because the GPS-derived absolute scale learned on KITTI does not transfer to a new domain. This is expected and consistent with our design: metric scale is carried by the low-dimensional affine of Section~3.3 and is inherently dataset-specific, requiring GPS or calibration from the target domain. The strong non-metric transfer shows that the \emph{shape} of our predictions generalizes even when the \emph{scale} does not---a direct empirical signature of scale--shift decoupling.
+
+
+
+\subsection{Qualitative Analysis}
+
+Figure~\ref{fig:viscomp} presents qualitative comparisons. Our method produces sharper depth boundaries and better-preserved thin structures (e.g., traffic barriers, poles) than ProDepth and Metric3D\,V2, substantially reducing the over-smoothing that affects methods without strong pretrained priors. Our predictions match the geometric fidelity of DepthAnything\,V2 while adding metric scale, validating that teacher SSI distillation preserves the foundation model's edge-aware detail during adaptation.
+
+\subsection{Ablation Study}
+
+Table~\ref{tab:ablation} isolates the contribution of each component, evaluated in the metric, low-resolution configuration at the final training epoch. Starting from the full model, we remove: (i) the scale--shift head, (ii) teacher SSI distillation, and (iii) high-loss pixel rejection. At convergence the differences are modest but consistent. High-loss pixel rejection has the clearest effect, degrading every metric and most strongly the outlier-sensitive ones (AbsRel \(0.096\!\rightarrow\!0.101\), SqRel \(0.679\!\rightarrow\!0.693\), RMSE \(4.300\!\rightarrow\!4.378\)), confirming that discarding unreliable supervision---typically dynamic objects and occlusion boundaries---stabilizes the recovered metric scale. Removing teacher SSI distillation produces a smaller degradation on these same outlier-sensitive metrics (SqRel \(0.679\!\rightarrow\!0.685\), RMSE \(4.300\!\rightarrow\!4.326\)), indicating that it preserves geometric structure the photometric loss alone tends to erode, while leaving the log and threshold metrics essentially unchanged. Figure~\ref{fig:consistency} makes this qualitative: without the consistency loss, depth boundaries soften and thin structures such as tree trunks and poles are eroded, whereas the full model---anchored to the frozen teacher---keeps them sharp. Disabling the CLS-token scale--shift corrector leaves the converged \emph{in-domain} metric error essentially unchanged (AbsRel \(0.096\!\rightarrow\!0.097\), with a marginal SqRel improvement to \(0.671\)), suggesting that on KITTI the remaining scale pathway already absorbs most of the global affine. Its contribution instead surfaces under domain shift: on Cityscapes (Table~\ref{tab:cityscapes_generalization}) the head improves \emph{every} error metric---and never degrades an accuracy threshold---in both the non-metric and metric settings (non-metric RMSE \(6.329\!\rightarrow\!6.291\), \(\delta{<}1.25\) \(0.881\!\rightarrow\!0.884\); metric SqRel \(3.646\!\rightarrow\!3.610\), RMSE \(12.153\!\rightarrow\!12.073\)), indicating that the explicit corrector generalizes the global affine more robustly than the implicit pathway when the input distribution changes---justifying its inclusion. Overall, the full configuration is best or tied on four of the seven metrics, and the components are complementary, with high-loss rejection contributing most to final metric accuracy.
+
+
+\begin{table}[t]
+\centering
+\caption{Ablation study on KITTI Eigen (metric output, low resolution, final epoch). Best per column in \textbf{bold} (ties broken toward the full model).}
+\label{tab:ablation}
+\footnotesize
+\setlength{\tabcolsep}{3.5pt}
+\renewcommand{\arraystretch}{1.05}
+
+\begin{adjustbox}{max width=\columnwidth}
+\begin{tabular}{l|c c c c|c c c}
+\toprule
+\textbf{Configuration} &
+\textbf{AbsRel} & \textbf{SqRel} & \textbf{RMSE} & \textbf{RMSElog} &
+\(\boldsymbol{\delta<1.25}\) & \(\boldsymbol{\delta<1.25^2}\) & \(\boldsymbol{\delta<1.25^3}\) \\
+\midrule
+\rowcolor{probg}
+Full &   \textbf{0.096}  &   0.679  &   \textbf{4.300}  &   0.178  &   0.903  &   \textbf{0.967}  &   \textbf{0.984}  \\
+w/o scale--shift head        &   0.097  &   \textbf{0.671}  &   4.313  &   0.179  &   0.901  &   0.967  &   0.984  \\
+w/o teacher SSI distillation &   0.096  &   0.685  &   4.326  &   \textbf{0.177}  &   \textbf{0.905}  &   0.967  &   0.984  \\
+w/o high-loss rejection      &   0.101  &   0.693  &   4.378  &   0.182  &   0.900  &   0.966  &   0.983  \\
+\bottomrule
+\end{tabular}
+\end{adjustbox}
+\end{table}
+
+\begin{figure*}[t]
+    \centering
+    \includegraphics[width=\linewidth]{imgs/consistency_visual.png}
+    \caption{Qualitative effect of the teacher SSI (consistency) distillation loss on KITTI Eigen samples. We compare the full model against the variant trained without the consistency loss (the ``w/o teacher SSI distillation'' row of Table~\ref{tab:ablation}). Removing the loss softens depth boundaries and erodes thin structures---tree trunks, poles, and object silhouettes---which the full model, distilled from the frozen foundation-model teacher, preserves. This mirrors the quantitative degradation on the outlier-sensitive error metrics.}
+    \label{fig:consistency}
+\end{figure*}

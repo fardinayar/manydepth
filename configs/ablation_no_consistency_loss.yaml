@@ -1,0 +1,4 @@
+# Ablation: disable the teacher SSI consistency (distillation) loss.
+extends: base.yaml
+no_consistency_loss: true
+model_name: "mdp_no_consistency_loss"

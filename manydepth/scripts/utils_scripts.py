@@ -17,7 +17,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from config import TrainConfig
 from layers import disp_to_depth
 import networks
-from networks.replace_with_lora import replace_mlp_with_lora, replace_conv_with_loraconv
+from networks.replace_with_lora import (
+    replace_linear_with_lora, replace_conv_with_loraconv, encoder_lora_target_substrings,
+)
 
 try:
     import open3d as o3d
@@ -131,16 +133,17 @@ def setup_models(
             use_cls_scale_shift=getattr(saved_cfg, "use_cls_scale_shift", False),
         )
         if not saved_cfg.no_lora:
-            encoder = replace_mlp_with_lora(
+            encoder = replace_linear_with_lora(
                 encoder,
-                r=saved_cfg.lora_rank,
-                lora_alpha=saved_cfg.lora_alpha,
+                r=saved_cfg.lora_encoder_rank,
+                lora_alpha=saved_cfg.lora_encoder_alpha,
                 lora_dropout=0.0,
+                target_names=encoder_lora_target_substrings(saved_cfg.lora_encoder_targets),
             )
             depth_decoder = replace_conv_with_loraconv(
                 depth_decoder,
-                r=saved_cfg.lora_rank,
-                lora_alpha=saved_cfg.lora_alpha,
+                r=saved_cfg.lora_decoder_rank,
+                lora_alpha=saved_cfg.lora_decoder_alpha,
                 lora_dropout=0.0,
             )
 

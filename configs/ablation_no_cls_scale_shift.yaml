@@ -1,0 +1,4 @@
+# Ablation: disable the CLS-token scale-shift disparity predictor.
+extends: base.yaml
+use_cls_scale_shift: false
+model_name: "mdp_no_cls_scale_shift"

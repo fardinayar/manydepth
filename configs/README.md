@@ -36,12 +36,17 @@ Then a single `-c configs/ablation_no_lora.yaml` gives you the full base plus th
 - **`base.yaml`** – full default set; use as the common base for experiments.
 - **`ablation_*.yaml`** – each extends `base.yaml` and overrides only the relevant flag(s) and `model_name`. No need to write a full config per ablation.
 
-| Config | Override | model_name |
+Each ablation turns **one component off** relative to the full model in `base.yaml`.
+
+| Config | Override (component removed) | model_name |
 |--------|----------|------------|
 | `ablation_no_lora.yaml` | no_lora: true | mdp_no_lora |
 | `ablation_no_consistency_loss.yaml` | no_consistency_loss: true | mdp_no_consistency_loss |
 | `ablation_no_loss_dynamic_weight.yaml` | no_loss_dynamic_weight: true | mdp_no_loss_dynamic_weight |
-| `ablation_no_ignore_high_low_loss.yaml` | ignore_high_low_loss_pixels: false (disables high-loss filtering) | mdp_no_ignore_high_low_loss |
+| `ablation_no_ignore_high_low_loss.yaml` | ignore_high_low_loss_pixels: false | mdp_no_ignore_high_low_loss |
+| `ablation_no_cls_scale_shift.yaml` | use_cls_scale_shift: false | mdp_no_cls_scale_shift |
+| `ablation_no_g2s.yaml` | g2s: false | mdp_no_g2s |
+| `ablation_pose_from_scratch.yaml` | pose_from_scratch: true | mdp_pose_from_scratch |
 
 ### Using one config file
 

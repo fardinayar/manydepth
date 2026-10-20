@@ -1,0 +1,63 @@
+#!/bin/bash -l
+#PBS -N cityscapes_prepare
+#PBS -q regular-c
+#PBS -l select=1:ncpus=8
+#PBS -l walltime=24:00:00
+#PBS -W group_list=gn21
+#PBS -j oe
+
+set -euo pipefail
+
+CITYSCAPES_DIR="/work/gn21/share/datasets/cityscapes"
+DUMP_ROOT="/work/gn21/share/datasets/cityscapes_preprocessed"
+SCRIPT_DIR="/work/gn21/h62001/manydepth"
+
+# Rename the misnamed zip
+cd "${CITYSCAPES_DIR}"
+if [[ -f "index.html?packageID=14" && ! -f "leftImg8bit_sequence_trainvaltest.zip" ]]; then
+    echo "Renaming index.html?packageID=14 -> leftImg8bit_sequence_trainvaltest.zip"
+    mv "index.html?packageID=14" leftImg8bit_sequence_trainvaltest.zip
+fi
+
+# Extract sequence images (skip if already extracted)
+if [[ ! -d "${CITYSCAPES_DIR}/leftImg8bit_sequence" ]]; then
+    echo "Extracting leftImg8bit_sequence_trainvaltest.zip..."
+    unzip -n leftImg8bit_sequence_trainvaltest.zip -d "${CITYSCAPES_DIR}"
+else
+    echo "leftImg8bit_sequence/ already extracted, skipping."
+fi
+
+# Extract camera calibration
+if [[ ! -d "${CITYSCAPES_DIR}/camera" ]]; then
+    echo "Extracting camera_trainvaltest.zip..."
+    unzip -n camera_trainvaltest.zip -d "${CITYSCAPES_DIR}"
+else
+    echo "camera/ already extracted, skipping."
+fi
+
+# Download prepare_train_data.py if not present
+PREP_SCRIPT="${SCRIPT_DIR}/prepare_train_data.py"
+if [[ ! -f "${PREP_SCRIPT}" ]]; then
+    echo "Downloading prepare_train_data.py from SfMLearner..."
+    wget -q -O "${PREP_SCRIPT}" \
+        "https://raw.githubusercontent.com/tinghuiz/SfMLearner/master/data/prepare_train_data.py"
+fi
+
+mkdir -p "${DUMP_ROOT}"
+
+echo "Running prepare_train_data.py..."
+PYTHON="/usr/bin/python3"
+export PYTHONPATH="/work/gn21/h62001/py_deps:${PYTHONPATH:-}"
+
+cd "${SCRIPT_DIR}"
+"${PYTHON}" prepare_train_data.py \
+    --img_height 512 \
+    --img_width 1024 \
+    --dataset_dir "${CITYSCAPES_DIR}" \
+    --dataset_name cityscapes \
+    --dump_root "${DUMP_ROOT}" \
+    --seq_length 3 \
+    --num_threads 8
+
+echo "Done."
+ls -lh "${DUMP_ROOT}"

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Create a PDF report comparing evaluated ManyDepth runs.
+Create a single self-contained HTML report comparing evaluated ManyDepth runs.
 
 This script reads evaluation artifacts saved by manydepth/evaluate_depth_mda.py,
 for example:
@@ -10,27 +10,33 @@ for example:
 
 It does not read TensorBoard logs and it does not report training losses.
 
-The PDF includes:
+There is no "base" run: every evaluated run is shown on equal footing. The
+report includes:
   - run/checkpoint overview
-  - config differences against a base config/run
-  - evaluation metric tables: abs_rel, sq_rel, rmse, rmse_log, a1, a2, a3
-  - depth visualizations from the saved disparity/depth arrays
-  - difference maps against the base run for samples with the largest depth changes
+  - evaluation metric tables and bar charts: abs_rel, sq_rel, rmse, rmse_log, a1, a2, a3
+  - depth visualizations for a random sample of evaluation images, with every
+    run's predicted depth placed side by side (sharing a color scale) so they
+    can be compared directly
+
+The output is a single .html file with all charts and depth maps embedded as
+base64 PNGs, so it can be opened or shared without any extra files.
 
 Examples:
-  python make_outs_report.py --outs outs --output outs/eval_report.pdf --base-run mdp
-  python make_outs_report.py --outs /outs --eval-split eigen_benchmark --method-tag multi
+  python make_outs_report.py --outs outs --output outs/eval_report.html
+  python make_outs_report.py --outs /outs --eval-split eigen_benchmark --num-samples 60
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import datetime as _datetime
+import io
 import math
 import os
 import re
-import textwrap
 from dataclasses import dataclass, field
+from html import escape as html_escape
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -42,7 +48,6 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.backends.backend_pdf import PdfPages
 
 try:
     from PIL import Image
@@ -58,11 +63,35 @@ except Exception:  # pragma: no cover - optional dependency
 METRIC_NAMES = ("abs_rel", "sq_rel", "rmse", "rmse_log", "a1", "a2", "a3")
 LOWER_IS_BETTER = {"abs_rel", "sq_rel", "rmse", "rmse_log"}
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
-PAGE_SIZE = (11.0, 8.5)
-VISUAL_PAGE_SIZE = (14.0, 8.5)
-PDF_DPI = 300
-plt.rcParams["savefig.dpi"] = PDF_DPI
+CHART_FIGSIZE = (14.0, 9.0)
+SAMPLE_PANEL_SIZE = (3.8, 4.2)  # inches per RGB/depth panel: (width, height)
+REPORT_DPI = 180
 plt.rcParams["figure.dpi"] = 150
+
+REPORT_CSS = """
+body { font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+       margin: 24px; color: #1c1f24; background: #fbfbfd; }
+h1 { margin-bottom: 6px; }
+h2 { margin-top: 36px; border-bottom: 1px solid #d8dde3; padding-bottom: 6px; }
+ul.meta { list-style: none; padding: 0; color: #50565e; font-size: 0.92em; }
+ul.meta li { margin: 2px 0; }
+table.data-table { border-collapse: collapse; width: 100%; font-size: 0.86em; margin-top: 10px; }
+table.data-table th, table.data-table td { border: 1px solid #d8dde3; padding: 5px 8px; text-align: left; }
+table.data-table th { background: #e9eef6; }
+table.data-table tr:nth-child(even) td { background: #f7f8fa; }
+img.chart { max-width: 100%; display: block; margin: 14px 0; cursor: zoom-in; }
+div.sample-card { border: 1px solid #d8dde3; border-radius: 8px; padding: 12px 16px;
+                  margin: 16px 0; background: #ffffff; }
+div.sample-card h3 { margin: 0 0 8px 0; font-size: 1.0em; }
+img.sample-image { max-width: 100%; height: auto; display: block; cursor: zoom-in; }
+#lb { display:none; position:fixed; top:0; left:0; width:100%; height:100%;
+      background:rgba(0,0,0,0.88); z-index:9999; align-items:center;
+      justify-content:center; cursor:zoom-out; }
+#lb-img { max-width:95vw; max-height:95vh; object-fit:contain;
+          box-shadow:0 4px 32px rgba(0,0,0,0.7); }
+p.sample-metrics { font-size: 0.82em; color: #4a525c; margin: 8px 0 0 0; }
+ul.notes { font-size: 0.9em; color: #3b4149; }
+"""
 
 
 @dataclass
@@ -73,6 +102,7 @@ class EvalArtifact:
     checkpoint_path: Path
     prediction_path: Path
     errors_path: Optional[Path]
+    metric_errors_path: Optional[Path]
     prefix: str
     method_tag: str
     eval_split: str
@@ -80,30 +110,20 @@ class EvalArtifact:
     prediction_shape: Tuple[int, ...] = field(default_factory=tuple)
     sample_count: int = 0
     metrics: Dict[str, float] = field(default_factory=dict)
+    metrics_metric: Dict[str, float] = field(default_factory=dict)
     weight_number: int = -1
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Create a PDF comparing evaluated runs in outs/."
+        description="Create an HTML report comparing evaluated runs in outs/, side by side."
     )
     parser.add_argument("--outs", type=Path, default=Path("outs"), help="Runs directory.")
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("outs/eval_report.pdf"),
-        help="Output PDF path.",
-    )
-    parser.add_argument(
-        "--base-run",
-        default=None,
-        help="Run name to use as the visual/config base. Defaults to mdp if present.",
-    )
-    parser.add_argument(
-        "--base-config",
-        type=Path,
-        default=Path("configs/base.yaml"),
-        help="Config file used for config diffs. If missing, the base run config is used.",
+        default=Path("outs/eval_report.html"),
+        help="Output HTML report path (single self-contained file).",
     )
     parser.add_argument(
         "--runs",
@@ -118,13 +138,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--eval-split",
         default=None,
-        help="Evaluation split to compare, e.g. eigen_benchmark. Defaults to the first split found for the base run.",
+        help="Evaluation split to compare, e.g. eigen_benchmark. Defaults to the most common split found.",
     )
     parser.add_argument(
         "--checkpoints",
-        choices=("latest", "all"),
         default="latest",
-        help="Use the latest evaluated checkpoint per run, or include all evaluated checkpoints.",
+        help=(
+            "Which checkpoints to include. 'latest' (default): best (highest) per run. "
+            "'all': every checkpoint. Or a comma-separated list of epoch numbers, e.g. '3,4'."
+        ),
     )
     parser.add_argument(
         "--prediction-kind",
@@ -145,28 +167,25 @@ def parse_args() -> argparse.Namespace:
         help="Maximum depth used for visualization clipping.",
     )
     parser.add_argument(
-        "--max-examples",
+        "--num-samples",
         type=int,
-        default=6,
-        help="Number of highest-difference samples to visualize.",
-    )
-    parser.add_argument(
-        "--scan-limit",
-        type=int,
-        default=0,
-        help="Deprecated; visual samples are selected randomly now.",
-    )
-    parser.add_argument(
-        "--runs-per-page",
-        type=int,
-        default=2,
-        help="Maximum non-base runs shown on one visual page.",
+        default=40,
+        help="Number of evaluation images to visualize side by side (at least this many when available).",
     )
     parser.add_argument(
         "--random-seed",
         type=int,
         default=1,
-        help="Seed used for random visual sample selection.",
+        help="Seed used for random sample selection.",
+    )
+    parser.add_argument(
+        "--metrics",
+        default=None,
+        help=(
+            "Comma-separated subset of metrics to show in tables and charts, e.g. 'abs_rel,sq_rel'. "
+            "Defaults to all seven metrics. Shorthand: 'abs'→abs_rel, 'sq'/'seq'→sq_rel, "
+            "'rmse_log'→rmse_log, 'a1'/'a2'/'a3' as-is."
+        ),
     )
     parser.add_argument(
         "--image-dir",
@@ -180,12 +199,6 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional KITTI data root override for loading RGB eval images. "
         "If omitted, the script reads data_path from configs and tries nearby dataset roots.",
-    )
-    parser.add_argument(
-        "--max-config-diffs",
-        type=int,
-        default=22,
-        help="Maximum config differences shown per run.",
     )
     return parser.parse_args()
 
@@ -221,17 +234,6 @@ def read_run_config(run_path: Path) -> Dict[str, Any]:
         if config:
             return config
     return {}
-
-
-def flatten_dict(data: Dict[str, Any], prefix: str = "") -> Dict[str, Any]:
-    flat: Dict[str, Any] = {}
-    for key, value in data.items():
-        full_key = f"{prefix}.{key}" if prefix else str(key)
-        if isinstance(value, dict):
-            flat.update(flatten_dict(value, full_key))
-        else:
-            flat[full_key] = value
-    return flat
 
 
 def short_text(value: Any, max_len: int = 58) -> str:
@@ -344,11 +346,15 @@ def discover_artifacts(args: argparse.Namespace) -> List[EvalArtifact]:
             if not errors_path.exists():
                 errors_path = None
 
+            metric_errors_path = prediction_path.with_name(prefix + "_metric_errors.npy")
+            if not metric_errors_path.exists():
+                metric_errors_path = None
+
             prediction_shape, sample_count = load_prediction_shape(prediction_path)
             checkpoint_path = checkpoint_path_for_prediction(prediction_path)
             weight_number = weight_number_from_path(prediction_path)
             display_name = run_path.name
-            if args.checkpoints == "all":
+            if args.checkpoints != "latest":
                 display_name = f"{run_path.name}/{checkpoint_path.name}"
 
             artifacts.append(
@@ -359,6 +365,7 @@ def discover_artifacts(args: argparse.Namespace) -> List[EvalArtifact]:
                     checkpoint_path=checkpoint_path,
                     prediction_path=prediction_path,
                     errors_path=errors_path,
+                    metric_errors_path=metric_errors_path,
                     prefix=prefix,
                     method_tag=method_tag,
                     eval_split=eval_split,
@@ -366,11 +373,22 @@ def discover_artifacts(args: argparse.Namespace) -> List[EvalArtifact]:
                     prediction_shape=prediction_shape,
                     sample_count=sample_count,
                     metrics=load_eval_metrics(errors_path),
+                    metrics_metric=load_eval_metrics(metric_errors_path),
                     weight_number=weight_number,
                 )
             )
 
-    if args.checkpoints == "latest":
+    checkpoints_arg = args.checkpoints
+    selected_weights: Optional[set] = None
+    if checkpoints_arg not in ("latest", "all"):
+        try:
+            selected_weights = {int(n.strip()) for n in checkpoints_arg.split(",") if n.strip()}
+        except ValueError:
+            raise SystemExit(f"--checkpoints must be 'latest', 'all', or comma-separated integers, got: {checkpoints_arg!r}")
+
+    if selected_weights is not None:
+        artifacts = [a for a in artifacts if a.weight_number in selected_weights]
+    elif checkpoints_arg == "latest":
         by_run: Dict[Tuple[str, str, str], EvalArtifact] = {}
         for artifact in artifacts:
             key = (artifact.run_name, artifact.method_tag, artifact.eval_split)
@@ -387,162 +405,26 @@ def discover_artifacts(args: argparse.Namespace) -> List[EvalArtifact]:
     return artifacts
 
 
-def choose_base_artifact(artifacts: Sequence[EvalArtifact], requested: Optional[str]) -> EvalArtifact:
-    if not artifacts:
-        raise ValueError("No evaluated prediction files were found.")
-    if requested:
-        candidates = [item for item in artifacts if item.run_name == requested or item.display_name == requested]
-        if candidates:
-            return sorted(candidates, key=lambda item: (item.weight_number, item.display_name))[-1]
-        raise ValueError(f"--base-run {requested!r} was not found among evaluated artifacts.")
-    for preferred in ("mdp", "base", "baseline"):
-        candidates = [item for item in artifacts if item.run_name == preferred]
-        if candidates:
-            return sorted(candidates, key=lambda item: (item.weight_number, item.display_name))[-1]
-    return artifacts[0]
+def most_common_value(values: Iterable[str]) -> Optional[str]:
+    counts: Dict[str, int] = {}
+    for value in values:
+        counts[value] = counts.get(value, 0) + 1
+    if not counts:
+        return None
+    best = max(counts.values())
+    return sorted(key for key, count in counts.items() if count == best)[0]
 
 
-def filter_to_base_split(artifacts: Sequence[EvalArtifact], base: EvalArtifact, args: argparse.Namespace) -> List[EvalArtifact]:
-    filtered = [
-        item
-        for item in artifacts
-        if item.eval_split == base.eval_split and item.method_tag == base.method_tag
-    ]
-    if args.eval_split:
-        filtered = [item for item in filtered if item.eval_split == args.eval_split]
-    return sorted(filtered, key=lambda item: item.display_name)
-
-
-def add_text_page(pdf: PdfPages, title: str, lines: Sequence[str]) -> None:
-    fig = plt.figure(figsize=PAGE_SIZE)
-    fig.patch.set_facecolor("white")
-    fig.text(0.05, 0.93, title, fontsize=20, weight="bold", va="top")
-    y = 0.86
-    for line in lines:
-        wrapped = textwrap.wrap(str(line), width=122) or [""]
-        for part in wrapped:
-            fig.text(0.06, y, part, fontsize=10.2, va="top")
-            y -= 0.035
-            if y < 0.06:
-                pdf.savefig(fig, bbox_inches="tight", dpi=PDF_DPI)
-                plt.close(fig)
-                fig = plt.figure(figsize=PAGE_SIZE)
-                fig.patch.set_facecolor("white")
-                y = 0.93
-    pdf.savefig(fig, bbox_inches="tight", dpi=PDF_DPI)
-    plt.close(fig)
-
-
-def add_table_pages(
-    pdf: PdfPages,
-    title: str,
-    headers: Sequence[str],
-    rows: Sequence[Sequence[str]],
-    rows_per_page: int = 22,
-    font_size: float = 7.2,
-) -> None:
-    if not rows:
-        add_text_page(pdf, title, ["No data found."])
-        return
-
-    for page_idx, start in enumerate(range(0, len(rows), rows_per_page)):
-        chunk = rows[start : start + rows_per_page]
-        fig, ax = plt.subplots(figsize=PAGE_SIZE)
-        fig.patch.set_facecolor("white")
-        ax.axis("off")
-        suffix = f" ({page_idx + 1})" if len(rows) > rows_per_page else ""
-        ax.set_title(title + suffix, loc="left", fontsize=16, weight="bold", pad=16)
-        table = ax.table(cellText=chunk, colLabels=headers, loc="center", cellLoc="left")
-        table.auto_set_font_size(False)
-        table.set_fontsize(font_size)
-        table.scale(1, 1.25)
-        for (row, _col), cell in table.get_celld().items():
-            if row == 0:
-                cell.set_facecolor("#e9eef6")
-                cell.set_text_props(weight="bold")
-            else:
-                cell.set_facecolor("#ffffff" if row % 2 else "#f7f7f7")
-        pdf.savefig(fig, bbox_inches="tight", dpi=PDF_DPI)
-        plt.close(fig)
-
-
-def add_overview_page(pdf: PdfPages, artifacts: Sequence[EvalArtifact], base: EvalArtifact) -> None:
-    rows = []
-    for item in artifacts:
-        rows.append(
-            [
-                item.display_name + ("  [base]" if item is base else ""),
-                item.method_tag,
-                item.eval_split,
-                item.checkpoint_path.name,
-                "x".join(str(dim) for dim in item.prediction_shape),
-                str(item.sample_count),
-                short_text(item.prediction_path.relative_to(item.run_path)),
-                short_text(item.errors_path.relative_to(item.run_path) if item.errors_path else ""),
-            ]
-        )
-    add_table_pages(
-        pdf,
-        "Evaluated Checkpoints",
-        ["run", "method", "split", "checkpoint", "prediction shape", "samples", "prediction file", "errors file"],
-        rows,
-        rows_per_page=18,
-        font_size=6.7,
+def select_comparison_group(artifacts: Sequence[EvalArtifact], args: argparse.Namespace) -> Tuple[List[EvalArtifact], str, str]:
+    eval_split = args.eval_split or most_common_value(item.eval_split for item in artifacts)
+    method_tag = None if args.method_tag == "*" else args.method_tag
+    if method_tag is None:
+        method_tag = most_common_value(item.method_tag for item in artifacts)
+    selected = sorted(
+        (item for item in artifacts if item.eval_split == eval_split and item.method_tag == method_tag),
+        key=lambda item: item.display_name,
     )
-
-
-def add_config_diff_pages(
-    pdf: PdfPages,
-    artifacts: Sequence[EvalArtifact],
-    base: EvalArtifact,
-    base_config: Dict[str, Any],
-    max_diffs: int,
-) -> None:
-    base_flat = flatten_dict(base_config or base.config)
-    important_tokens = (
-        "model_name",
-        "learning_rate",
-        "batch_size",
-        "height",
-        "width",
-        "lora",
-        "split",
-        "eval",
-        "data",
-    )
-    rows: List[List[str]] = []
-    for item in artifacts:
-        if item.display_name == base.display_name and not base_config:
-            continue
-        flat = flatten_dict(item.config)
-        keys = sorted(set(base_flat) | set(flat))
-
-        def score_key(key: str) -> Tuple[int, str]:
-            low = key.lower()
-            return (0 if any(token in low for token in important_tokens) else 1, key)
-
-        diffs = [key for key in keys if base_flat.get(key) != flat.get(key)]
-        diffs.sort(key=score_key)
-        for key in diffs[:max_diffs]:
-            rows.append(
-                [
-                    item.display_name,
-                    key,
-                    short_text(base_flat.get(key, "<missing>")),
-                    short_text(flat.get(key, "<missing>")),
-                ]
-            )
-        if len(diffs) > max_diffs:
-            rows.append([item.display_name, f"... {len(diffs) - max_diffs} more differences", "", ""])
-
-    add_table_pages(
-        pdf,
-        "Config Differences Against Base",
-        ["run", "key", "base value", "run value"],
-        rows,
-        rows_per_page=24,
-        font_size=6.9,
-    )
+    return selected, str(eval_split or ""), str(method_tag or "")
 
 
 def metric_sort_key(item: EvalArtifact) -> Tuple[float, str]:
@@ -550,87 +432,6 @@ def metric_sort_key(item: EvalArtifact) -> Tuple[float, str]:
     if abs_rel is None or not math.isfinite(abs_rel):
         return (float("inf"), item.display_name)
     return (abs_rel, item.display_name)
-
-
-def add_eval_metric_pages(pdf: PdfPages, artifacts: Sequence[EvalArtifact], base: EvalArtifact) -> None:
-    sorted_items = sorted(artifacts, key=metric_sort_key)
-    rows: List[List[str]] = []
-    base_metrics = base.metrics
-    for rank, item in enumerate(sorted_items, start=1):
-        row = [str(rank), item.display_name, item.checkpoint_path.name]
-        for metric in METRIC_NAMES:
-            row.append(fmt_float(item.metrics.get(metric)))
-        delta = None
-        if "abs_rel" in item.metrics and "abs_rel" in base_metrics:
-            delta = item.metrics["abs_rel"] - base_metrics["abs_rel"]
-        row.append(fmt_float(delta))
-        rows.append(row)
-
-    add_table_pages(
-        pdf,
-        "Evaluation Metrics",
-        ["rank", "run", "checkpoint", *METRIC_NAMES, "abs_rel - base"],
-        rows,
-        rows_per_page=22,
-        font_size=6.6,
-    )
-
-
-def add_metric_bar_pages(pdf: PdfPages, artifacts: Sequence[EvalArtifact]) -> None:
-    metrics_with_data = [
-        metric for metric in METRIC_NAMES if any(metric in item.metrics for item in artifacts)
-    ]
-    if not metrics_with_data:
-        return
-
-    for start in range(0, len(metrics_with_data), 4):
-        chunk = metrics_with_data[start : start + 4]
-        fig, axes = plt.subplots(2, 2, figsize=PAGE_SIZE, squeeze=False)
-        fig.patch.set_facecolor("white")
-        fig.suptitle("Evaluation Metric Comparison", fontsize=16, weight="bold", x=0.04, ha="left")
-        for ax, metric in zip(axes.ravel(), chunk):
-            values = [item.metrics.get(metric, np.nan) for item in artifacts]
-            names = [item.display_name for item in artifacts]
-            colors = ["#5577aa" if metric in LOWER_IS_BETTER else "#5f9f6e"] * len(values)
-            ax.barh(names, values, color=colors)
-            ax.set_title(f"{metric} ({'lower' if metric in LOWER_IS_BETTER else 'higher'} is better)", fontsize=10)
-            ax.grid(axis="x", linewidth=0.4, alpha=0.35)
-            ax.tick_params(axis="y", labelsize=7)
-            ax.tick_params(axis="x", labelsize=7)
-        for ax in axes.ravel()[len(chunk) :]:
-            ax.axis("off")
-        fig.tight_layout(rect=(0.02, 0.02, 0.98, 0.91))
-        pdf.savefig(fig, bbox_inches="tight", dpi=PDF_DPI)
-        plt.close(fig)
-
-
-def load_prediction_array(path: Path) -> Optional[np.ndarray]:
-    try:
-        return np.load(path, mmap_mode="r", allow_pickle=False)
-    except Exception:
-        return None
-
-
-def squeeze_prediction_sample(array: np.ndarray, sample_index: int) -> Optional[np.ndarray]:
-    if array is None:
-        return None
-    squeezed = np.squeeze(array)
-    if squeezed.ndim == 2:
-        sample = squeezed
-    elif squeezed.ndim >= 3:
-        if sample_index < 0 or sample_index >= squeezed.shape[0]:
-            return None
-        sample = np.squeeze(squeezed[sample_index])
-    else:
-        return None
-
-    if sample.ndim == 3 and sample.shape[0] in (1, 3, 4):
-        sample = sample[0]
-    elif sample.ndim == 3 and sample.shape[-1] in (1, 3, 4):
-        sample = sample[..., 0]
-    if sample.ndim != 2:
-        return None
-    return np.asarray(sample, dtype=np.float32)
 
 
 def finite_2d(array: np.ndarray) -> np.ndarray:
@@ -651,22 +452,6 @@ def resize_2d(array: np.ndarray, target_shape: Tuple[int, int]) -> np.ndarray:
     y_idx = np.clip(np.round(np.linspace(0, src_h - 1, dst_h)).astype(int), 0, src_h - 1)
     x_idx = np.clip(np.round(np.linspace(0, src_w - 1, dst_w)).astype(int), 0, src_w - 1)
     return array[y_idx][:, x_idx]
-
-
-def resize_mask_2d(mask: np.ndarray, target_shape: Tuple[int, int]) -> np.ndarray:
-    mask = np.asarray(mask, dtype=bool)
-    if mask.shape == target_shape:
-        return mask
-    if Image is not None:
-        image = Image.fromarray(mask.astype(np.uint8) * 255)
-        image = image.resize((target_shape[1], target_shape[0]), Image.NEAREST)
-        return np.asarray(image) > 127
-
-    src_h, src_w = mask.shape
-    dst_h, dst_w = target_shape
-    y_idx = np.clip(np.round(np.linspace(0, src_h - 1, dst_h)).astype(int), 0, src_h - 1)
-    x_idx = np.clip(np.round(np.linspace(0, src_w - 1, dst_w)).astype(int), 0, src_w - 1)
-    return mask[y_idx][:, x_idx]
 
 
 def prediction_is_depth(item: EvalArtifact, prediction_kind: str) -> bool:
@@ -696,45 +481,6 @@ def sample_to_depth(
     return np.clip(depth, min_depth, max_depth).astype(np.float32, copy=False)
 
 
-def sample_to_unclipped_depth(
-    sample: np.ndarray,
-    item: EvalArtifact,
-    prediction_kind: str,
-) -> np.ndarray:
-    sample = finite_2d(sample)
-    if prediction_is_depth(item, prediction_kind):
-        return sample.astype(np.float32, copy=False)
-    disp = np.asarray(sample, dtype=np.float32)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        depth = 1.0 / disp
-    return depth.astype(np.float32, copy=False)
-
-
-def sample_to_disparity(
-    sample: np.ndarray,
-    item: EvalArtifact,
-    prediction_kind: str,
-) -> np.ndarray:
-    sample = finite_2d(sample)
-    if prediction_is_depth(item, prediction_kind):
-        depth = np.maximum(sample, 1e-6)
-        with np.errstate(divide="ignore", invalid="ignore"):
-            disp = 1.0 / depth
-        return finite_2d(disp)
-    return sample.astype(np.float32, copy=False)
-
-
-def valid_depth_mask(
-    sample: np.ndarray,
-    item: EvalArtifact,
-    prediction_kind: str,
-    min_depth: float,
-    max_depth: float,
-) -> np.ndarray:
-    depth = sample_to_unclipped_depth(sample, item, prediction_kind)
-    return np.isfinite(depth) & (depth >= min_depth) & (depth <= max_depth)
-
-
 def robust_limits(arrays: Sequence[np.ndarray], low: float = 2.0, high: float = 98.0) -> Tuple[float, float]:
     values = []
     for array in arrays:
@@ -753,33 +499,11 @@ def robust_limits(arrays: Sequence[np.ndarray], low: float = 2.0, high: float = 
     return float(vmin), float(vmax)
 
 
-def normalize_with_limits(array: np.ndarray, limits: Tuple[float, float]) -> np.ndarray:
-    vmin, vmax = limits
-    return np.clip((array - vmin) / max(vmax - vmin, 1e-12), 0.0, 1.0)
-
-
-def depth_difference_score(base_depth: np.ndarray, other_depth: np.ndarray) -> float:
-    other_depth = resize_2d(other_depth, base_depth.shape)
-    limits = robust_limits([base_depth, other_depth])
-    base_norm = normalize_with_limits(base_depth, limits)
-    other_norm = normalize_with_limits(other_depth, limits)
-    return float(np.mean(np.abs(other_norm - base_norm)))
-
-
-def scan_indices(sample_count: int, scan_limit: int) -> List[int]:
-    if sample_count <= 0:
-        return []
-    if scan_limit <= 0 or sample_count <= scan_limit:
-        return list(range(sample_count))
-    return sorted(set(int(round(x)) for x in np.linspace(0, sample_count - 1, scan_limit)))
-
-
 def choose_visual_samples(
     artifacts: Sequence[EvalArtifact],
-    base: EvalArtifact,
     arrays: Dict[str, np.ndarray],
     args: argparse.Namespace,
-) -> List[Tuple[int, float, str]]:
+) -> List[int]:
     available_counts = [
         item.sample_count
         for item in artifacts
@@ -790,12 +514,12 @@ def choose_visual_samples(
     common_count = min(available_counts)
     if common_count <= 0:
         return []
-    count = min(max(args.max_examples, 0), common_count)
+    count = min(max(args.num_samples, 0), common_count)
     if count <= 0:
         return []
     rng = np.random.default_rng(args.random_seed)
     selected = rng.choice(common_count, size=count, replace=False)
-    return [(int(idx), 0.0, "random") for idx in sorted(selected.tolist())]
+    return sorted(int(idx) for idx in selected.tolist())
 
 
 def load_image_from_path(path: Path, target_shape: Optional[Tuple[int, int]] = None) -> Optional[np.ndarray]:
@@ -889,11 +613,11 @@ def path_has_split_sample(data_path: Optional[Path], split_lines: Sequence[str],
     return False
 
 
-def dataset_root_candidates(artifacts: Sequence[EvalArtifact], base: EvalArtifact, base_config: Dict[str, Any]) -> List[Path]:
+def dataset_root_candidates(artifacts: Sequence[EvalArtifact]) -> List[Path]:
     candidates: List[Path] = []
-    for config in [base.config, base_config, *(item.config for item in artifacts)]:
+    for item in artifacts:
         for key in ("data_path", "dataset_path", "kitti_path", "data_root", "root_dir"):
-            candidate = path_from_config_value(config.get(key) if config else None)
+            candidate = path_from_config_value(item.config.get(key) if item.config else None)
             if candidate is not None:
                 candidates.append(candidate)
 
@@ -936,16 +660,13 @@ def dataset_root_candidates(artifacts: Sequence[EvalArtifact], base: EvalArtifac
 def resolve_data_path(
     cli_data_path: Optional[Path],
     artifacts: Sequence[EvalArtifact],
-    base: EvalArtifact,
-    base_config: Dict[str, Any],
+    lookup_config: Dict[str, Any],
     split_lines: Sequence[str],
 ) -> Optional[Path]:
     if cli_data_path is not None:
         return cli_data_path.expanduser()
 
-    lookup_config = dict(base_config)
-    lookup_config.update(base.config)
-    for candidate in dataset_root_candidates(artifacts, base, base_config):
+    for candidate in dataset_root_candidates(artifacts):
         if path_has_split_sample(candidate, split_lines, lookup_config):
             return candidate
     return None
@@ -957,7 +678,7 @@ def find_rgb_image(
     image_files: Sequence[Path],
     split_lines: Sequence[str],
     data_path: Optional[Path],
-    base_config: Dict[str, Any],
+    lookup_config: Dict[str, Any],
 ) -> Optional[np.ndarray]:
     if image_files:
         if sample_index < len(image_files):
@@ -968,16 +689,45 @@ def find_rgb_image(
                 return load_image_from_path(path, target_shape)
 
     if data_path is None:
-        config_data_path = base_config.get("data_path")
+        config_data_path = lookup_config.get("data_path")
         data_path = Path(config_data_path).expanduser() if config_data_path else None
     if data_path is None or sample_index >= len(split_lines):
         return None
 
-    for candidate in candidate_kitti_image_paths(data_path, split_lines[sample_index], base_config):
+    for candidate in candidate_kitti_image_paths(data_path, split_lines[sample_index], lookup_config):
         image = load_image_from_path(candidate, target_shape)
         if image is not None:
             return image
     return None
+
+
+def load_prediction_array(path: Path) -> Optional[np.ndarray]:
+    try:
+        return np.load(path, mmap_mode="r", allow_pickle=False)
+    except Exception:
+        return None
+
+
+def squeeze_prediction_sample(array: np.ndarray, sample_index: int) -> Optional[np.ndarray]:
+    if array is None:
+        return None
+    squeezed = np.squeeze(array)
+    if squeezed.ndim == 2:
+        sample = squeezed
+    elif squeezed.ndim >= 3:
+        if sample_index < 0 or sample_index >= squeezed.shape[0]:
+            return None
+        sample = np.squeeze(squeezed[sample_index])
+    else:
+        return None
+
+    if sample.ndim == 3 and sample.shape[0] in (1, 3, 4):
+        sample = sample[0]
+    elif sample.ndim == 3 and sample.shape[-1] in (1, 3, 4):
+        sample = sample[..., 0]
+    if sample.ndim != 2:
+        return None
+    return np.asarray(sample, dtype=np.float32)
 
 
 def load_sample_depth(
@@ -991,32 +741,6 @@ def load_sample_depth(
     if sample is None:
         return None
     return sample_to_depth(sample, item, args.prediction_kind, args.min_depth, args.max_depth)
-
-
-def load_sample_disparity(
-    item: EvalArtifact,
-    sample_index: int,
-    arrays: Dict[str, np.ndarray],
-    args: argparse.Namespace,
-) -> Optional[np.ndarray]:
-    array = arrays.get(item.display_name)
-    sample = squeeze_prediction_sample(array, sample_index)
-    if sample is None:
-        return None
-    return sample_to_disparity(sample, item, args.prediction_kind)
-
-
-def load_sample_valid_mask(
-    item: EvalArtifact,
-    sample_index: int,
-    arrays: Dict[str, np.ndarray],
-    args: argparse.Namespace,
-) -> Optional[np.ndarray]:
-    array = arrays.get(item.display_name)
-    sample = squeeze_prediction_sample(array, sample_index)
-    if sample is None:
-        return None
-    return valid_depth_mask(sample, item, args.prediction_kind, args.min_depth, args.max_depth)
 
 
 def sample_error_metrics(item: EvalArtifact, sample_index: int) -> Dict[str, float]:
@@ -1038,183 +762,331 @@ def sample_error_metrics(item: EvalArtifact, sample_index: int) -> Dict[str, flo
     return {name: float(value) for name, value in zip(METRIC_NAMES, values)}
 
 
-def add_depth_visual_pages(
-    pdf: PdfPages,
+def fig_to_data_uri(fig: "plt.Figure", dpi: int = REPORT_DPI) -> str:
+    buffer = io.BytesIO()
+    fig.savefig(buffer, format="png", dpi=dpi, bbox_inches="tight", facecolor="white")
+    buffer.seek(0)
+    encoded = base64.b64encode(buffer.read()).decode("ascii")
+    return f"data:image/png;base64,{encoded}"
+
+
+def html_table(headers: Sequence[str], rows: Sequence[Sequence[Any]]) -> str:
+    head = "".join(f"<th>{html_escape(str(value))}</th>" for value in headers)
+    body_rows = []
+    for row in rows:
+        cells = "".join(f"<td>{html_escape(str(value))}</td>" for value in row)
+        body_rows.append(f"<tr>{cells}</tr>")
+    if not body_rows:
+        body_rows.append(f'<tr><td colspan="{len(headers)}">No data found.</td></tr>')
+    return (
+        '<table class="data-table">'
+        f"<thead><tr>{head}</tr></thead>"
+        f"<tbody>{''.join(body_rows)}</tbody>"
+        "</table>"
+    )
+
+
+def build_html_document(title: str, meta_lines: Sequence[str], sections: Sequence[str]) -> str:
+    meta_html = "".join(f"<li>{html_escape(line)}</li>" for line in meta_lines)
+    body = "\n".join(sections)
+    lightbox_html = (
+        '<div id="lb"><img id="lb-img" alt="zoomed"></div>\n'
+        "<script>\n"
+        "(function(){\n"
+        "  var lb=document.getElementById('lb');\n"
+        "  var lbImg=document.getElementById('lb-img');\n"
+        "  function open(src){lbImg.src=src;lb.style.display='flex';}\n"
+        "  function close(){lb.style.display='none';lbImg.src='';}\n"
+        "  document.querySelectorAll('img.chart,img.sample-image').forEach(function(img){\n"
+        "    img.addEventListener('click',function(){open(this.src);});\n"
+        "  });\n"
+        "  lb.addEventListener('click',close);\n"
+        "  document.addEventListener('keydown',function(e){if(e.key==='Escape')close();});\n"
+        "})();\n"
+        "</script>\n"
+    )
+    return (
+        "<!DOCTYPE html>\n"
+        '<html lang="en">\n'
+        "<head>\n"
+        '<meta charset="utf-8">\n'
+        f"<title>{html_escape(title)}</title>\n"
+        f"<style>{REPORT_CSS}</style>\n"
+        "</head>\n"
+        "<body>\n"
+        f"<h1>{html_escape(title)}</h1>\n"
+        f'<ul class="meta">{meta_html}</ul>\n'
+        f"{body}\n"
+        f"{lightbox_html}"
+        "</body>\n"
+        "</html>\n"
+    )
+
+
+def render_overview_section(artifacts: Sequence[EvalArtifact]) -> str:
+    rows = []
+    for item in artifacts:
+        rows.append(
+            [
+                item.display_name,
+                item.method_tag,
+                item.eval_split,
+                item.checkpoint_path.name,
+                "x".join(str(dim) for dim in item.prediction_shape),
+                item.sample_count,
+                short_text(item.prediction_path.relative_to(item.run_path)),
+                short_text(item.errors_path.relative_to(item.run_path) if item.errors_path else ""),
+            ]
+        )
+    table = html_table(
+        ["run", "method", "split", "checkpoint", "prediction shape", "samples", "prediction file", "errors file"],
+        rows,
+    )
+    return f"<section><h2>Evaluated Runs ({len(artifacts)})</h2>{table}</section>"
+
+
+def render_metrics_section(artifacts: Sequence[EvalArtifact], metrics: Tuple[str, ...] = METRIC_NAMES) -> str:
+    sorted_items = sorted(artifacts, key=metric_sort_key)
+    rows = []
+    for rank, item in enumerate(sorted_items, start=1):
+        row = [rank, item.display_name, item.checkpoint_path.name]
+        for metric in metrics:
+            row.append(fmt_float(item.metrics.get(metric)))
+        rows.append(row)
+    table = html_table(["rank (by abs_rel)", "run", "checkpoint", *metrics], rows)
+
+    has_metric = any(item.metrics_metric for item in artifacts)
+    metric_table_html = ""
+    if has_metric:
+        sorted_metric = sorted(artifacts, key=lambda item: (
+            item.metrics_metric.get("abs_rel", float("inf")), item.display_name))
+        metric_rows = []
+        for rank, item in enumerate(sorted_metric, start=1):
+            row = [rank, item.display_name, item.checkpoint_path.name]
+            for metric in metrics:
+                row.append(fmt_float(item.metrics_metric.get(metric)))
+            metric_rows.append(row)
+        metric_table_html = (
+            "<h3>Metric-depth (unscaled / g2s)</h3>"
+            + html_table(["rank (by abs_rel)", "run", "checkpoint", *metrics], metric_rows)
+        )
+
+    return (
+        f"<section><h2>Evaluation Metrics</h2>"
+        f"<h3>Scaled with ground-truth median</h3>{table}"
+        f"{metric_table_html}</section>"
+    )
+
+
+def _bar_chart_images(artifacts: Sequence[EvalArtifact], metrics: Tuple[str, ...], get_val) -> List[str]:
+    metrics_with_data = [m for m in metrics if any(m in get_val(item) for item in artifacts)]
+    if not metrics_with_data:
+        return []
+    images = []
+    for start in range(0, len(metrics_with_data), 4):
+        chunk = metrics_with_data[start : start + 4]
+        fig, axes = plt.subplots(2, 2, figsize=CHART_FIGSIZE, squeeze=False)
+        fig.patch.set_facecolor("white")
+        for ax, metric in zip(axes.ravel(), chunk):
+            values = [get_val(item).get(metric, np.nan) for item in artifacts]
+            names = [item.display_name for item in artifacts]
+            color = "#5577aa" if metric in LOWER_IS_BETTER else "#5f9f6e"
+            ax.barh(names, values, color=color)
+            ax.set_title(f"{metric} ({'lower' if metric in LOWER_IS_BETTER else 'higher'} is better)", fontsize=10)
+            ax.grid(axis="x", linewidth=0.4, alpha=0.35)
+            ax.tick_params(axis="both", labelsize=7)
+        for ax in axes.ravel()[len(chunk):]:
+            ax.axis("off")
+        fig.tight_layout()
+        images.append(fig_to_data_uri(fig))
+        plt.close(fig)
+    return images
+
+
+def render_metric_bar_section(artifacts: Sequence[EvalArtifact], metrics: Tuple[str, ...] = METRIC_NAMES) -> str:
+    images = _bar_chart_images(artifacts, metrics, lambda item: item.metrics)
+    if not images:
+        return ""
+    img_tags = "".join(f'<img class="chart" src="{uri}" alt="metric comparison chart">' for uri in images)
+
+    metric_html = ""
+    if any(item.metrics_metric for item in artifacts):
+        metric_images = _bar_chart_images(artifacts, metrics, lambda item: item.metrics_metric)
+        if metric_images:
+            metric_img_tags = "".join(
+                f'<img class="chart" src="{uri}" alt="metric-depth comparison chart">' for uri in metric_images
+            )
+            metric_html = f"<h3>Metric-depth (unscaled / g2s)</h3>{metric_img_tags}"
+
+    return (
+        f"<section><h2>Metric Comparison Charts</h2>"
+        f"<h3>Scaled with ground-truth median</h3>{img_tags}"
+        f"{metric_html}</section>"
+    )
+
+
+def render_depth_sample_figure(
+    sample_index: int,
     artifacts: Sequence[EvalArtifact],
-    base: EvalArtifact,
     arrays: Dict[str, np.ndarray],
-    selected_samples: Sequence[Tuple[int, float, str]],
     image_files: Sequence[Path],
     split_lines: Sequence[str],
+    lookup_config: Dict[str, Any],
     args: argparse.Namespace,
-) -> bool:
-    if not selected_samples:
-        return False
-
-    comparison_runs = [item for item in artifacts if item.display_name != base.display_name]
-    if not comparison_runs:
-        return False
-
-    made_page = False
-    runs_per_page = max(1, args.runs_per_page)
-    diff_cmap = plt.get_cmap("coolwarm").copy()
-    diff_cmap.set_bad(color="#ffffff")
-
-    for sample_index, _score, _selection_kind in selected_samples:
-        base_depth = load_sample_depth(base, sample_index, arrays, args)
-        base_disp = load_sample_disparity(base, sample_index, arrays, args)
-        base_mask = load_sample_valid_mask(base, sample_index, arrays, args)
-        if base_depth is None or base_disp is None or base_mask is None:
+) -> Optional[Tuple[str, List[Tuple[str, Dict[str, float]]]]]:
+    valid_items: List[Tuple[EvalArtifact, np.ndarray]] = []
+    target_shape: Optional[Tuple[int, int]] = None
+    for item in artifacts:
+        depth = load_sample_depth(item, sample_index, arrays, args)
+        if depth is None:
             continue
-        base_disp = resize_2d(base_disp, base_depth.shape)
-        base_mask = resize_mask_2d(base_mask, base_depth.shape)
+        if target_shape is None:
+            target_shape = depth.shape
+        else:
+            depth = resize_2d(depth, target_shape)
+        valid_items.append((item, depth))
+    if not valid_items or target_shape is None:
+        return None
 
-        for group_start in range(0, len(comparison_runs), runs_per_page):
-            group = comparison_runs[group_start : group_start + runs_per_page]
-            valid_group = []
-            depths = [base_depth]
-            for item in group:
-                depth = load_sample_depth(item, sample_index, arrays, args)
-                disp = load_sample_disparity(item, sample_index, arrays, args)
-                mask = load_sample_valid_mask(item, sample_index, arrays, args)
-                if depth is None or disp is None or mask is None:
-                    continue
-                depth = resize_2d(depth, base_depth.shape)
-                disp = resize_2d(disp, base_depth.shape)
-                mask = resize_mask_2d(mask, base_depth.shape)
-                valid_group.append((item, depth, disp, mask))
-                depths.append(depth)
-            if not valid_group:
-                continue
+    rgb = find_rgb_image(sample_index, target_shape, image_files, split_lines, args.data_path, lookup_config)
+    depth_limits = robust_limits([depth for _, depth in valid_items])
 
-            cols = 2 + len(valid_group)
-            fig, axes = plt.subplots(2, cols, figsize=VISUAL_PAGE_SIZE, squeeze=False)
-            fig.patch.set_facecolor("white")
-            title = (
-                f"Sample {sample_index}: Random Evaluation Example"
-                f" | disparity diff vs {base.display_name}"
-            )
-            fig.suptitle(title, fontsize=14.5, weight="bold", x=0.03, ha="left")
+    panel_w, panel_h = SAMPLE_PANEL_SIZE
+    cols = len(valid_items) + (1 if rgb is not None else 0)
+    fig, axes = plt.subplots(1, cols, figsize=(panel_w * cols, panel_h), squeeze=False)
+    axes = axes[0]
+    fig.patch.set_facecolor("white")
 
-            rgb = find_rgb_image(
-                sample_index,
-                base_depth.shape,
-                image_files,
-                split_lines,
-                args.data_path,
-                base.config,
-            )
-            if rgb is not None:
-                axes[0, 0].imshow(rgb, interpolation="lanczos")
-                axes[0, 0].set_title("example image", fontsize=9)
-            else:
-                axes[0, 0].text(0.5, 0.5, "RGB image not found", ha="center", va="center", fontsize=9)
-                axes[0, 0].set_title("example image", fontsize=9)
-            axes[0, 0].axis("off")
-            axes[1, 0].axis("off")
+    col = 0
+    if rgb is not None:
+        axes[col].imshow(rgb, interpolation="lanczos")
+        axes[col].set_title("RGB", fontsize=9)
+        axes[col].axis("off")
+        col += 1
 
-            depth_limits = robust_limits(depths)
-            axes[0, 1].imshow(
-                base_depth,
-                cmap="plasma",
-                vmin=depth_limits[0],
-                vmax=depth_limits[1],
-                interpolation="lanczos",
-            )
-            axes[0, 1].set_title(f"{base.display_name}\ndepth", fontsize=8.4)
-            axes[0, 1].axis("off")
-            axes[1, 1].axis("off")
-            base_sample_metrics = sample_error_metrics(base, sample_index)
-            if base_sample_metrics:
-                axes[1, 1].text(
-                    0.02,
-                    0.7,
-                    f"abs_rel {fmt_float(base_sample_metrics.get('abs_rel'))}\nrmse {fmt_float(base_sample_metrics.get('rmse'))}\na1 {fmt_float(base_sample_metrics.get('a1'))}",
-                    fontsize=8,
-                    va="top",
-                )
+    legend_rows: List[Tuple[str, Dict[str, float]]] = []
+    for item, depth in valid_items:
+        axes[col].imshow(depth, cmap="plasma", vmin=depth_limits[0], vmax=depth_limits[1], interpolation="lanczos")
+        axes[col].set_title(item.display_name, fontsize=8.6)
+        axes[col].axis("off")
+        legend_rows.append((item.display_name, sample_error_metrics(item, sample_index)))
+        col += 1
 
-            for col, (item, depth, disp, mask) in enumerate(valid_group, start=2):
-                axes[0, col].imshow(
-                    depth,
-                    cmap="plasma",
-                    vmin=depth_limits[0],
-                    vmax=depth_limits[1],
-                    interpolation="lanczos",
-                )
-                axes[0, col].set_title(f"{item.display_name}\ndepth", fontsize=8.4)
-                axes[0, col].axis("off")
-
-                valid = base_mask & mask & np.isfinite(base_disp) & np.isfinite(disp)
-                diff = np.abs(disp - base_disp)
-                valid_values = diff[valid]
-                if valid_values.size:
-                    diff_vmax = max(float(np.percentile(valid_values, 99)), 1e-12)
-                    mean_diff = float(np.mean(valid_values))
-                else:
-                    diff_vmax = 1.0
-                    mean_diff = float("nan")
-                masked_diff = np.ma.array(diff, mask=~valid)
-                axes[1, col].imshow(
-                    masked_diff,
-                    cmap=diff_cmap,
-                    vmin=0.0,
-                    vmax=diff_vmax,
-                    interpolation="nearest",
-                )
-                axes[1, col].set_title("disparity abs diff\nblue low, red high", fontsize=8.4)
-                axes[1, col].axis("off")
-                metrics = sample_error_metrics(item, sample_index)
-                text = f"mean disp diff {fmt_float(mean_diff)}\nmasked depth > {args.max_depth:g}m"
-                if metrics:
-                    text += (
-                        f"\nabs_rel {fmt_float(metrics.get('abs_rel'))}"
-                        f"\nrmse {fmt_float(metrics.get('rmse'))}"
-                        f"\na1 {fmt_float(metrics.get('a1'))}"
-                    )
-                axes[1, col].text(0.02, -0.08, text, transform=axes[1, col].transAxes, fontsize=7.2, va="top")
-
-            fig.tight_layout(rect=(0.02, 0.02, 0.98, 0.90))
-            pdf.savefig(fig, bbox_inches="tight", dpi=PDF_DPI)
-            plt.close(fig)
-            made_page = True
-    return made_page
+    fig.suptitle(f"Sample {sample_index}", fontsize=12, weight="bold", x=0.01, ha="left")
+    fig.tight_layout(rect=(0.01, 0.0, 0.99, 0.90))
+    data_uri = fig_to_data_uri(fig)
+    plt.close(fig)
+    return data_uri, legend_rows
 
 
-def add_notes_page(
-    pdf: PdfPages,
+def render_depth_samples_section(
     artifacts: Sequence[EvalArtifact],
-    base: EvalArtifact,
-    visual_pages: bool,
+    arrays: Dict[str, np.ndarray],
+    selected_samples: Sequence[int],
+    image_files: Sequence[Path],
+    split_lines: Sequence[str],
+    lookup_config: Dict[str, Any],
     args: argparse.Namespace,
-) -> None:
+) -> Tuple[str, int]:
+    empty = (
+        "<section><h2>Depth Comparisons</h2>"
+        "<p>No comparable samples were found across the evaluated runs.</p></section>"
+    )
+    if not selected_samples:
+        return empty, 0
+
+    cards = []
+    for sample_index in selected_samples:
+        result = render_depth_sample_figure(sample_index, artifacts, arrays, image_files, split_lines, lookup_config, args)
+        if result is None:
+            continue
+        data_uri, legend_rows = result
+
+        metrics_bits = []
+        for name, metrics in legend_rows:
+            if not metrics:
+                continue
+            metrics_bits.append(
+                f"<strong>{html_escape(name)}</strong>: "
+                f"abs_rel {fmt_float(metrics.get('abs_rel'))}, "
+                f"rmse {fmt_float(metrics.get('rmse'))}, "
+                f"a1 {fmt_float(metrics.get('a1'))}"
+            )
+        legend_html = ""
+        if metrics_bits:
+            legend_html = '<p class="sample-metrics">' + " &nbsp;|&nbsp; ".join(metrics_bits) + "</p>"
+
+        cards.append(
+            '<div class="sample-card">'
+            f"<h3>Sample {sample_index}</h3>"
+            f'<img class="sample-image" src="{data_uri}" alt="depth comparison for sample {sample_index}">'
+            f"{legend_html}"
+            "</div>"
+        )
+
+    if not cards:
+        return empty, 0
+
+    heading = (
+        f"Depth Comparisons &mdash; {len(cards)} sample(s), every run shown side by side "
+        "(shared color scale per sample, plasma colormap)"
+    )
+    return f"<section><h2>{heading}</h2>{''.join(cards)}</section>", len(cards)
+
+
+def render_notes_section(artifacts: Sequence[EvalArtifact], rendered_count: int, args: argparse.Namespace) -> str:
     missing_errors = [item.display_name for item in artifacts if not item.metrics]
     notes = [
-        "Report notes:",
-        "  - TensorBoard event files are not read.",
-        "  - Metrics come only from evaluation errors files, such as multi_eigen_benchmark_errors.npy.",
-        "  - Metric columns are exactly: abs_rel, sq_rel, rmse, rmse_log, a1, a2, a3.",
-        "  - Depth pages are built from saved split arrays, such as multi_eigen_benchmark_split.npy.",
-        "  - By default *_split.npy is treated as disparity and visualized as depth = 1 / disparity.",
-        f"  - Visual samples are selected randomly with seed {args.random_seed}; largest differences are not searched.",
-        "  - Difference maps use absolute disparity differences, not depth differences.",
-        f"  - Pixels whose implied depth is greater than {args.max_depth:g}m are masked out of difference maps.",
-        "  - Difference maps use blue for low difference and red for high difference.",
-        f"  - Base artifact: {base.display_name} ({base.prediction_path})",
+        "TensorBoard event files are not read; metrics come only from saved evaluation errors files such as multi_eigen_benchmark_errors.npy.",
+        "Metric columns are exactly: abs_rel, sq_rel, rmse, rmse_log, a1, a2, a3.",
+        "Depth panels are built from saved split arrays such as multi_eigen_benchmark_split.npy.",
+        f"By default *_split.npy is treated as disparity and visualized as depth = 1 / disparity, clipped to [{args.min_depth:g}, {args.max_depth:g}] meters.",
+        "Within each sample, every run's depth map shares the same color scale (2nd-98th percentile across runs) for a fair side-by-side comparison.",
+        f"Visual samples were selected randomly with seed {args.random_seed}; {rendered_count} of {args.num_samples} requested sample(s) are shown.",
     ]
+    if rendered_count < args.num_samples:
+        notes.append(
+            "Fewer samples were shown than requested because the smallest evaluated run "
+            "has fewer overlapping evaluation samples (or RGB/depth could not be loaded for some indices)."
+        )
     if args.prediction_kind == "auto":
-        notes.append("  - --prediction-kind auto treats *_split.npy files as disparity unless the filename clearly says depth.")
+        notes.append("--prediction-kind auto treats *_split.npy files as disparity unless the filename clearly says depth.")
     if missing_errors:
-        notes.append("  - Missing eval errors for: " + ", ".join(missing_errors))
-    if not visual_pages:
-        notes.append("  - No visual comparison pages were created; check that base and comparison arrays share sample indices.")
+        notes.append("Missing eval errors for: " + ", ".join(missing_errors))
     if args.image_dir is None and args.data_path is None:
-        notes.append("  - Original RGB images are optional. Pass --image-dir or --data-path if automatic lookup cannot find them.")
-    add_text_page(pdf, "Notes", notes)
+        notes.append("Original RGB images are optional. Pass --image-dir or --data-path if automatic lookup cannot find them.")
+
+    items = "".join(f"<li>{html_escape(note)}</li>" for note in notes)
+    return f'<section><h2>Notes</h2><ul class="notes">{items}</ul></section>'
+
+
+_METRIC_SHORTHANDS: Dict[str, str] = {
+    "abs": "abs_rel",
+    "sq": "sq_rel",
+    "seq": "sq_rel",
+    "rmse_log": "rmse_log",
+}
+
+
+def resolve_metrics(raw: Optional[str]) -> Tuple[str, ...]:
+    if not raw:
+        return METRIC_NAMES
+    resolved = []
+    for token in raw.split(","):
+        token = token.strip().lower()
+        if not token:
+            continue
+        name = _METRIC_SHORTHANDS.get(token, token)
+        if name not in METRIC_NAMES:
+            raise SystemExit(f"Unknown metric {token!r}. Valid names: {', '.join(METRIC_NAMES)}")
+        if name not in resolved:
+            resolved.append(name)
+    return tuple(resolved)
 
 
 def main() -> None:
     args = parse_args()
+    args.metrics = resolve_metrics(args.metrics)
     artifacts = discover_artifacts(args)
     if not artifacts:
         raise SystemExit(
@@ -1222,54 +1094,49 @@ def main() -> None:
             f"and split={args.eval_split!r} were found under {args.outs}"
         )
 
-    base = choose_base_artifact(artifacts, args.base_run)
-    artifacts = filter_to_base_split(artifacts, base, args)
-    base = choose_base_artifact(artifacts, base.display_name)
+    artifacts, eval_split, method_tag = select_comparison_group(artifacts, args)
+    if not artifacts:
+        raise SystemExit(
+            f"No evaluated prediction files matching method={method_tag!r} and split={eval_split!r} "
+            f"were found under {args.outs}"
+        )
 
-    base_config = read_yaml_or_simple(args.base_config) if args.base_config else {}
+    lookup_config: Dict[str, Any] = {}
+    for item in artifacts:
+        lookup_config.update(item.config)
+
     image_files = sorted_image_files(args.image_dir)
-    split_lines = load_split_lines(base.eval_split)
-    args.data_path = resolve_data_path(args.data_path, artifacts, base, base_config, split_lines)
-    arrays = {
-        item.display_name: load_prediction_array(item.prediction_path)
-        for item in artifacts
-    }
-    selected_samples = choose_visual_samples(artifacts, base, arrays, args)
+    split_lines = load_split_lines(eval_split)
+    args.data_path = resolve_data_path(args.data_path, artifacts, lookup_config, split_lines)
+    arrays = {item.display_name: load_prediction_array(item.prediction_path) for item in artifacts}
+    selected_samples = choose_visual_samples(artifacts, arrays, args)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     created_at = _datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    with PdfPages(args.output) as pdf:
-        add_text_page(
-            pdf,
-            "ManyDepth Evaluation Report",
-            [
-                f"Created: {created_at}",
-                f"Runs directory: {args.outs}",
-                f"Method tag: {base.method_tag}",
-                f"Evaluation split: {base.eval_split}",
-                f"Artifacts included: {', '.join(item.display_name for item in artifacts)}",
-                f"Base for visual differences: {base.display_name}",
-                f"Visual samples: random, seed {args.random_seed}",
-                f"RGB data path: {args.data_path if args.data_path is not None else 'not found'}",
-                f"Output PDF: {args.output}",
-            ],
-        )
-        add_overview_page(pdf, artifacts, base)
-        add_config_diff_pages(pdf, artifacts, base, base_config, args.max_config_diffs)
-        add_eval_metric_pages(pdf, artifacts, base)
-        add_metric_bar_pages(pdf, artifacts)
-        visual_pages = add_depth_visual_pages(
-            pdf,
-            artifacts,
-            base,
-            arrays,
-            selected_samples,
-            image_files,
-            split_lines,
-            args,
-        )
-        add_notes_page(pdf, artifacts, base, visual_pages, args)
+    sections = [
+        render_overview_section(artifacts),
+        render_metrics_section(artifacts, args.metrics),
+        render_metric_bar_section(artifacts, args.metrics),
+    ]
+    sample_section, rendered_count = render_depth_samples_section(
+        artifacts, arrays, selected_samples, image_files, split_lines, lookup_config, args
+    )
+    sections.append(sample_section)
+    sections.append(render_notes_section(artifacts, rendered_count, args))
+
+    meta_lines = [
+        f"Created: {created_at}",
+        f"Runs directory: {args.outs}",
+        f"Method tag: {method_tag}",
+        f"Evaluation split: {eval_split}",
+        f"Runs included ({len(artifacts)}): " + ", ".join(item.display_name for item in artifacts),
+        f"Visual samples: random, seed {args.random_seed}, requested {args.num_samples}, shown {rendered_count}",
+        f"RGB data path: {args.data_path if args.data_path is not None else 'not found'}",
+        f"Output report: {args.output}",
+    ]
+    html_doc = build_html_document("ManyDepth Evaluation Report", meta_lines, sections)
+    args.output.write_text(html_doc, encoding="utf-8")
 
     print(f"Wrote report to {args.output}")
 
