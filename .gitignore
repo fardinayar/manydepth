@@ -15,9 +15,11 @@ Grounded-SAM-2/
 *.npy
 *.mp4
 *.ply
-splits/eigen_benchmark/gt_depths.npz
-splits/eigen_benchmark/gt_depths.npz
 *.bash
+splits/eigen_benchmark/gt_depths.npz
+!released/**/*.pth
+!released/**/*.npy
+!released/**/*.yaml
 1.txt
 2.txt
 *.bash.*

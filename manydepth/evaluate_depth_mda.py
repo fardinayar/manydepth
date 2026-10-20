@@ -4,6 +4,7 @@
 # which allows for non-commercial use only, the full terms of which are made
 # available in the LICENSE file.
 
+import glob
 import os
 import cv2
 
@@ -247,7 +248,21 @@ def evaluate(opt):
         gt_depths = os.path.join(splits_dir, opt.eval_split, "gt_depths")
     else:
         gt_path = os.path.join(splits_dir, opt.eval_split, "gt_depths.npz")
-        gt_depths = np.load(gt_path, fix_imports=True, encoding='latin1', allow_pickle=True)["data"]
+        load_kw = dict(fix_imports=True, encoding="latin1", allow_pickle=True)
+        if os.path.isfile(gt_path):
+            gt_depths = np.load(gt_path, **load_kw)["data"]
+        else:
+            # The single archive is over GitHub's 100MB file limit, so the repo
+            # stores the same object array as consecutive parts.
+            part_paths = sorted(glob.glob(os.path.join(
+                splits_dir, opt.eval_split, "gt_depths_part*.npz")))
+            if not part_paths:
+                raise FileNotFoundError(
+                    "No ground truth at {} or {}/gt_depths_part*.npz".format(
+                        gt_path, os.path.join(splits_dir, opt.eval_split)))
+            gt_depths = np.concatenate([
+                np.load(part_path, **load_kw)["data"] for part_path in part_paths
+            ])
 
     print("-> Evaluating")
 
